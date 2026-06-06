@@ -52,6 +52,7 @@ nav:
   - Why Not the Operator: why-not-operator.md
   - Bootstrap Flow: bootstrap-flow.md
   - Operating Guide: operating.md
+  - Deploying the Factory Suite: deploying-the-factory-suite.md
   - Apps:
       - SkillAI: apps-skillai.md
       - RoleHunter: apps-rolehunter.md
