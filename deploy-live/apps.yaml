@@ -1,0 +1,258 @@
+################################################################################
+# AIFactory
+################################################################################
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: aifactory-data, namespace: factory, labels: { app: aifactory } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: aifactory, namespace: factory, labels: { app: aifactory } }
+spec:
+  selector: { app: aifactory }
+  ports: [{ name: http, port: 3101, targetPort: 3101 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: aifactory, namespace: factory, labels: { app: aifactory } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: aifactory } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: aifactory } }
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      enableServiceLinks: false
+      securityContext: { fsGroup: 65532 }
+      containers:
+        - name: aifactory
+          image: ghcr.io/olafkfreund/aifactory:v3.4.2
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 3101 }]
+          env:
+            - { name: APP_HOST, value: "0.0.0.0" }
+            - { name: APP_PORT, value: "3101" }
+            - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
+            - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
+            - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+          volumeMounts: [{ name: data, mountPath: /home/nonroot/.aifactory }]
+          readinessProbe: { httpGet: { path: /api/health, port: 3101 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
+          livenessProbe:  { httpGet: { path: /api/health, port: 3101 }, initialDelaySeconds: 30, periodSeconds: 20 }
+          resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: aifactory-data } }]
+################################################################################
+# PFactory
+################################################################################
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: pfactory-data, namespace: factory, labels: { app: pfactory } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: pfactory, namespace: factory, labels: { app: pfactory } }
+spec:
+  selector: { app: pfactory }
+  ports: [{ name: http, port: 3114, targetPort: 3114 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: pfactory, namespace: factory, labels: { app: pfactory } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: pfactory } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: pfactory } }
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      enableServiceLinks: false
+      securityContext: { fsGroup: 65532 }
+      containers:
+        - name: pfactory
+          image: ghcr.io/olafkfreund/pfactory:0.6.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 3114 }]
+          env:
+            - { name: APP_HOST, value: "0.0.0.0" }
+            - { name: APP_PORT, value: "3114" }
+            - { name: PFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
+            - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
+            - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+          volumeMounts: [{ name: data, mountPath: /home/nonroot/.pfactory }]
+          readinessProbe: { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
+          livenessProbe:  { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 30, periodSeconds: 20 }
+          resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: pfactory-data } }]
+################################################################################
+# TFactory  (APP_PORT overridden to canonical 3103)
+################################################################################
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tfactory-data, namespace: factory, labels: { app: tfactory } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tfactory, namespace: factory, labels: { app: tfactory } }
+spec:
+  selector: { app: tfactory }
+  ports: [{ name: http, port: 3103, targetPort: 3103 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tfactory, namespace: factory, labels: { app: tfactory } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: tfactory } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: tfactory } }
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      enableServiceLinks: false
+      securityContext: { fsGroup: 65532 }
+      containers:
+        - name: tfactory
+          image: ghcr.io/olafkfreund/tfactory:0.5.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 3103 }]
+          env:
+            - { name: APP_HOST, value: "0.0.0.0" }
+            - { name: APP_PORT, value: "3103" }
+            - { name: TFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
+            - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
+            - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+          volumeMounts: [{ name: data, mountPath: /home/nonroot/.tfactory }]
+          readinessProbe: { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
+          livenessProbe:  { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 30, periodSeconds: 20 }
+          resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: tfactory-data } }]
+################################################################################
+# CFactory backend  (service name: cfactory, :3111)
+################################################################################
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: cfactory-data, namespace: factory, labels: { app: cfactory } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: cfactory, namespace: factory, labels: { app: cfactory } }
+spec:
+  selector: { app: cfactory }
+  ports: [{ name: http, port: 3111, targetPort: 3111 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: cfactory, namespace: factory, labels: { app: cfactory } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: cfactory } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: cfactory } }
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      enableServiceLinks: false
+      securityContext: { fsGroup: 65532 }
+      containers:
+        - name: cfactory
+          image: ghcr.io/olafkfreund/cfactory:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 3111 }]
+          env:
+            - { name: CFACTORY_BACKEND_PORT, value: "3111" }
+            - { name: CFACTORY_AIFACTORY_API_URL, value: "http://aifactory.factory.svc.cluster.local:3101" }
+            - { name: CFACTORY_PFACTORY_API_URL, value: "http://pfactory.factory.svc.cluster.local:3114" }
+            - { name: CFACTORY_TFACTORY_API_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }
+            - { name: CFACTORY_SUBSCRIBE_UPSTREAMS, value: "true" }
+            - { name: CFACTORY_LIVE_PROGRESS, value: "true" }
+            - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
+            - { name: CFACTORY_AUDIT_HMAC_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_AUDIT_HMAC_SECRET } } }
+          volumeMounts: [{ name: data, mountPath: /home/nonroot/.cfactory }]
+          readinessProbe: { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 6 }
+          livenessProbe:  { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 20, periodSeconds: 20 }
+          resources: { requests: { cpu: 50m, memory: 256Mi }, limits: { memory: 1Gi } }
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: cfactory-data } }]
+################################################################################
+# CFactory frontend (cockpit nginx, service name: cfactory-frontend, :80 -> 8080)
+################################################################################
+---
+apiVersion: v1
+kind: Service
+metadata: { name: cfactory-frontend, namespace: factory, labels: { app: cfactory-frontend } }
+spec:
+  selector: { app: cfactory-frontend }
+  ports: [{ name: http, port: 80, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: cfactory-frontend, namespace: factory, labels: { app: cfactory-frontend } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: cfactory-frontend } }
+  template:
+    metadata: { labels: { app: cfactory-frontend } }
+    spec:
+      imagePullSecrets: [{ name: ghcr-pull }]
+      enableServiceLinks: false
+      securityContext: { fsGroup: 65532 }
+      containers:
+        - name: frontend
+          image: ghcr.io/olafkfreund/cfactory-frontend:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8080 }]
+          env:
+            - { name: BACKEND_URL, value: "http://cfactory.factory.svc.cluster.local:3111" }
+          readinessProbe: { httpGet: { path: /, port: 8080 }, initialDelaySeconds: 5, periodSeconds: 10 }
+          resources: { requests: { cpu: 20m, memory: 32Mi }, limits: { memory: 128Mi } }
+        - name: tailscale
+          image: docker.io/tailscale/tailscale:v1.98.4
+          env:
+            - { name: TS_AUTHKEY, valueFrom: { secretKeyRef: { name: tailscale-auth-key, key: TS_AUTHKEY } } }
+            - { name: TS_HOSTNAME, value: "cockpit" }
+            - { name: TS_KUBE_SECRET, value: "" }
+            - { name: TS_USERSPACE, value: "true" }
+            - { name: TS_STATE_DIR, value: "/tmp/tsstate" }
+            - { name: TS_EXTRA_ARGS, value: "--accept-dns=false" }
+            - { name: TS_SERVE_CONFIG, value: "/etc/tsconfig/serve.json" }
+          volumeMounts:
+            - { name: ts-serve-config, mountPath: /etc/tsconfig, readOnly: true }
+          securityContext: { runAsUser: 1000, runAsNonRoot: true }
+          resources: { requests: { cpu: 20m, memory: 32Mi }, limits: { memory: 128Mi } }
+      volumes:
+        - name: ts-serve-config
+          configMap: { name: cockpit-tailscale-serve-config }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: cockpit-tailscale-serve-config, namespace: factory }
+data:
+  serve.json: |
+    {
+      "TCP": { "443": { "HTTPS": true } },
+      "Web": {
+        "${TS_CERT_DOMAIN}:443": {
+          "Handlers": { "/": { "Proxy": "http://127.0.0.1:8080" } }
+        }
+      },
+      "AllowFunnel": {}
+    }
