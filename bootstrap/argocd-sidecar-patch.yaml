@@ -26,6 +26,16 @@ spec:
   template:
     spec:
       containers:
+        # Patch argocd-server with --insecure so it doesn't try to redirect
+        # HTTP→HTTPS at the application layer. TLS is terminated by the
+        # tailscale sidecar (real cert from Tailscale); the connection
+        # from sidecar → argocd-server stays on the Pod's loopback as
+        # plain HTTP. Without --insecure, argocd-server sees `http://`
+        # and 307s the client back to `https://…/` infinitely.
+        - name: argocd-server
+          command:
+            - argocd-server
+            - --insecure
         - name: tailscale
           image: docker.io/tailscale/tailscale:v1.98.4
           imagePullPolicy: IfNotPresent
