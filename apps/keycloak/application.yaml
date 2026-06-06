@@ -1,0 +1,23 @@
+# Keycloak — central IdP for the Factory suite (Phase 2 SSO).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: keycloak
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: infra/keycloak
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
