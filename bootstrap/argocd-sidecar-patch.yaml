@@ -33,7 +33,11 @@ spec:
         # plain HTTP. Without --insecure, argocd-server sees `http://`
         # and 307s the client back to `https://…/` infinitely.
         - name: argocd-server
-          command:
+          # Upstream argocd-server defines argv via `args` (not `command`,
+          # which is left to the image's ENTRYPOINT). To add --insecure
+          # without losing the binary path argument, patch `args` and
+          # leave `command` alone.
+          args:
             - /usr/local/bin/argocd-server
             - --insecure
         - name: tailscale
