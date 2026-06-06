@@ -30,8 +30,12 @@ factory-gitops/
     │   └── application.yaml
     ├── tfactory/
     │   └── application.yaml
-    └── cfactory/
-        └── application.yaml
+    ├── cfactory/
+    │   └── application.yaml
+    ├── skillai/
+    │   └── application.yaml          ← Next.js + pgvector recruiting portal
+    └── rolehunter/
+        └── application.yaml          ← Next.js + pgvector AI job-hunt workspace
 ```
 
 ## Tailnet exposure: the sidecar pattern
