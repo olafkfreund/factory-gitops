@@ -1,0 +1,51 @@
+# Keycloak — central identity provider for the Factory suite.
+# dev-mode (H2 on a PVC) for the homelab; switch to Postgres once the node
+# /dev/shm is bumped (see deploy-live/postgres.yaml). Tailnet exposure (the
+# Tailscale sidecar) is added once stable hostnames are in place.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: keycloak-data, namespace: factory, labels: { app: keycloak } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: keycloak, namespace: factory, labels: { app: keycloak } }
+spec:
+  selector: { app: keycloak }
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: keycloak, namespace: factory, labels: { app: keycloak } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: keycloak } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: keycloak } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { fsGroup: 1000 }
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.1
+          args: ["start-dev"]
+          env:
+            - { name: KC_BOOTSTRAP_ADMIN_USERNAME, value: "admin" }
+            - { name: KC_BOOTSTRAP_ADMIN_PASSWORD, valueFrom: { secretKeyRef: { name: factory-secrets, key: KEYCLOAK_ADMIN_PASSWORD } } }
+            # Public URL once exposed on the tailnet (issuer in tokens). Apps reach
+            # this same host in-cluster via a hostAlias / split-horizon DNS entry.
+            - { name: KC_HOSTNAME, value: "https://keycloak.tail833f7.ts.net" }
+            - { name: KC_HTTP_ENABLED, value: "true" }
+            - { name: KC_PROXY_HEADERS, value: "xforwarded" }
+            - { name: KC_HOSTNAME_STRICT, value: "false" }
+          ports: [{ containerPort: 8080 }]
+          volumeMounts: [{ name: data, mountPath: /opt/keycloak/data }]
+          readinessProbe: { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 25, periodSeconds: 10, failureThreshold: 30 }
+          livenessProbe:  { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 90, periodSeconds: 30 }
+          resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { memory: 1536Mi } }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: keycloak-data } }
