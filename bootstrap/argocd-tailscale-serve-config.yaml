@@ -14,6 +14,12 @@ metadata:
   name: argocd-tailscale-serve-config
   namespace: argocd
 data:
+  # argocd-server is TLS-detect: same port (8080) serves both HTTP and
+  # HTTPS. We proxy via HTTP (not HTTPS) because Tailscale Serve refuses
+  # to verify argocd-server's self-signed certificate and returns 502.
+  # The connection stays entirely inside the Pod's loopback interface,
+  # so plaintext here is fine — external clients still get HTTPS,
+  # terminated by the tailscale sidecar with a real cert.
   serve.json: |
     {
       "TCP": {
@@ -22,7 +28,7 @@ data:
       "Web": {
         "${TS_CERT_DOMAIN}:443": {
           "Handlers": {
-            "/": { "Proxy": "https://127.0.0.1:8080" }
+            "/": { "Proxy": "http://127.0.0.1:8080" }
           }
         }
       },
