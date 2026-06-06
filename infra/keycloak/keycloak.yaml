@@ -47,5 +47,28 @@ spec:
           readinessProbe: { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 25, periodSeconds: 10, failureThreshold: 30 }
           livenessProbe:  { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 90, periodSeconds: 30 }
           resources: { requests: { cpu: 250m, memory: 1Gi }, limits: { memory: 2560Mi } }
+        - name: tailscale
+          image: docker.io/tailscale/tailscale:v1.98.4
+          env:
+            - { name: TS_AUTHKEY, valueFrom: { secretKeyRef: { name: tailscale-auth-key, key: TS_AUTHKEY } } }
+            - { name: TS_HOSTNAME, value: "keycloak" }
+            - { name: TS_KUBE_SECRET, value: "" }
+            - { name: TS_USERSPACE, value: "true" }
+            - { name: TS_STATE_DIR, value: "/tmp/tsstate" }
+            - { name: TS_EXTRA_ARGS, value: "--accept-dns=false" }
+            - { name: TS_SERVE_CONFIG, value: "/etc/tsconfig/serve.json" }
+          volumeMounts:
+            - { name: ts-serve-config, mountPath: /etc/tsconfig, readOnly: true }
+          securityContext: { runAsUser: 1000, runAsNonRoot: true }
+          resources: { requests: { cpu: 20m, memory: 32Mi }, limits: { memory: 128Mi } }
       volumes:
         - { name: data, persistentVolumeClaim: { claimName: keycloak-data } }
+        - name: ts-serve-config
+          configMap: { name: keycloak-tailscale-serve-config }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: keycloak-tailscale-serve-config, namespace: factory }
+data:
+  serve.json: |
+    { "TCP": { "443": { "HTTPS": true } }, "Web": { "${TS_CERT_DOMAIN}:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:8080" } } } }, "AllowFunnel": {} }
