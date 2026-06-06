@@ -60,7 +60,7 @@ spec:
             - containerPort: 8080
         # ── tailscale sidecar ───────────────────────────────────
         - name: tailscale
-          image: ghcr.io/tailscale/tailscale:v1.74.0
+          image: docker.io/tailscale/tailscale:v1.98.4
           env:
             - name: TS_AUTHKEY
               valueFrom:
