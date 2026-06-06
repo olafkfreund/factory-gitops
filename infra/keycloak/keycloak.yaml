@@ -46,6 +46,6 @@ spec:
           volumeMounts: [{ name: data, mountPath: /opt/keycloak/data }]
           readinessProbe: { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 25, periodSeconds: 10, failureThreshold: 30 }
           livenessProbe:  { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 90, periodSeconds: 30 }
-          resources: { requests: { cpu: 200m, memory: 512Mi }, limits: { memory: 1536Mi } }
+          resources: { requests: { cpu: 250m, memory: 1Gi }, limits: { memory: 2560Mi } }
       volumes:
         - { name: data, persistentVolumeClaim: { claimName: keycloak-data } }
