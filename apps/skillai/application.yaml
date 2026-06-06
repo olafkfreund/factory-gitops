@@ -1,0 +1,31 @@
+# SkillAI — internal AI-powered recruiting portal (Next.js + pgvector + Claude).
+# Source repo: github.com/olafkfreund/SkillAi  (manifests in deploy/k8s, kustomize)
+#
+# Exposed on the freundcloud tailnet at https://skillai.tail833f7.ts.net via a
+# Tailscale sidecar in the app Pod (see docs/sidecar-pattern.md).
+#
+# NOTE: targetRevision is core-mvp-foundation (SkillAi's default branch), not main.
+# Until the SkillAi deploy/k8s directory is merged there, ArgoCD reports
+# ComparisonError on the missing path — that's expected, same as the other apps.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: skillai
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/SkillAi
+    targetRevision: core-mvp-foundation
+    path: deploy/k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
