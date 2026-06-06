@@ -41,4 +41,28 @@ spec:
           readinessProbe: { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 30, periodSeconds: 20 }
           resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
-      volumes: [{ name: data, persistentVolumeClaim: { claimName: pfactory-data } }]
+        - name: tailscale
+          image: docker.io/tailscale/tailscale:v1.98.4
+          env:
+            - { name: TS_AUTHKEY, valueFrom: { secretKeyRef: { name: tailscale-auth-key, key: TS_AUTHKEY } } }
+            - { name: TS_HOSTNAME, value: "pfactory" }
+            - { name: TS_KUBE_SECRET, value: "" }
+            - { name: TS_USERSPACE, value: "true" }
+            - { name: TS_STATE_DIR, value: "/tmp/tsstate" }
+            - { name: TS_EXTRA_ARGS, value: "--accept-dns=false" }
+            - { name: TS_SERVE_CONFIG, value: "/etc/tsconfig/serve.json" }
+          volumeMounts:
+            - { name: ts-serve-config, mountPath: /etc/tsconfig, readOnly: true }
+          securityContext: { runAsUser: 1000, runAsNonRoot: true }
+          resources: { requests: { cpu: 20m, memory: 32Mi }, limits: { memory: 128Mi } }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: pfactory-data } }
+        - name: ts-serve-config
+          configMap: { name: pfactory-tailscale-serve-config }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: pfactory-tailscale-serve-config, namespace: factory }
+data:
+  serve.json: |
+    { "TCP": { "443": { "HTTPS": true } }, "Web": { "${TS_CERT_DOMAIN}:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:3114" } } } }, "AllowFunnel": {} }
