@@ -1,0 +1,182 @@
+# Backstage catalog entries for the factory-gitops repo.
+#
+# Discovered automatically by Backstage's GitHubEntityProvider (configured
+# in olafkfreund/backstage app-config.production.yaml). Catalog refresh
+# runs every ~5 minutes; after the first push to this repo, this file
+# is parsed and the entities below appear in the catalog.
+#
+# Owner convention: `owner: olafkfreund` resolves to the Group of the
+# same name declared in olafkfreund/nixos_config/catalog-info.yaml.
+
+---
+# The repo itself.
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: factory-gitops
+  title: factory-gitops (GitOps source)
+  description: |
+    GitOps source repo for the k3d cluster on p510. App-of-Apps
+    pattern: bootstrap/ installs ArgoCD + Tailscale sidecar patch onto
+    argocd-server, then the root Application sweeps apps/* recursively.
+
+    Bootstrapped declaratively by the k3d-cluster-bootstrap systemd
+    unit from olafkfreund/nixos_config — see that repo's
+    docs/architecture/k3d-architecture.md for design and
+    docs/applications/k3d-cluster.md for ops.
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/
+    backstage.io/view-url: https://github.com/olafkfreund/factory-gitops
+    backstage.io/edit-url: https://github.com/olafkfreund/factory-gitops/edit/main/
+    github.com/project-slug: olafkfreund/factory-gitops
+    github.com/project-readme-path: README.md
+  tags:
+    - gitops
+    - argocd
+    - kubernetes
+    - k3d
+    - tailscale
+    - factory
+  links:
+    - url: https://argocd.tail833f7.ts.net
+      title: ArgoCD UI (tailnet)
+      icon: dashboard
+    - url: https://github.com/olafkfreund/nixos_config/blob/main/docs/applications/k3d-cluster.md
+      title: Cluster ops runbook (in nixos_config)
+      icon: docs
+    - url: https://github.com/olafkfreund/nixos_config/blob/main/docs/architecture/k3d-architecture.md
+      title: Architecture rationale (in nixos_config)
+      icon: docs
+spec:
+  type: gitops-source
+  lifecycle: production
+  owner: olafkfreund
+  system: freundcloud-infra
+  dependsOn:
+    - resource:default/k3d-factory
+    - component:default/argocd
+
+---
+# Placeholder Component for AIFactory's eventual deployment. The product
+# repo (olafkfreund/AIFactory) has its own catalog-info.yaml for product
+# metadata; this Component models the *deployment* into the factory
+# cluster. They're distinct entities.
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: aifactory-deployment
+  title: AIFactory deployment (factory cluster)
+  description: |
+    AIFactory's deployment in the k3d-factory cluster on p510. Managed by
+    the `aifactory` ArgoCD Application in apps/aifactory/. Placeholder
+    until github.com/olafkfreund/AIFactory grows a deploy/k8s/ tree.
+  annotations:
+    backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/aifactory/
+    github.com/project-slug: olafkfreund/AIFactory
+  tags:
+    - factory
+    - aifactory
+    - argocd-app
+    - placeholder
+  links:
+    - url: https://github.com/olafkfreund/AIFactory
+      title: AIFactory product repo
+      icon: github
+spec:
+  type: service
+  lifecycle: experimental
+  owner: olafkfreund
+  system: freundcloud-infra
+  dependsOn:
+    - component:default/factory-gitops
+
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: pfactory-deployment
+  title: PFactory deployment (factory cluster)
+  description: |
+    PFactory's deployment in the k3d-factory cluster. Managed by the
+    `pfactory` ArgoCD Application. Placeholder until github.com/olafkfreund/PFactory
+    grows deploy/k8s/.
+  annotations:
+    backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/pfactory/
+    github.com/project-slug: olafkfreund/PFactory
+  tags:
+    - factory
+    - pfactory
+    - argocd-app
+    - placeholder
+  links:
+    - url: https://github.com/olafkfreund/PFactory
+      title: PFactory product repo
+      icon: github
+spec:
+  type: service
+  lifecycle: experimental
+  owner: olafkfreund
+  system: freundcloud-infra
+  dependsOn:
+    - component:default/factory-gitops
+
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: tfactory-deployment
+  title: TFactory deployment (factory cluster)
+  description: |
+    TFactory's deployment in the k3d-factory cluster. Managed by the
+    `tfactory` ArgoCD Application. Placeholder until github.com/olafkfreund/TFactory
+    grows deploy/k8s/.
+  annotations:
+    backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/tfactory/
+    github.com/project-slug: olafkfreund/TFactory
+  tags:
+    - factory
+    - tfactory
+    - argocd-app
+    - placeholder
+  links:
+    - url: https://github.com/olafkfreund/TFactory
+      title: TFactory product repo
+      icon: github
+spec:
+  type: service
+  lifecycle: experimental
+  owner: olafkfreund
+  system: freundcloud-infra
+  dependsOn:
+    - component:default/factory-gitops
+
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: cfactory-deployment
+  title: CFactory deployment (factory cluster)
+  description: |
+    CFactory's deployment in the k3d-factory cluster. Managed by the
+    `cfactory` ArgoCD Application. Placeholder until github.com/olafkfreund/CFactory
+    grows deploy/k8s/.
+  annotations:
+    backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/cfactory/
+    github.com/project-slug: olafkfreund/CFactory
+  tags:
+    - factory
+    - cfactory
+    - argocd-app
+    - placeholder
+  links:
+    - url: https://github.com/olafkfreund/CFactory
+      title: CFactory product repo
+      icon: github
+spec:
+  type: service
+  lifecycle: experimental
+  owner: olafkfreund
+  system: freundcloud-infra
+  dependsOn:
+    - component:default/factory-gitops

@@ -1,0 +1,54 @@
+site_name: factory-gitops
+site_description: >-
+  GitOps source repo for the k3d cluster on p510.
+  App-of-Apps pattern with ArgoCD, Tailscale sidecars for tailnet exposure.
+site_author: olafkfreund
+
+repo_url: https://github.com/olafkfreund/factory-gitops
+repo_name: olafkfreund/factory-gitops
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Repo Layout: layout.md
+  - Sidecar Pattern: sidecar-pattern.md
+  - Why Not the Operator: why-not-operator.md
+  - Bootstrap Flow: bootstrap-flow.md
+  - Operating Guide: operating.md

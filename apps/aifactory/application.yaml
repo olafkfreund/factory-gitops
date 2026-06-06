@@ -1,0 +1,28 @@
+# AIFactory — spec-driven development for AI agents.
+# Source repo: github.com/olafkfreund/AIFactory
+#
+# Status: placeholder. Will turn green once AIFactory grows a deploy/k8s
+# directory with at least a Deployment + Service. Until then, ArgoCD
+# will report ComparisonError on the missing path — that's expected.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aifactory
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/AIFactory
+    targetRevision: main
+    path: deploy/k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

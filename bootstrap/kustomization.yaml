@@ -1,0 +1,33 @@
+# bootstrap/ — what the Nix k3d-cluster-bootstrap unit applies once.
+#
+# Apply order (Kustomize handles ordering automatically; this is the
+# logical sequence the resources represent):
+#   1. argocd namespace
+#   2. argo-cd upstream install manifests (pinned to v2.13.1 — bump
+#      deliberately; never to `stable` or a branch)
+#   3. sidecar patch onto argocd-server (adds the `tailscale` container so
+#      the UI is reachable at argocd.tail833f7.ts.net) plus the matching
+#      Tailscale Serve ConfigMap
+#   4. App-of-Apps root Application (points at ../apps/ recursively)
+#
+# After this kustomization succeeds, ArgoCD self-manages every Application
+# via the root Application; this file is never re-applied unless someone
+# manually triggers it (e.g. to roll forward to a newer argo-cd version).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: argocd
+
+resources:
+  - argocd-namespace.yaml
+  - https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.1/manifests/install.yaml
+  - argocd-tailscale-serve-config.yaml
+  - argocd-root-app.yaml
+
+patches:
+  - path: argocd-sidecar-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: argocd-server

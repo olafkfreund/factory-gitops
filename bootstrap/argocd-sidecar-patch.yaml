@@ -1,0 +1,67 @@
+# Strategic-merge patch onto argocd-server Deployment that adds a
+# Tailscale sidecar.
+#
+# Result: argocd-server pod runs two containers:
+#   1. argocd-server (upstream image, unchanged)
+#   2. tailscale (registers `argocd` on the tailnet via TS_AUTHKEY)
+#
+# The two containers share a network namespace (default Pod behaviour),
+# so when the sidecar's `tailscale serve` proxy listens on :443 it can
+# reach argocd-server on localhost:8080 (or :443 internally — argocd
+# serves HTTPS by default; the sidecar's Serve config below trusts the
+# upstream cert).
+#
+# TS_AUTHKEY comes from the `tailscale-auth-key` Secret seeded into the
+# argocd namespace by the k3d-cluster-bootstrap unit on p510. The
+# pinned tailscale image is bumped by editing this file (no `:latest`).
+#
+# The matching ConfigMap (`argocd-tailscale-serve-config`) is a separate
+# resource — see argocd-tailscale-serve-config.yaml in this directory.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-server
+  namespace: argocd
+spec:
+  template:
+    spec:
+      containers:
+        - name: tailscale
+          image: ghcr.io/tailscale/tailscale:v1.74.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: tailscale-auth-key
+                  key: TS_AUTHKEY
+            - name: TS_HOSTNAME
+              value: "argocd"
+            - name: TS_USERSPACE
+              value: "true"          # userspace networking — no NET_ADMIN needed
+            - name: TS_STATE_DIR
+              value: "/tmp/tsstate"  # ephemeral (reusable key handles re-registration)
+            - name: TS_EXTRA_ARGS
+              value: "--accept-dns=false"
+            - name: TS_SERVE_CONFIG
+              value: "/etc/tsconfig/serve.json"
+          volumeMounts:
+            - name: ts-serve-config
+              mountPath: /etc/tsconfig
+              readOnly: true
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          resources:
+            limits:
+              memory: 128Mi
+              cpu: 200m
+            requests:
+              memory: 32Mi
+              cpu: 20m
+      volumes:
+        - name: ts-serve-config
+          configMap:
+            name: argocd-tailscale-serve-config

@@ -1,0 +1,33 @@
+# App-of-Apps root.
+#
+# Once ArgoCD is installed, this Application is the only thing it watches.
+# It points at apps/ recursively — every Application file there becomes
+# a managed Application automatically.
+#
+# So the workflow for adding a service is just: commit a file under
+# apps/<name>/application.yaml, push, wait ~3 min.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps
+    directory:
+      recurse: true
+      include: "**/application.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

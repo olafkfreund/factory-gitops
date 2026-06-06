@@ -1,0 +1,26 @@
+# PFactory — Plan Factory (AI planning + governance).
+# Source repo: github.com/olafkfreund/PFactory
+#
+# Status: placeholder until PFactory grows deploy/k8s/.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: pfactory
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/PFactory
+    targetRevision: main
+    path: deploy/k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
