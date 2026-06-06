@@ -22,6 +22,7 @@ resources:
   - argocd-namespace.yaml
   - https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.1/manifests/install.yaml
   - argocd-tailscale-serve-config.yaml
+  - argocd-tailscale-state-pvc.yaml
   - argocd-root-app.yaml
 
 patches:

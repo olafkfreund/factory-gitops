@@ -1,0 +1,33 @@
+# PersistentVolumeClaim for the argocd-server Tailscale sidecar's state.
+#
+# Backed by the k3s local-path-provisioner — data path on the host is
+# /mnt/img_pool/k3d/storage (bind-mounted into the k3d server container
+# by the NixOS module modules/containers/k3d.nix).
+#
+# Contents: tailscaled's node keys + machine identity. Tiny (~32 KB
+# under normal operation). 100Mi is generous; alarm if usage grows.
+#
+# Why this matters: without persistent state, every Pod restart
+# triggers a fresh tailnet registration, and Tailscale Auth doesn't
+# return the old hostname — it appends a numeric suffix. Symptom:
+# argocd / argocd-1 / argocd-2 / ... all claim the slot, the canonical
+# `argocd.tail833f7.ts.net` points at a long-dead node, and the new
+# pod is reachable only at the suffixed name.
+#
+# Restore semantics: cluster-recreate WIPES this PVC (local-path-
+# provisioner stores under the cluster's data volume, which the
+# k3d-cluster-bootstrap unit recreates from scratch). Recovery is
+# automatic on first start of the new sidecar — it registers as
+# `argocd` again as long as no other live device is holding the name.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: argocd-server-tailscale-state
+  namespace: argocd
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Mi
+  # local-path is the default StorageClass on k3s/k3d.
+  storageClassName: local-path

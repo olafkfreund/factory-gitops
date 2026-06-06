@@ -52,6 +52,10 @@ spec:
   template:
     metadata: { labels: { app: aifactory } }
     spec:
+      # Sidecar runs as UID 1000; fsGroup makes the PVC mount writable
+      # to that UID without a root-owned mountpoint.
+      securityContext:
+        fsGroup: 1000
       containers:
         # ── your app ────────────────────────────────────────────
         - name: app
@@ -68,11 +72,14 @@ spec:
                   name: tailscale-auth-key
                   key: TS_AUTHKEY
             - name: TS_HOSTNAME
-              value: "aifactory"      # → aifactory.tail833f7.ts.net
+              value: "aifactory"          # → aifactory.tail833f7.ts.net
             - name: TS_USERSPACE
-              value: "true"           # no NET_ADMIN cap required
+              value: "true"               # no NET_ADMIN cap required
             - name: TS_STATE_DIR
-              value: "/tmp/tsstate"
+              # Persistent state — see "stable identity" below. Required
+              # if you want the tailnet hostname to survive pod restarts;
+              # otherwise you accumulate aifactory-1/-2/-N aliases.
+              value: "/var/lib/tailscale"
             - name: TS_EXTRA_ARGS
               value: "--accept-dns=false"
             # OPTIONAL: serve the app's port on the tailnet identity at :443
@@ -82,6 +89,8 @@ spec:
             - name: ts-serve-config
               mountPath: /etc/tsconfig
               readOnly: true
+            - name: ts-state
+              mountPath: /var/lib/tailscale
           securityContext:
             runAsUser: 1000
             runAsNonRoot: true
@@ -89,6 +98,21 @@ spec:
         - name: ts-serve-config
           configMap:
             name: aifactory-tailscale-serve-config
+        - name: ts-state
+          persistentVolumeClaim:
+            claimName: aifactory-tailscale-state
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aifactory-tailscale-state
+  namespace: factory
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Mi
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -107,6 +131,20 @@ data:
       "AllowFunnel": {}
     }
 ```
+
+### Stable identity across pod restarts
+
+Without persistent state for the sidecar's `/var/lib/tailscale`, every
+pod restart registers a *new* device on the tailnet because tailscaled's
+node key is regenerated on first start. Tailscale won't return the old
+hostname — it appends a numeric suffix (`aifactory-1`, `-2`, ...).
+DNS for the canonical name keeps pointing at the now-dead original
+device, and the new pod is only reachable at the suffixed name.
+
+The PVC above (backed by k3s `local-path-provisioner` → host
+`/mnt/img_pool/k3d/storage`) fixes this. The state survives pod and
+deployment restarts. It does NOT survive a cluster delete + recreate —
+acceptable, since that's a rare operation.
 
 The plain in-cluster Service (`kind: Service`) stays for in-cluster
 addressability — tailnet clients don't go through it.

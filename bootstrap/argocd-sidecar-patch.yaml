@@ -17,6 +17,18 @@
 #
 # The matching ConfigMap (`argocd-tailscale-serve-config`) is a separate
 # resource — see argocd-tailscale-serve-config.yaml in this directory.
+#
+# PERSISTENT TAILNET IDENTITY:
+# The sidecar's state lives on a PersistentVolumeClaim backed by the k3s
+# local-path-provisioner (data path: /mnt/img_pool/k3d/storage on the
+# host). This keeps the tailnet identity stable across Pod restarts —
+# without it, every restart registered a new device and accumulated
+# argocd / argocd-1 / argocd-2 / ... aliases in the Tailscale admin.
+#
+# Caveat: state survives Pod and Deployment restarts but NOT a cluster
+# delete + recreate (which wipes /mnt/img_pool/k3d/storage). That's
+# acceptable for now; the in-cluster Tailscale state is just node
+# keys + machine identity (a few KB), so 100Mi is generous.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +37,10 @@ metadata:
 spec:
   template:
     spec:
+      # Sidecar runs as UID 1000 (runAsNonRoot). Without fsGroup the PVC
+      # mounts owned by root and the sidecar can't write its state file.
+      securityContext:
+        fsGroup: 1000
       containers:
         # Patch argocd-server with --insecure so it doesn't try to redirect
         # HTTP→HTTPS at the application layer. TLS is terminated by the
@@ -54,7 +70,7 @@ spec:
             - name: TS_USERSPACE
               value: "true"          # userspace networking — no NET_ADMIN needed
             - name: TS_STATE_DIR
-              value: "/tmp/tsstate"  # ephemeral (reusable key handles re-registration)
+              value: "/var/lib/tailscale"  # PVC-backed → stable tailnet identity across pod restarts
             - name: TS_EXTRA_ARGS
               value: "--accept-dns=false"
             - name: TS_SERVE_CONFIG
@@ -63,6 +79,8 @@ spec:
             - name: ts-serve-config
               mountPath: /etc/tsconfig
               readOnly: true
+            - name: ts-state
+              mountPath: /var/lib/tailscale
           securityContext:
             runAsUser: 1000
             runAsNonRoot: true
@@ -79,3 +97,6 @@ spec:
         - name: ts-serve-config
           configMap:
             name: argocd-tailscale-serve-config
+        - name: ts-state
+          persistentVolumeClaim:
+            claimName: argocd-server-tailscale-state
