@@ -34,7 +34,7 @@ spec:
         # and 307s the client back to `https://…/` infinitely.
         - name: argocd-server
           command:
-            - argocd-server
+            - /usr/local/bin/argocd-server
             - --insecure
         - name: tailscale
           image: docker.io/tailscale/tailscale:v1.98.4
