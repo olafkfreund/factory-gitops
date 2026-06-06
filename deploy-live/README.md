@@ -18,7 +18,10 @@ Working Kubernetes manifests that brought the **Factory suite live** on the p510
 | `cfactory` (backend) | `ghcr.io/olafkfreund/cfactory:0.1.0` | 3111 | upstreams wired to cluster DNS |
 | `cfactory-frontend` (cockpit) | `ghcr.io/olafkfreund/cfactory-frontend:0.1.0` | 80→8080 | Tailscale sidecar → `https://cockpit.tail833f7.ts.net` |
 
-`apps.yaml` — all five workloads + Services + PVCs + the cockpit Tailscale sidecar/serve ConfigMap.
+The app manifests now live per-product under `apps/<product>/manifests/` and are managed by each
+product's ArgoCD Application (`apps/<product>/application.yaml`). This directory keeps only the
+deferred Postgres + this note.
+
 `postgres.yaml` — shared Postgres (currently **deferred**: the k3d node's `/dev/shm` is 64M and
 postgres `initdb` SIGBUSes; bump node shm in the nixos_config k3d module, then switch the apps'
 `*_DATABASE_URL` to Postgres).

@@ -12,9 +12,9 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/olafkfreund/TFactory
+    repoURL: https://github.com/olafkfreund/factory-gitops
     targetRevision: main
-    path: deploy/k8s
+    path: apps/tfactory/manifests
   destination:
     server: https://kubernetes.default.svc
     namespace: factory
