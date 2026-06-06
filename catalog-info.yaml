@@ -74,6 +74,8 @@ metadata:
   annotations:
     backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/aifactory/
     github.com/project-slug: olafkfreund/AIFactory
+    argocd/app-name: aifactory
+    backstage.io/kubernetes-label-selector: app=aifactory
   tags:
     - factory
     - aifactory
@@ -104,6 +106,8 @@ metadata:
   annotations:
     backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/pfactory/
     github.com/project-slug: olafkfreund/PFactory
+    argocd/app-name: pfactory
+    backstage.io/kubernetes-label-selector: app=pfactory
   tags:
     - factory
     - pfactory
@@ -134,6 +138,8 @@ metadata:
   annotations:
     backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/tfactory/
     github.com/project-slug: olafkfreund/TFactory
+    argocd/app-name: tfactory
+    backstage.io/kubernetes-label-selector: app=tfactory
   tags:
     - factory
     - tfactory
@@ -164,6 +170,8 @@ metadata:
   annotations:
     backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/cfactory/
     github.com/project-slug: olafkfreund/CFactory
+    argocd/app-name: cfactory
+    backstage.io/kubernetes-label-selector: app=cfactory
   tags:
     - factory
     - cfactory
