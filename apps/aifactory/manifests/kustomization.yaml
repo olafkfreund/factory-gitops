@@ -6,4 +6,4 @@ resources:
 # CI bumps `newTag` via: kustomize edit set image ghcr.io/olafkfreund/aifactory=ghcr.io/olafkfreund/aifactory:<tag>
 images:
   - name: ghcr.io/olafkfreund/aifactory
-    newTag: v3.4.2-rmux
+    newTag: v3.4.2-rmux-authcookie
