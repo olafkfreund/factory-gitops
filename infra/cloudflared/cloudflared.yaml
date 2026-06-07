@@ -1,0 +1,51 @@
+# In-cluster Cloudflare Tunnel connector for the Factory suite.
+# Routes *.freundcloud.org.uk public hostnames to the in-cluster Services.
+# Separate tunnel (factory-cluster) from the host's p510-home/backstage tunnel
+# — they don't interfere. credentials.json lives in the cloudflared-factory
+# secret (seeded out-of-band from /run/agenix on p510).
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: cloudflared-config, namespace: factory }
+data:
+  config.yaml: |
+    tunnel: 55338418-e5d7-476a-a67f-079bd3044db7
+    credentials-file: /etc/cloudflared/creds/credentials.json
+    metrics: 0.0.0.0:2000
+    no-autoupdate: true
+    ingress:
+      - hostname: cfactory.freundcloud.org.uk
+        service: http://cfactory-frontend.factory.svc.cluster.local:80
+      - hostname: aifactory.freundcloud.org.uk
+        service: http://aifactory.factory.svc.cluster.local:3101
+      - hostname: pfactory.freundcloud.org.uk
+        service: http://pfactory.factory.svc.cluster.local:3114
+      - hostname: tfactory.freundcloud.org.uk
+        service: http://tfactory.factory.svc.cluster.local:3103
+      - hostname: keycloak.freundcloud.org.uk
+        service: http://keycloak.factory.svc.cluster.local:8080
+      - service: http_status:404
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: cloudflared, namespace: factory, labels: { app: cloudflared } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: cloudflared } }
+  template:
+    metadata: { labels: { app: cloudflared } }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: cloudflared
+          image: docker.io/cloudflare/cloudflared:2026.5.2
+          args: ["tunnel", "--config", "/etc/cloudflared/config.yaml", "run"]
+          livenessProbe: { httpGet: { path: /ready, port: 2000 }, initialDelaySeconds: 10, periodSeconds: 20 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/cloudflared, readOnly: true }
+            - { name: creds, mountPath: /etc/cloudflared/creds, readOnly: true }
+          resources: { requests: { cpu: 20m, memory: 64Mi }, limits: { memory: 256Mi } }
+      volumes:
+        - name: config
+          configMap: { name: cloudflared-config }
+        - name: creds
+          secret: { secretName: cloudflared-factory }
