@@ -6,4 +6,4 @@ resources:
 # CI bumps newTag via: kustomize edit set image ghcr.io/olafkfreund/pfactory=...:<tag>
 images:
   - name: ghcr.io/olafkfreund/pfactory
-    newTag: "0.6.0"
+    newTag: "0.6.1"
