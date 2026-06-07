@@ -53,6 +53,8 @@ nav:
   - Bootstrap Flow: bootstrap-flow.md
   - Operating Guide: operating.md
   - Deploying the Factory Suite: deploying-the-factory-suite.md
+  - Build & Deploy: build-and-deploy.md
+  - Keycloak SSO: keycloak-sso.md
   - Apps:
       - SkillAI: apps-skillai.md
       - RoleHunter: apps-rolehunter.md
