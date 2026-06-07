@@ -37,6 +37,11 @@ spec:
             - { name: TFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+            - { name: APP_OIDC_ENABLED, value: "true" }
+            - { name: APP_OIDC_ISSUER_URL, value: "https://keycloak.freundcloud.org.uk/realms/factory" }
+            - { name: APP_OIDC_CLIENT_ID, value: "tfactory" }
+            - { name: APP_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: TFACTORY_OIDC_CLIENT_SECRET } } }
+            - { name: APP_OIDC_REDIRECT_URI, value: "https://tfactory.freundcloud.org.uk/api/auth/oidc/callback" }
           volumeMounts: [{ name: data, mountPath: /home/nonroot/.tfactory }]
           readinessProbe: { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 30, periodSeconds: 20 }
