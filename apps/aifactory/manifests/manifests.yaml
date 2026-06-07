@@ -43,6 +43,17 @@ spec:
             - { name: APP_OIDC_CLIENT_ID, value: "aifactory" }
             - { name: APP_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_OIDC_CLIENT_SECRET } } }
             - { name: APP_OIDC_REDIRECT_URI, value: "https://aifactory.freundcloud.org.uk/api/auth/oidc/callback" }
+            # rmux Live Agent Console — always on
+            - { name: APP_RMUX_ENABLED, value: "true" }
+            - { name: AIFACTORY_RMUX_ENABLED, value: "true" }
+            - { name: AIFACTORY_RMUX_PANES_DIR, value: "/home/nonroot/.aifactory/rmux-panes" }
+            # provider keys (codex/antigravity/etc.) from factory-secrets
+            - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
+            - { name: GEMINI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: GEMINI_API_KEY } } }
+            - { name: CONTEXT7_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CONTEXT7_KEY } } }
+            - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
+            - { name: RAPIDAPI_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: RAPIDAPI_KEY } } }
+            - { name: CLAUDE_CODE_OAUTH_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: CLAUDE_CODE_OAUTH_TOKEN } } }
           volumeMounts: [{ name: data, mountPath: /home/nonroot/.aifactory }]
           readinessProbe: { httpGet: { path: /api/health, port: 3101 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3101 }, initialDelaySeconds: 30, periodSeconds: 20 }
