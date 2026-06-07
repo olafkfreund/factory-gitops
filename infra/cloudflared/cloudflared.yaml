@@ -23,6 +23,15 @@ data:
         service: http://tfactory.factory.svc.cluster.local:3103
       - hostname: keycloak.freundcloud.org.uk
         service: http://keycloak.factory.svc.cluster.local:8080
+      # argocd-server has --insecure set in the bootstrap sidecar patch so
+      # plain HTTP works without the HTTP→HTTPS redirect loop. Service is
+      # in the argocd namespace, not factory.
+      - hostname: argocd.freundcloud.org.uk
+        service: http://argocd-server.argocd.svc.cluster.local:80
+      - hostname: skillai.freundcloud.org.uk
+        service: http://skillai-app.factory.svc.cluster.local:3000
+      - hostname: rolehunter.freundcloud.org.uk
+        service: http://rolehunter-app.factory.svc.cluster.local:3000
       - service: http_status:404
 ---
 apiVersion: apps/v1
