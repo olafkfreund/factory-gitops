@@ -1,0 +1,33 @@
+# Strategic-merge patch: add --insecure to argocd-server.
+#
+# WHY: argocd-server is reached by the in-cluster cloudflared connector
+# (factory namespace) over plain HTTP on the Pod's loopback. Without
+# --insecure, argocd-server tries to redirect every request from HTTP
+# to HTTPS at the application layer, which causes a 307 → 307 → … loop
+# (cloudflared re-fronts each redirect with HTTPS, the app sees HTTP
+# again, and we never converge). --insecure tells argocd-server to
+# accept the X-Forwarded-Proto header from cloudflared instead.
+#
+# TLS termination is at Cloudflare's edge with a real Let's Encrypt
+# cert for our public hostname. The loopback hop being plaintext is
+# fine — it never leaves the Pod.
+#
+# This patch replaces the now-deleted argocd-sidecar-patch.yaml from
+# the previous Tailscale-sidecar architecture (decommissioned
+# 2026-06-07; see public-ingress docs).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-server
+  namespace: argocd
+spec:
+  template:
+    spec:
+      containers:
+        - name: argocd-server
+          # Upstream argocd-server defines argv via `args`. Patch `args`
+          # rather than `command` to add a flag without losing the binary
+          # path that the image's ENTRYPOINT relies on.
+          args:
+            - /usr/local/bin/argocd-server
+            - --insecure
