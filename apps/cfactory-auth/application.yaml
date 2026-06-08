@@ -1,0 +1,24 @@
+# CFactory SSO — oauth2-proxy in front of cfactory-frontend.
+# Source: apps/cfactory-auth/manifests in this repo.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cfactory-auth
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/cfactory-auth/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

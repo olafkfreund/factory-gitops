@@ -13,8 +13,11 @@ data:
     metrics: 0.0.0.0:2000
     no-autoupdate: true
     ingress:
+      # CFactory cockpit sits behind oauth2-proxy (Keycloak SSO).
+      # The proxy lives in the factory ns alongside the frontend; see
+      # apps/cfactory-auth/. Keycloak realm: factory, client: cfactory.
       - hostname: cfactory.freundcloud.org.uk
-        service: http://cfactory-frontend.factory.svc.cluster.local:80
+        service: http://oauth2-proxy-cfactory.factory.svc.cluster.local:4180
       - hostname: aifactory.freundcloud.org.uk
         service: http://aifactory.factory.svc.cluster.local:3101
       - hostname: pfactory.freundcloud.org.uk
