@@ -6,4 +6,4 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/odin
   newName: ghcr.io/olafkfreund/odin
-  newTag: sha-b3ac685
+  newTag: sha-2281f0f
