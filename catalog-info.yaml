@@ -190,3 +190,32 @@ spec:
   dependsOn:
     - component:default/factory-gitops
 
+---
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: odin-deployment
+  title: Odin deployment (factory cluster)
+  description: |
+    Odin Homelab Portal's deployment in the k3d-factory cluster. Managed by the
+    `odin` ArgoCD Application.
+  annotations:
+    backstage.io/source-location: url:https://github.com/olafkfreund/factory-gitops/tree/main/apps/odin/
+    github.com/project-slug: olafkfreund/Odin
+    argocd/app-name: odin
+    backstage.io/kubernetes-label-selector: app=odin-dashboard
+  tags:
+    - factory
+    - odin
+    - argocd-app
+  links:
+    - url: https://github.com/olafkfreund/Odin
+      title: Odin product repo
+      icon: github
+spec:
+  type: service
+  lifecycle: experimental
+  owner: olafkfreund
+  system: freundcloud-infra
+  dependsOn:
+    - component:default/factory-gitops
