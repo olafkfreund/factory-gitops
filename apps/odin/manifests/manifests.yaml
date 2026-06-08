@@ -17,6 +17,7 @@ spec:
       labels:
         app: odin-dashboard
     spec:
+      serviceAccountName: odin-dashboard-sa
       imagePullSecrets:
         - name: ghcr-pull
       containers:
@@ -67,3 +68,40 @@ spec:
     name: http
   selector:
     app: odin-dashboard
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: odin-dashboard-sa
+  namespace: factory
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: odin-dashboard-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services", "namespaces", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/rollback"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["argocd.argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: odin-dashboard-rolebinding
+subjects:
+  - kind: ServiceAccount
+    name: odin-dashboard-sa
+    namespace: factory
+roleRef:
+  kind: ClusterRole
+  name: odin-dashboard-role
+  apiGroup: rbac.authorization.k8s.io
