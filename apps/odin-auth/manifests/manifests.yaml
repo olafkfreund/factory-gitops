@@ -1,0 +1,109 @@
+# Keycloak SSO for Odin via oauth2-proxy.
+#
+# Odin (FastAPI) has no native auth; this fronts it with oauth2-proxy
+# talking OIDC to keycloak.factory.svc:8080 (realm `factory`,
+# client `odin-dashboard`). The cluster cloudflared ingress for
+# odin.freundcloud.org.uk points HERE instead of odin-dashboard, so
+# every public request is gated by a Keycloak login before reaching
+# Odin's /api/* routes.
+#
+# Convention note: aifactory/pfactory/tfactory use native in-app OIDC
+# (APP_OIDC_* env vars); Odin uses oauth2-proxy by deliberate choice
+# until a future Odin release ships native OIDC. See
+# docs/architecture/public-ingress.md for the SSO design.
+#
+# Secret `oauth2-proxy-odin` (client-id, client-secret, cookie-secret)
+# is created out-of-band via kubectl — NOT in this repo until
+# sealed-secrets / external-secrets-operator lands.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy-odin
+  namespace: factory
+  labels:
+    app: oauth2-proxy-odin
+    app.kubernetes.io/instance: odin-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy-odin
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy-odin
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0
+          args:
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url=https://keycloak.freundcloud.org.uk/realms/factory
+            - --redirect-url=https://odin.freundcloud.org.uk/oauth2/callback
+            - --upstream=http://odin-dashboard.factory.svc.cluster.local:8000
+            - --http-address=0.0.0.0:4180
+            - --reverse-proxy=true
+            - --email-domain=*
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --pass-access-token=true
+            - --pass-authorization-header=true
+            - --set-xauthrequest=true
+            - --skip-provider-button=true
+            - --whitelist-domain=odin.freundcloud.org.uk
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-odin
+                  key: client-id
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-odin
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-odin
+                  key: cookie-secret
+          ports:
+            - name: http
+              containerPort: 4180
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy-odin
+  namespace: factory
+  labels:
+    app: oauth2-proxy-odin
+    app.kubernetes.io/instance: odin-auth
+spec:
+  selector:
+    app: oauth2-proxy-odin
+  ports:
+    - name: http
+      port: 4180
+      targetPort: 4180

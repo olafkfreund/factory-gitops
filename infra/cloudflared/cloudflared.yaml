@@ -32,8 +32,11 @@ data:
         service: http://skillai-app.factory.svc.cluster.local:3000
       - hostname: rolehunter.freundcloud.org.uk
         service: http://rolehunter-app.factory.svc.cluster.local:3000
+      # Odin sits behind oauth2-proxy (Keycloak SSO). The proxy lives in the
+      # factory ns alongside Odin; see apps/odin-auth/ for the deployment.
+      # Keycloak realm: factory, client: odin-dashboard.
       - hostname: odin.freundcloud.org.uk
-        service: http://odin-dashboard.factory.svc.cluster.local:8000
+        service: http://oauth2-proxy-odin.factory.svc.cluster.local:4180
       - service: http_status:404
 ---
 apiVersion: apps/v1
