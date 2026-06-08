@@ -5,4 +5,4 @@ resources:
   - manifests.yaml
 images:
   - name: ghcr.io/olafkfreund/tfactory
-    newTag: "0.6.1"
+    newTag: "0.6.2"
