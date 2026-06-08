@@ -2,8 +2,9 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: factory
 resources:
-  - manifests.yaml
+- manifests.yaml
 # CI bumps `newTag` via: kustomize edit set image ghcr.io/olafkfreund/aifactory=ghcr.io/olafkfreund/aifactory:<tag>
 images:
-  - name: ghcr.io/olafkfreund/aifactory
-    newTag: v3.4.5-rmux-nocache
+- name: ghcr.io/olafkfreund/aifactory
+  newName: ghcr.io/olafkfreund/aifactory
+  newTag: sha-1c44e63
