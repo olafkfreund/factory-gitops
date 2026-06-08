@@ -1,0 +1,108 @@
+# Keycloak SSO for CFactory via oauth2-proxy.
+#
+# CFactory's frontend (cfactory-frontend:80) has no native auth; this
+# fronts it with oauth2-proxy talking OIDC to keycloak.factory.svc:8080
+# (realm `factory`, client `cfactory`). The cluster cloudflared ingress
+# for cfactory.freundcloud.org.uk points HERE instead of the frontend,
+# so every public request is gated by a Keycloak login before reaching
+# the cockpit UI. The cfactory backend (cfactory:3111) stays internal —
+# only the frontend talks to it (BACKEND_URL=...svc.cluster.local:3111).
+#
+# Convention note: same pattern as apps/odin-auth/. aifactory/pfactory/
+# tfactory still use native in-app OIDC (APP_OIDC_* env vars).
+#
+# Secret `oauth2-proxy-cfactory` (client-id, client-secret, cookie-secret)
+# is created out-of-band via kubectl — NOT in this repo until
+# sealed-secrets / external-secrets-operator lands.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy-cfactory
+  namespace: factory
+  labels:
+    app: oauth2-proxy-cfactory
+    app.kubernetes.io/instance: cfactory-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy-cfactory
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy-cfactory
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0
+          args:
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url=https://keycloak.freundcloud.org.uk/realms/factory
+            - --redirect-url=https://cfactory.freundcloud.org.uk/oauth2/callback
+            - --upstream=http://cfactory-frontend.factory.svc.cluster.local:80
+            - --http-address=0.0.0.0:4180
+            - --reverse-proxy=true
+            - --email-domain=*
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --pass-access-token=true
+            - --pass-authorization-header=true
+            - --set-xauthrequest=true
+            - --skip-provider-button=true
+            - --whitelist-domain=cfactory.freundcloud.org.uk
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-cfactory
+                  key: client-id
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-cfactory
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-cfactory
+                  key: cookie-secret
+          ports:
+            - name: http
+              containerPort: 4180
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy-cfactory
+  namespace: factory
+  labels:
+    app: oauth2-proxy-cfactory
+    app.kubernetes.io/instance: cfactory-auth
+spec:
+  selector:
+    app: oauth2-proxy-cfactory
+  ports:
+    - name: http
+      port: 4180
+      targetPort: 4180
