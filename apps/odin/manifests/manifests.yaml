@@ -42,6 +42,22 @@ spec:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: false
           runAsNonRoot: false
+        volumeMounts:
+        - name: media
+          mountPath: /mnt/media
+          readOnly: true
+        - name: img-pool
+          mountPath: /mnt/img_pool
+          readOnly: true
+      volumes:
+      - name: media
+        hostPath:
+          path: /mnt/media
+          type: Directory
+      - name: img-pool
+        hostPath:
+          path: /mnt/img_pool
+          type: Directory
 ---
 apiVersion: v1
 kind: Service
