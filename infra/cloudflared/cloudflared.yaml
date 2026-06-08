@@ -32,6 +32,8 @@ data:
         service: http://skillai-app.factory.svc.cluster.local:3000
       - hostname: rolehunter.freundcloud.org.uk
         service: http://rolehunter-app.factory.svc.cluster.local:3000
+      - hostname: odin.freundcloud.org.uk
+        service: http://odin-dashboard.factory.svc.cluster.local:8000
       - service: http_status:404
 ---
 apiVersion: apps/v1

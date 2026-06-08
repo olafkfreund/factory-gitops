@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: odin-dashboard
+  namespace: factory
+  labels:
+    app: odin-dashboard
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: odin-dashboard
+  template:
+    metadata:
+      labels:
+        app: odin-dashboard
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+      - name: odin
+        image: ghcr.io/olafkfreund/odin:0.1.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: SONARR_API_KEY
+          value: "b33eac69aaa94e2ab426f2934eabfb96"
+        - name: RADARR_API_KEY
+          value: "7d825135970740c1bc5845badc47c4ed"
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          runAsNonRoot: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: odin-dashboard
+  namespace: factory
+  labels:
+    app: odin-dashboard
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: odin-dashboard
