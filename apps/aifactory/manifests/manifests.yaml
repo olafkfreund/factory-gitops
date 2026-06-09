@@ -84,6 +84,9 @@ spec:
             - { name: APP_RMUX_ENABLED, value: "true" }
             - { name: AIFACTORY_RMUX_ENABLED, value: "true" }
             - { name: AIFACTORY_RMUX_PANES_DIR, value: "/home/nonroot/.aifactory/rmux-panes" }
+            # k3d can't host bwrap (node is a container); disable the bash sandbox
+            # so agent bash works. Real syscall sandbox via gVisor tracked on AIFactory #363.
+            - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
