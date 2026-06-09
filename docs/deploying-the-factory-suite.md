@@ -59,6 +59,7 @@ Bind via `APP_PORT` (AIF/PF/TF) or `CFACTORY_BACKEND_PORT` (CF).
   `TFACTORY_CONTAINER_BIN=podman`).
 - **Secrets** seeded as `factory/factory-secrets` by the agenix bootstrap (same mechanism as the
   Tailscale auth key): `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY` (opt),
+  `OLLAMA_API_KEY` (opt — PFactory Ollama Cloud, mint at https://ollama.com/settings/keys),
   `CFACTORY_AUDIT_HMAC_SECRET`, Postgres creds, and (Phase 2) the OIDC client secrets.
 
 ## Images
