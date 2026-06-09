@@ -94,6 +94,16 @@ spec:
             # Ollama). optional=true so the pod still starts before the key is
             # seeded into factory-secrets; base URL defaults to https://ollama.com.
             - { name: OLLAMA_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OLLAMA_API_KEY, optional: true } } }
+            # Planning-context MCP server (POST /mcp) auth. /mcp bypasses the
+            # /api auth middleware, so without this it is open to the internet
+            # via the ingress. Reuse the shared APP_API_TOKEN so cross-factory
+            # callers (aifactory/cfactory/tfactory) authenticate with the bearer
+            # they already mount; external anonymous calls get 401.
+            - { name: PFACTORY_MCP_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
+            # Handover/handback target — AIFactory web-server in-cluster (was the
+            # localhost:3101 default). Lets PFactory's /handback-to-aifactory POST
+            # corrections to the live AIFactory instead of a local one.
+            - { name: PFACTORY_AIFACTORY_API_URL, value: "http://aifactory.factory.svc.cluster.local:3101" }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.pfactory }
             - { name: clis,      mountPath: /clis }
