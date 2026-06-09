@@ -3,7 +3,9 @@ kind: Kustomization
 namespace: factory
 resources:
   - manifests.yaml
-# CI bumps newTag via: kustomize edit set image ghcr.io/olafkfreund/pfactory=...:<tag>
+# Pinned by digest after a same-tag rebuild (v0.6.5 incl. agent sandbox deps).
+# IfNotPresent + reused version tags do not redeploy on content change; a
+# digest forces a fresh pull. Long-term fix: sha-based CD (see PFactory #98).
 images:
   - name: ghcr.io/olafkfreund/pfactory
-    newTag: "v0.6.5"
+    digest: sha256:bb1a44c82fa373273e34d1234af6cb787bb90d71df19a020fb9a62e2b5f065a7
