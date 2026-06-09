@@ -72,6 +72,10 @@ spec:
             - { name: PFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+            # Shared static API token for programmatic access (CFactory's adapters
+            # send it as `Authorization: Bearer`). Matches aifactory so all three
+            # factories accept the one shared token from factory-secrets.
+            - { name: APP_API_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
             # OIDC SSO via Keycloak
             - { name: APP_OIDC_ENABLED, value: "true" }
             - { name: APP_OIDC_ISSUER_URL, value: "https://keycloak.freundcloud.org.uk/realms/factory" }
