@@ -90,6 +90,9 @@ spec:
             # string like "openai-compatible:qwen3-coder:480b" routes here.
             - { name: OPENAI_COMPATIBLE_BASE_URL, value: "https://ollama.com" }
             - { name: OPENAI_COMPATIBLE_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_COMPATIBLE_API_KEY } } }
+            # TFactory handoff (#496) — opt-in auto-handover of finished tasks
+            # for testing. send_handoff is a no-op without this base URL.
+            - { name: TFACTORY_BASE_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }
             - { name: GEMINI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: GEMINI_API_KEY } } }
             - { name: CONTEXT7_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CONTEXT7_KEY } } }
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
