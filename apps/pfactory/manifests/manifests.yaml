@@ -89,6 +89,11 @@ spec:
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
             - { name: RAPIDAPI_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: RAPIDAPI_KEY } } }
             - { name: CLAUDE_CODE_OAUTH_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: CLAUDE_CODE_OAUTH_TOKEN } } }
+            # Ollama Cloud (PFactory #94) — hosted OpenAI-compatible inference at
+            # https://ollama.com, reachable from the cluster (unlike host-local
+            # Ollama). optional=true so the pod still starts before the key is
+            # seeded into factory-secrets; base URL defaults to https://ollama.com.
+            - { name: OLLAMA_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OLLAMA_API_KEY, optional: true } } }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.pfactory }
             - { name: clis,      mountPath: /clis }
