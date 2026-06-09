@@ -68,6 +68,9 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3103" }
+            # bwrap can't run on k3d (node is a container) — disable the bash sandbox
+            # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
+            - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
             - { name: PATH, value: "/clis/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: TFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
