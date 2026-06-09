@@ -104,6 +104,9 @@ spec:
             # localhost:3101 default). Lets PFactory's /handback-to-aifactory POST
             # corrections to the live AIFactory instead of a local one.
             - { name: PFACTORY_AIFACTORY_API_URL, value: "http://aifactory.factory.svc.cluster.local:3101" }
+            # Persist plan sessions to the PVC (mounted at ~/.pfactory) so they
+            # survive pod restarts/redeploys (the store was in-memory only).
+            - { name: PFACTORY_PLAN_PERSIST, value: "1" }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.pfactory }
             - { name: clis,      mountPath: /clis }
