@@ -72,6 +72,8 @@ spec:
             - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+            # Static API token for programmatic/MCP access (alongside OIDC SSO).
+            - { name: APP_API_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
             # OIDC SSO via Keycloak
             - { name: APP_OIDC_ENABLED, value: "true" }
             - { name: APP_OIDC_ISSUER_URL, value: "https://keycloak.freundcloud.org.uk/realms/factory" }
