@@ -8,4 +8,4 @@ resources:
 # digest forces a fresh pull. Long-term fix: sha-based CD (see PFactory #98).
 images:
   - name: ghcr.io/olafkfreund/pfactory
-            newTag: "v0.6.13"
+    newTag: "v0.6.13"
