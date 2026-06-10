@@ -90,10 +90,15 @@ spec:
             # k3d can't host bwrap (node is a container); disable the bash sandbox
             # so agent bash works. Real syscall sandbox via gVisor tracked on AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
-            # PR endgame (#71 Phase 4): on a clean build, open a PR + request a
-            # Copilot review, then STOP for a human. AUTO_MERGE deliberately left
-            # UNSET (off) — nothing is auto-merged until explicitly enabled.
-            - { name: AIFACTORY_AUTO_PR, value: "true" }
+            # PR endgame (#71 Phase 4) — OPT-IN, default OFF. When "true", a
+            # clean build opens a PR + requests a Copilot review, then STOPS for
+            # a human. AIFACTORY_AUTO_MERGE (also default off) additionally
+            # merges on Copilot APPROVED + re-tests. NOTE: live Copilot review
+            # requires GitHub Copilot *code review* enabled for the repo/org;
+            # without it the watcher degrades to pending→timeout→human-stop.
+            # See guides/pr-endgame.md. Verified live 2026-06-10 (PR #10 on
+            # aifactory-test). Left OFF after the test — flip to "true" to opt in.
+            - { name: AIFACTORY_AUTO_PR, value: "false" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
