@@ -50,6 +50,10 @@ spec:
             # (default) until explicitly switched via CFACTORY_COPILOT_PROVIDER.
             - { name: OLLAMA_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OLLAMA_API_KEY } } }
             - { name: CFACTORY_AUDIT_HMAC_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_AUDIT_HMAC_SECRET } } }
+            # Bearer secret guarding the read-only MCP server at POST /mcp (#71).
+            # Reuses the shared APP_API_TOKEN so the conductor authenticates with
+            # the same token it uses for the other factories. Unset => /mcp open.
+            - { name: CFACTORY_MCP_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
           volumeMounts: [{ name: data, mountPath: /home/nonroot/.cfactory }]
           readinessProbe: { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 20, periodSeconds: 20 }
