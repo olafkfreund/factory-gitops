@@ -3,9 +3,9 @@ kind: Kustomization
 namespace: factory
 resources:
   - manifests.yaml
-# Pinned by digest after a same-tag rebuild (v0.6.7 incl. agent sandbox deps, plus restored Planning rail + plan persistence).
-# IfNotPresent + reused version tags do not redeploy on content change; a
-# digest forces a fresh pull. Long-term fix: sha-based CD (see PFactory #98).
+# Fresh version tag per release → a new tag forces the rollout to pull the new
+# image (no digest pin needed; that was only for same-tag rebuilds, see v0.6.7).
+# Long-term fix: sha-based CD (see PFactory #98).
 images:
   - name: ghcr.io/olafkfreund/pfactory
-    newTag: "v0.6.13"
+    newTag: "v0.6.14"
