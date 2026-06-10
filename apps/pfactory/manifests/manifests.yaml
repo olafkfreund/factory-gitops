@@ -68,6 +68,9 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3114" }
+            # Shared HMAC key so PFactory's signed Task Contract verifies in
+            # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
+            - {{ name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: {{ secretKeyRef: {{ name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY }} }} }}
             # bwrap can't run on k3d (node is a container) — disable the bash sandbox
             # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
