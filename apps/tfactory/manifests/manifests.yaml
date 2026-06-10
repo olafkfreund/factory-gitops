@@ -72,6 +72,12 @@ spec:
             # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
             - { name: PATH, value: "/clis/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            # The web-server process must import the backend's `agents` package
+            # (create_spec_ingest_workspace schedules agents.planner on ingest).
+            # Without apps/backend on the path the import fails silently and the
+            # ingested spec sits at status=pending — the verify pipeline never
+            # runs. (#71: AIFactory→TFactory handoff lands but TFactory no-ops.)
+            - { name: PYTHONPATH, value: "/home/projects/MagesticAI/apps/backend" }
             - { name: TFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             # Auto-run the verify pipeline on spec ingest (planner → gen-functional
             # → evaluate → triage) so an AIFactory→TFactory handoff actually
