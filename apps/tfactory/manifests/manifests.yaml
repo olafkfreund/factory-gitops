@@ -73,6 +73,14 @@ spec:
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
             - { name: PATH, value: "/clis/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: TFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
+            # Auto-run the verify pipeline on spec ingest (planner → gen-functional
+            # → evaluate → triage) so an AIFactory→TFactory handoff actually
+            # generates + runs tests and emits a verdict. Without these the spec
+            # ingests but sits at status=pending (the PARR verify leg never runs).
+            - { name: TFACTORY_AUTO_PLAN, value: "true" }
+            - { name: TFACTORY_AUTO_GENERATE, value: "true" }
+            - { name: TFACTORY_AUTO_EVALUATE, value: "true" }
+            - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
             - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
             # Shared static API token for programmatic access (CFactory's adapters
