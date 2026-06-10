@@ -18,6 +18,12 @@ data:
       # apps/cfactory-auth/. Keycloak realm: factory, client: cfactory.
       - hostname: cfactory.freundcloud.org.uk
         service: http://oauth2-proxy-cfactory.factory.svc.cluster.local:4180
+      # CFactory's read-only MCP server (POST /mcp) goes straight to the backend,
+      # bypassing the Keycloak SSO that fronts the human cockpit. Auth is the
+      # backend's own CFACTORY_MCP_SECRET bearer (the shared APP_API_TOKEN) — the
+      # same model as aifactory.freundcloud.org.uk. Lets the PARR conductor (#71).
+      - hostname: cfactory-mcp.freundcloud.org.uk
+        service: http://cfactory.factory.svc.cluster.local:3111
       - hostname: aifactory.freundcloud.org.uk
         service: http://aifactory.factory.svc.cluster.local:3101
       - hostname: pfactory.freundcloud.org.uk
