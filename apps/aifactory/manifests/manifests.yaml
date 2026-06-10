@@ -70,7 +70,7 @@ spec:
             - { name: APP_PORT, value: "3101" }
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
-            - {{ name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: {{ secretKeyRef: {{ name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY }} }} }}
+            - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
             - { name: PATH, value: "/clis/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
