@@ -44,7 +44,6 @@ spec:
             # Shared bearer token the adapters/WS send to the sibling factories.
             # Without it every upstream fetch is 401 and the cockpit shows nothing.
             - { name: CFACTORY_UPSTREAM_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
-            - { name: ANTHROPIC_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: ANTHROPIC_API_KEY } } }
             # Ollama Cloud copilot key (#59). Makes the OpenAI-compatible provider
             # available + connectivity-checkable; copilot_provider stays "claude"
             # (default) until explicitly switched via CFACTORY_COPILOT_PROVIDER.
