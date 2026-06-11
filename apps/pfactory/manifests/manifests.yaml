@@ -112,6 +112,7 @@ spec:
             # Persist plan sessions to the PVC (mounted at ~/.pfactory) so they
             # survive pod restarts/redeploys (the store was in-memory only).
             - { name: PFACTORY_PLAN_PERSIST, value: "1" }
+            - { name: PFACTORY_EXECUTION_MODEL, value: "gemini-2.5-pro" }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.pfactory }
             - { name: clis,      mountPath: /clis }

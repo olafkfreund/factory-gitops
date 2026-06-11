@@ -8,4 +8,4 @@ resources:
 # Long-term fix: sha-based CD (see PFactory #98).
 images:
   - name: ghcr.io/olafkfreund/pfactory
-    newTag: "v0.6.15"
+    newTag: "v0.6.16"
