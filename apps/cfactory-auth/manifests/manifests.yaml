@@ -52,6 +52,13 @@ spec:
             - --set-xauthrequest=true
             - --skip-provider-button=true
             - --whitelist-domain=cfactory.freundcloud.org.uk
+            # Editor OIDC layer: accept a valid Keycloak JWT bearer (from the
+            # factory-vscode public client) instead of forcing an interactive
+            # browser login, so the editor connects via SSO with no API key. The
+            # JWT must carry `cfactory` in its audience (a Keycloak audience mapper
+            # on the factory-vscode client adds it). Browser login is unaffected.
+            - --skip-jwt-bearer-tokens=true
+            - --oidc-extra-audience=factory-vscode
           env:
             - name: OAUTH2_PROXY_CLIENT_ID
               valueFrom:
