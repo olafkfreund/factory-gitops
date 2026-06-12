@@ -2,10 +2,11 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: factory
 resources:
-  - manifests.yaml
+- manifests.yaml
 # Fresh version tag per release → a new tag forces the rollout to pull the new
 # image (no digest pin needed; that was only for same-tag rebuilds, see v0.6.7).
 # Long-term fix: sha-based CD (see PFactory #98).
 images:
-  - name: ghcr.io/olafkfreund/pfactory
-    newTag: "v0.6.16"
+- name: ghcr.io/olafkfreund/pfactory
+  newName: ghcr.io/olafkfreund/pfactory
+  newTag: sha-aa34a23
