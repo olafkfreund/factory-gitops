@@ -53,6 +53,13 @@ spec:
             # Reuses the shared APP_API_TOKEN so the conductor authenticates with
             # the same token it uses for the other factories. Unset => /mcp open.
             - { name: CFACTORY_MCP_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
+            # Token-gated API for editor/external clients (CFactory #75). Enforces a
+            # scoped key on /api/* (+ /connect/*); /health, /mcp and /api/events stay
+            # exempt. The browser cockpit's nginx injects this key (frontend
+            # CFACTORY_API_KEY); editors connect via the cfactory-mcp host (which
+            # bypasses oauth2-proxy) with the key shown on /settings/token.
+            - { name: CFACTORY_API_KEYS, valueFrom: { secretKeyRef: { name: cfactory-api-keys, key: api-keys } } }
+            - { name: CFACTORY_PUBLIC_API_URL, value: "https://cfactory-mcp.freundcloud.org.uk" }
           volumeMounts: [{ name: data, mountPath: /home/nonroot/.cfactory }]
           readinessProbe: { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 20, periodSeconds: 20 }
