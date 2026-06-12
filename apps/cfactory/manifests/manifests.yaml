@@ -88,5 +88,10 @@ spec:
           ports: [{ containerPort: 8080 }]
           env:
             - { name: BACKEND_URL, value: "http://cfactory.factory.svc.cluster.local:3111" }
+            # Cockpit nginx injects this as `Authorization: Bearer <key>` on /api +
+            # /connect so the browser cockpit keeps working once the backend
+            # keystore is enforced (CFactory #75). Bare key form; same key as the
+            # backend's CFACTORY_API_KEYS. Harmless no-op while the keystore is open.
+            - { name: CFACTORY_API_KEY, valueFrom: { secretKeyRef: { name: cfactory-api-keys, key: api-key } } }
           readinessProbe: { httpGet: { path: /, port: 8080 }, initialDelaySeconds: 5, periodSeconds: 10 }
           resources: { requests: { cpu: 20m, memory: 32Mi }, limits: { memory: 128Mi } }
