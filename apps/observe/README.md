@@ -69,24 +69,100 @@ OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic <base64(email:password)>
 # echo -n 'admin@freundcloud.org.uk:<password>' | base64
 ```
 
-## 3. Public UI host (operator-added cloudflared route)
+## 3. Public UI host — Keycloak SSO via oauth2-proxy (IMPLEMENTED)
 
 The web UI is reachable in-cluster at `http://observe.factory.svc.cluster.local:5080`.
-To expose it publicly on its own host **observe.freundcloud.org.uk** — mirroring
-how cfactory is exposed — the operator adds ONE ingress entry to the shared
-`infra/cloudflared/cloudflared.yaml` ConfigMap (kept out of this PR on purpose,
-so this app touches no shared/CFactory config):
+It is now exposed publicly on its own host **observe.freundcloud.org.uk**, fronted
+by Keycloak SSO — mirroring EXACTLY how cfactory is exposed (`apps/cfactory-auth/`).
+This was wired up in this repo (no longer an out-of-band operator one-liner):
 
-```yaml
-      - hostname: observe.freundcloud.org.uk
-        service: http://observe.factory.svc.cluster.local:5080
-```
+- **`apps/observe-auth/`** — an ArgoCD `Application` (auto-discovered by the
+  root App-of-Apps, same as `cfactory-auth`) that deploys an
+  `oauth2-proxy-observe` Deployment + Service (`:4180`). It talks OIDC to
+  Keycloak (realm `factory`, client `observe`,
+  issuer `https://keycloak.freundcloud.org.uk/realms/factory`,
+  redirect `https://observe.freundcloud.org.uk/oauth2/callback`) and proxies
+  authenticated traffic upstream to `http://observe.factory.svc.cluster.local:5080`.
+- **`infra/cloudflared/cloudflared.yaml`** — one ADDED ingress route (existing
+  routes untouched), placed with the other oauth2-proxy'd services and before
+  the `http_status:404` catch-all:
 
-Optionally front it with a Keycloak `oauth2-proxy-observe` (copy `apps/cfactory-auth/`)
-if the UI should require SSO. OpenObserve also has its own login (the root user
-above), so the bare route is already credential-gated.
+  ```yaml
+        - hostname: observe.freundcloud.org.uk
+          service: http://oauth2-proxy-observe.factory.svc.cluster.local:4180
+  ```
 
-The DNS record + cloudflared route + any SSO are the operator's decision.
+In-cluster OTLP ingest (§2) is unaffected: AIFactory ships to the `observe`
+Service (`:5080`/`:5081`) directly and never traverses oauth2-proxy or cloudflared.
+
+### Operator steps the operator MUST do (SSO is manual, like every other Factory client)
+
+Keycloak clients in this suite are created **imperatively** with `kcadm.sh`
+inside the Keycloak pod — there is no declarative realm-import in this repo
+(see `docs/keycloak-sso.md`). So the `observe` client and its Secret are NOT in
+git and the operator must create them:
+
+1. **Create the `observe` OIDC client** in realm `factory` (mirrors §2 of
+   `docs/keycloak-sso.md`):
+
+   ```bash
+   KCPOD=$(kubectl -n factory get pod -l app=keycloak -o jsonpath='{.items[0].metadata.name}')
+   kubectl -n factory exec "$KCPOD" -c keycloak -- bash -c '
+     K=/opt/keycloak/bin/kcadm.sh
+     $K config credentials --server http://localhost:8080 --realm master \
+        --user admin --password "$KC_BOOTSTRAP_ADMIN_PASSWORD"
+     $K create clients -r factory \
+       -s clientId=observe -s enabled=true -s protocol=openid-connect \
+       -s publicClient=false -s standardFlowEnabled=true \
+       -s "redirectUris=[\"https://observe.freundcloud.org.uk/oauth2/callback\"]" \
+       -s "webOrigins=[\"https://observe.freundcloud.org.uk\"]" || echo "observe client exists"
+   '
+   ```
+
+   IMPORTANT: the `observe` client's redirect URI is the **oauth2-proxy callback**
+   `https://observe.freundcloud.org.uk/oauth2/callback` (NOT the app `/api/auth/...`
+   path used by the native-OIDC apps) — same as `cfactory` / `odin-dashboard`.
+
+2. **Read the generated client secret** (do not echo it into git/logs):
+
+   ```bash
+   kubectl -n factory exec "$KCPOD" -c keycloak -- bash -c '
+     K=/opt/keycloak/bin/kcadm.sh
+     $K config credentials --server http://localhost:8080 --realm master \
+        --user admin --password "$KC_BOOTSTRAP_ADMIN_PASSWORD"
+     CID=$($K get clients -r factory -q clientId=observe --fields id --format csv --noquotes)
+     $K get clients/$CID/client-secret -r factory --fields value --format csv --noquotes
+   '
+   ```
+
+3. **Create the `oauth2-proxy-observe` Secret** the proxy references (same shape
+   as `oauth2-proxy-cfactory` — three keys: `client-id`, `client-secret`,
+   `cookie-secret`). The cookie secret must be a fresh random 32-byte value:
+
+   ```bash
+   kubectl -n factory create secret generic oauth2-proxy-observe \
+     --from-literal=client-id='observe' \
+     --from-literal=client-secret='<the secret from step 2>' \
+     --from-literal=cookie-secret="$(openssl rand -base64 32 | tr -d '\n')"
+   ```
+
+   Without this Secret the `oauth2-proxy-observe` pod will not start (the env
+   refs are required), so the route will return 502 until it exists.
+
+4. **DNS**: add the `observe.freundcloud.org.uk` CNAME to the Cloudflare tunnel
+   (same as the other `*.freundcloud.org.uk` hosts).
+
+5. **cloudflared rollout**: cloudflared reloads its config on file change, but
+   the ConfigMap-mounted `config.yaml` may not hot-reload inside the running
+   pod. If the new route 404s after the ArgoCD sync, restart the connector to
+   pick up the new ingress entry:
+
+   ```bash
+   kubectl -n factory rollout restart deployment/cloudflared
+   ```
+
+OpenObserve also has its own root login (the `observe-root` Secret in §1), so
+after the Keycloak gate the operator still authenticates to OpenObserve itself.
 
 ## 4. Import the starter dashboard
 

@@ -1,0 +1,28 @@
+# Observe SSO — oauth2-proxy in front of the OpenObserve UI (service: observe).
+# Source: apps/observe-auth/manifests in this repo.
+#
+# Mirrors apps/cfactory-auth/ exactly: an ArgoCD Application that the root
+# App-of-Apps (bootstrap/argocd-root-app.yaml) auto-discovers via the
+# recursive apps/**/application.yaml glob — no extra registration needed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: observe-auth
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/observe-auth/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
