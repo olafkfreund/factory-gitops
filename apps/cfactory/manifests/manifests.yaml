@@ -59,6 +59,10 @@ spec:
             # CFACTORY_API_KEY); editors connect via the cfactory-mcp host (which
             # bypasses oauth2-proxy) with the key shown on /settings/token.
             - { name: CFACTORY_API_KEYS, valueFrom: { secretKeyRef: { name: cfactory-api-keys, key: api-keys } } }
+            # OpenObserve backend (apps/observe) for the cockpit Services view.
+            # CFactory's Services probe hits <url>/healthz (200, no auth) to mark
+            # `observe` reachable. Base URL only — additive, best-effort.
+            - { name: CFACTORY_OBSERVE_API_URL, value: "http://observe.factory.svc.cluster.local:5080" }
             - { name: CFACTORY_PUBLIC_API_URL, value: "https://cfactory-mcp.freundcloud.org.uk" }
           volumeMounts: [{ name: data, mountPath: /home/nonroot/.cfactory }]
           readinessProbe: { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 6 }
