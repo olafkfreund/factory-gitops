@@ -112,6 +112,18 @@ spec:
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
             - { name: RAPIDAPI_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: RAPIDAPI_KEY } } }
             - { name: CLAUDE_CODE_OAUTH_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: CLAUDE_CODE_OAUTH_TOKEN } } }
+            # OpenTelemetry export -> in-cluster OpenObserve OTLP/HTTP backend
+            # (apps/observe, service `observe:5080`). The web-server exporter
+            # (#567) honors these and is a NO-OP when OTEL_EXPORTER_OTLP_ENDPOINT
+            # is unset; a bad endpoint only logs (never crashes the factory).
+            # OpenObserve ingests OTLP/HTTP under an org-scoped base; the OTel SDK
+            # appends /v1/{traces,metrics,logs}. Org = `default`. Verified live:
+            # POST .../api/default/v1/traces -> 401 unauth / 400 with Basic auth.
+            # Auth header (HTTP Basic root creds) is sourced from secret
+            # otel-otlp-auth (key `headers`) — NEVER inlined; built from observe-root.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://observe.factory.svc.cluster.local:5080/api/default" }
+            - { name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf" }
+            - { name: OTEL_EXPORTER_OTLP_HEADERS, valueFrom: { secretKeyRef: { name: otel-otlp-auth, key: headers } } }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.aifactory }
             - { name: clis,      mountPath: /clis }
