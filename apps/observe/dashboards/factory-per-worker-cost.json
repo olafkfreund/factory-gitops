@@ -1,0 +1,130 @@
+{
+  "version": 3,
+  "dashboardId": "factory-per-worker-cost",
+  "title": "Factory — Per-worker / per-provider cost & observability",
+  "description": "P1 metrics from AIFactory parallel builds: tokens, cost (by provider/model), worker duration, and soft-budget breaches. OTel metric names are dot-named at the source (gen_ai.input_tokens, ...) and arrive in OpenObserve's metrics stream with dots normalised to underscores; queries below use the underscore form. Tags: provider, model, phase.",
+  "role": "",
+  "owner": "factory",
+  "created": "2026-06-13T12:00:00Z",
+  "variables": {
+    "list": [
+      {
+        "type": "custom",
+        "name": "provider",
+        "label": "provider",
+        "query_data": null,
+        "value": "",
+        "options": [
+          { "label": "all", "value": "" },
+          { "label": "claude", "value": "claude" },
+          { "label": "gemini", "value": "gemini" },
+          { "label": "ollama", "value": "ollama" }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": "panel-cost-by-provider",
+      "type": "bar",
+      "title": "Cost (USD) by provider",
+      "description": "gen_ai.cost_usd summed per provider. Local providers (Ollama) report 0.",
+      "config": { "show_legends": true, "legends_position": "bottom", "unit": "currency", "unit_custom": "USD" },
+      "queryType": "promql",
+      "queries": [
+        {
+          "query": "sum by (provider) (gen_ai_cost_usd_total)",
+          "customQuery": true,
+          "fields": { "stream": "default", "stream_type": "metrics" },
+          "config": { "promql_legend": "{{provider}}" }
+        }
+      ],
+      "layout": { "x": 0, "y": 0, "w": 24, "h": 9, "i": 1 }
+    },
+    {
+      "id": "panel-cost-by-model",
+      "type": "bar",
+      "title": "Cost (USD) by model",
+      "description": "gen_ai.cost_usd summed per model.",
+      "config": { "show_legends": true, "legends_position": "bottom", "unit": "currency", "unit_custom": "USD" },
+      "queryType": "promql",
+      "queries": [
+        {
+          "query": "sum by (model) (gen_ai_cost_usd_total)",
+          "customQuery": true,
+          "fields": { "stream": "default", "stream_type": "metrics" },
+          "config": { "promql_legend": "{{model}}" }
+        }
+      ],
+      "layout": { "x": 24, "y": 0, "w": 24, "h": 9, "i": 2 }
+    },
+    {
+      "id": "panel-input-tokens",
+      "type": "line",
+      "title": "Input tokens by provider",
+      "description": "gen_ai.input_tokens rate, per provider.",
+      "config": { "show_legends": true, "legends_position": "bottom", "unit": "default" },
+      "queryType": "promql",
+      "queries": [
+        {
+          "query": "sum by (provider) (rate(gen_ai_input_tokens_total[5m]))",
+          "customQuery": true,
+          "fields": { "stream": "default", "stream_type": "metrics" },
+          "config": { "promql_legend": "{{provider}}" }
+        }
+      ],
+      "layout": { "x": 0, "y": 9, "w": 24, "h": 9, "i": 3 }
+    },
+    {
+      "id": "panel-output-tokens",
+      "type": "line",
+      "title": "Output tokens by provider",
+      "description": "gen_ai.output_tokens rate, per provider.",
+      "config": { "show_legends": true, "legends_position": "bottom", "unit": "default" },
+      "queryType": "promql",
+      "queries": [
+        {
+          "query": "sum by (provider) (rate(gen_ai_output_tokens_total[5m]))",
+          "customQuery": true,
+          "fields": { "stream": "default", "stream_type": "metrics" },
+          "config": { "promql_legend": "{{provider}}" }
+        }
+      ],
+      "layout": { "x": 24, "y": 9, "w": 24, "h": 9, "i": 4 }
+    },
+    {
+      "id": "panel-worker-duration-p95",
+      "type": "line",
+      "title": "Worker duration p95 (ms) by provider",
+      "description": "worker.duration_ms histogram, 95th percentile per provider.",
+      "config": { "show_legends": true, "legends_position": "bottom", "unit": "milliseconds" },
+      "queryType": "promql",
+      "queries": [
+        {
+          "query": "histogram_quantile(0.95, sum by (provider, le) (rate(worker_duration_ms_bucket[5m])))",
+          "customQuery": true,
+          "fields": { "stream": "default", "stream_type": "metrics" },
+          "config": { "promql_legend": "{{provider}}" }
+        }
+      ],
+      "layout": { "x": 0, "y": 18, "w": 24, "h": 9, "i": 5 }
+    },
+    {
+      "id": "panel-budget-exceeded",
+      "type": "stat",
+      "title": "Budget exceeded (count)",
+      "description": "budget.exceeded counter — soft-budget breaches. Observe-and-warn only; never aborts a build.",
+      "config": { "show_legends": false, "unit": "default" },
+      "queryType": "promql",
+      "queries": [
+        {
+          "query": "sum(increase(budget_exceeded_total[24h]))",
+          "customQuery": true,
+          "fields": { "stream": "default", "stream_type": "metrics" },
+          "config": { "promql_legend": "breaches (24h)" }
+        }
+      ],
+      "layout": { "x": 24, "y": 18, "w": 24, "h": 9, "i": 6 }
+    }
+  ]
+}

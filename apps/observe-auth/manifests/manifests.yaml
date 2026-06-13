@@ -1,0 +1,110 @@
+# Keycloak SSO for the OpenObserve UI via oauth2-proxy.
+#
+# OpenObserve (service `observe`, :5080) has its own root login, but to put
+# it behind the same Factory-wide Keycloak SSO as the cockpit, this fronts
+# it with oauth2-proxy talking OIDC to keycloak.factory.svc:8080
+# (realm `factory`, client `observe`). The cluster cloudflared ingress for
+# observe.freundcloud.org.uk points HERE instead of the observe Service, so
+# every public request is gated by a Keycloak login before reaching the UI.
+# In-cluster OTLP ingest (AIFactory -> observe:5080/:5081) is unaffected — it
+# talks to the observe Service directly and never traverses this proxy.
+#
+# Convention note: same pattern as apps/cfactory-auth/ and apps/odin-auth/.
+# aifactory/pfactory/tfactory use native in-app OIDC (APP_OIDC_* env vars);
+# observe (like cfactory and odin) has no native OIDC, so oauth2-proxy fronts it.
+#
+# Secret `oauth2-proxy-observe` (client-id, client-secret, cookie-secret) is
+# created out-of-band via kubectl — NOT in this repo until sealed-secrets /
+# external-secrets-operator lands. See apps/observe/README.md.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy-observe
+  namespace: factory
+  labels:
+    app: oauth2-proxy-observe
+    app.kubernetes.io/instance: observe-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy-observe
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy-observe
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0
+          args:
+            - --provider=keycloak-oidc
+            - --oidc-issuer-url=https://keycloak.freundcloud.org.uk/realms/factory
+            - --redirect-url=https://observe.freundcloud.org.uk/oauth2/callback
+            - --upstream=http://observe.factory.svc.cluster.local:5080
+            - --http-address=0.0.0.0:4180
+            - --reverse-proxy=true
+            - --email-domain=*
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --pass-access-token=true
+            - --pass-authorization-header=true
+            - --set-xauthrequest=true
+            - --skip-provider-button=true
+            - --whitelist-domain=observe.freundcloud.org.uk
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-observe
+                  key: client-id
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-observe
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-observe
+                  key: cookie-secret
+          ports:
+            - name: http
+              containerPort: 4180
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy-observe
+  namespace: factory
+  labels:
+    app: oauth2-proxy-observe
+    app.kubernetes.io/instance: observe-auth
+spec:
+  selector:
+    app: oauth2-proxy-observe
+  ports:
+    - name: http
+      port: 4180
+      targetPort: 4180

@@ -46,6 +46,13 @@ data:
       # Keycloak realm: factory, client: odin-dashboard.
       - hostname: odin.freundcloud.org.uk
         service: http://oauth2-proxy-odin.factory.svc.cluster.local:4180
+      # OpenObserve UI sits behind oauth2-proxy (Keycloak SSO). The proxy
+      # lives in the factory ns alongside the observe Service; see
+      # apps/observe-auth/ for the deployment. Keycloak realm: factory,
+      # client: observe. In-cluster OTLP ingest hits observe:5080/:5081
+      # directly and does not traverse this route.
+      - hostname: observe.freundcloud.org.uk
+        service: http://oauth2-proxy-observe.factory.svc.cluster.local:4180
       - service: http_status:404
 ---
 apiVersion: apps/v1

@@ -1,0 +1,37 @@
+# OpenObserve — bundled OTLP backend for the Factory program (P2 of the
+# per-worker observability design, docs/plans/2026-06-13-per-worker-observability-design.md
+# in the Factory spec repo).
+#
+# Isolated, ADDITIVE sibling app. Single-binary OpenObserve (OTLP-native,
+# local Parquet + SQLite) that AIFactory's OTel exporter ships to via
+# OTEL_EXPORTER_OTLP_ENDPOINT, and that the CFactory cockpit links to.
+#
+# Manifests live in-gitops (apps/observe/manifests) — same pattern as
+# apps/cfactory — because OpenObserve has no product repo of its own.
+#
+# It does NOT touch any existing app's manifests, CFactory's ingress, or the
+# shared cloudflared route table. Public exposure on its own host
+# (observe.freundcloud.org.uk) is a one-line cloudflared ingress entry the
+# operator adds out-of-band — see apps/observe/README.md.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: observe
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/observe/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
