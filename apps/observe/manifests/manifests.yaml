@@ -1,0 +1,72 @@
+################################################################################
+# OpenObserve — bundled OTLP backend (service: observe)
+#
+# Single-binary OpenObserve: OTLP-native ingest (HTTP on :5080, gRPC on :5081)
+# + web UI (:5080), storing locally to Parquet + SQLite under ZO_DATA_DIR.
+#
+# Ports (OpenObserve defaults):
+#   5080  HTTP  — web UI AND OTLP/HTTP ingest (POST /api/<org>/v1/{traces,metrics,logs})
+#   5081  gRPC  — OTLP/gRPC ingest
+#
+# Isolated: own Deployment/Service/PVC, own labels (app: observe), namespace
+# factory. Touches nothing else. Public exposure is a separate cloudflared
+# route the operator adds (see README.md) — not in this manifest.
+################################################################################
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: observe-data, namespace: factory, labels: { app: observe } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: observe, namespace: factory, labels: { app: observe } }
+spec:
+  selector: { app: observe }
+  ports:
+    # Web UI + OTLP/HTTP ingest.
+    - { name: http, port: 5080, targetPort: 5080 }
+    # OTLP/gRPC ingest.
+    - { name: grpc, port: 5081, targetPort: 5081 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: observe, namespace: factory, labels: { app: observe } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: observe } }
+  # Recreate: single writer to a ReadWriteOnce PVC (Parquet + SQLite), same as cfactory.
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: observe } }
+    spec:
+      enableServiceLinks: false
+      # OpenObserve image runs as root by default; fsGroup lets it own the PVC dir.
+      securityContext: { fsGroup: 65532 }
+      containers:
+        - name: openobserve
+          # Pinned, NOT latest. public.ecr.aws/zinclabs is the official ECR mirror.
+          image: public.ecr.aws/zinclabs/openobserve:v0.90.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 5080, name: http }
+            - { containerPort: 5081, name: grpc }
+          env:
+            # Local data dir on the PVC: Parquet (data) + SQLite (metadata).
+            - { name: ZO_DATA_DIR, value: "/data" }
+            - { name: ZO_HTTP_PORT, value: "5080" }
+            - { name: ZO_GRPC_PORT, value: "5081" }
+            # Bootstrap root user. Credentials are NEVER inlined here — they come
+            # from a Secret the operator creates out-of-band (see README.md):
+            #   kubectl -n factory create secret generic observe-root \
+            #     --from-literal=email=... --from-literal=password=...
+            - { name: ZO_ROOT_USER_EMAIL,    valueFrom: { secretKeyRef: { name: observe-root, key: email } } }
+            - { name: ZO_ROOT_USER_PASSWORD, valueFrom: { secretKeyRef: { name: observe-root, key: password } } }
+          volumeMounts: [{ name: data, mountPath: /data }]
+          readinessProbe: { httpGet: { path: /healthz, port: 5080 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
+          livenessProbe:  { httpGet: { path: /healthz, port: 5080 }, initialDelaySeconds: 30, periodSeconds: 20 }
+          # Modest for a k3d box, per design note.
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 1Gi } }
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: observe-data } }]
