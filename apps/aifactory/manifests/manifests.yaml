@@ -108,6 +108,10 @@ spec:
             # for testing. send_handoff is a no-op without this base URL.
             - { name: TFACTORY_BASE_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }
             - { name: GEMINI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: GEMINI_API_KEY } } }
+            # Headless/automated runs: the gemini/antigravity CLI refuses to run in an
+            # "untrusted" workspace and exits before any API call. The build subprocess
+            # inherits the server env, so set trust here (not just per-invocation).
+            - { name: GEMINI_CLI_TRUST_WORKSPACE, value: "true" }
             - { name: CONTEXT7_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CONTEXT7_KEY } } }
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
             - { name: RAPIDAPI_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: RAPIDAPI_KEY } } }
