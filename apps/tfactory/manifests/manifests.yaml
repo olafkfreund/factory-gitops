@@ -87,6 +87,9 @@ spec:
             - { name: TFACTORY_AUTO_GENERATE, value: "true" }
             - { name: TFACTORY_AUTO_EVALUATE, value: "true" }
             - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
+            # Opt-in LLM staff-engineer review lane (additive, parallel, never
+            # feeds the verdict path). Writes findings/review.json each verify.
+            - { name: TFACTORY_REVIEW_LANE, value: "1" }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
             # Shared static API token for programmatic access (CFactory's adapters
             # send it as `Authorization: Bearer`). Matches aifactory so all three
