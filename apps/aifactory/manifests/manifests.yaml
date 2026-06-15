@@ -23,6 +23,7 @@ spec:
   template:
     metadata: { labels: { app: aifactory } }
     spec:
+      serviceAccountName: aifactory-sandbox
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       securityContext: { fsGroup: 65532 }
@@ -146,3 +147,43 @@ spec:
         - { name: cc-gemini, emptyDir: {} }
         - { name: cc-config, emptyDir: {} }
         - { name: cli-creds, secret: { secretName: factory-cli-creds } }
+---
+# RFC-0005 #68: dedicated SA + scoped Role so the coder can launch per-task
+# verification sandboxes as ephemeral Kubernetes Jobs (the in-cluster backend;
+# the pod has no container runtime). Least-privilege: jobs + read-only pod logs
+# in the factory namespace only. No cluster-wide rights.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aifactory-sandbox
+  namespace: factory
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aifactory-sandbox
+  namespace: factory
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aifactory-sandbox
+  namespace: factory
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aifactory-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: aifactory-sandbox
+    namespace: factory
