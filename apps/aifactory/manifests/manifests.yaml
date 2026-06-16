@@ -105,7 +105,7 @@ spec:
             # prove the path in a real Go build. The kubejob backend takes ONE
             # image, so this only suits single-language (Go) builds — revert to
             # GATES="false" after the proof so non-Go builds aren't gated wrong.
-            - { name: AIFACTORY_SANDBOX_GATES, value: "false" }
+            - { name: AIFACTORY_SANDBOX_GATES, value: "true" }
             - { name: AIFACTORY_SANDBOX_BACKEND, value: "kubejob" }
             - { name: AIFACTORY_SANDBOX_IMAGE, value: "golang:1.25" }
             # provider keys
