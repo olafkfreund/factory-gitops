@@ -99,6 +99,15 @@ spec:
             # See guides/pr-endgame.md. Verified live 2026-06-10 (PR #10 on
             # aifactory-test). Left OFF after the test — flip to "true" to opt in.
             - { name: AIFACTORY_AUTO_PR, value: "false" }
+            # RFC-0005/0006 in-cluster verification gate (#594). Trailing build
+            # gates run as ephemeral k8s Jobs co-mounting the task worktree.
+            # SCOPED EXPERIMENT 2026-06-16: enabled with a Go toolchain image to
+            # prove the path in a real Go build. The kubejob backend takes ONE
+            # image, so this only suits single-language (Go) builds — revert to
+            # GATES="false" after the proof so non-Go builds aren't gated wrong.
+            - { name: AIFACTORY_SANDBOX_GATES, value: "true" }
+            - { name: AIFACTORY_SANDBOX_BACKEND, value: "kubejob" }
+            - { name: AIFACTORY_SANDBOX_IMAGE, value: "golang:1.25" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
