@@ -6,6 +6,28 @@ spec:
   storageClassName: local-path
   resources: { requests: { storage: 5Gi } }
 ---
+# RFC-0005 Tier A: SA + least-privilege RBAC so TFactory can dispatch ephemeral
+# Nix-lane Jobs (tools/runners/kube_sandbox.py) and read their logs. Scoped to
+# the factory namespace; jobs + pod logs only.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: tfactory-sandbox, namespace: factory, labels: { app: tfactory } }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: tfactory-sandbox, namespace: factory, labels: { app: tfactory } }
+rules:
+  - { apiGroups: ["batch"], resources: ["jobs"], verbs: ["create","get","list","watch","delete"] }
+  - { apiGroups: [""], resources: ["pods"], verbs: ["get","list"] }
+  - { apiGroups: [""], resources: ["pods/log"], verbs: ["get"] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: tfactory-sandbox, namespace: factory, labels: { app: tfactory } }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: tfactory-sandbox }
+subjects:
+  - { kind: ServiceAccount, name: tfactory-sandbox, namespace: factory }
+---
 apiVersion: v1
 kind: Service
 metadata: { name: tfactory, namespace: factory, labels: { app: tfactory } }
@@ -23,6 +45,8 @@ spec:
   template:
     metadata: { labels: { app: tfactory } }
     spec:
+      # RFC-0005 Tier A: this SA can create/read the ephemeral Nix-lane Jobs.
+      serviceAccountName: tfactory-sandbox
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       securityContext: { fsGroup: 65532 }
@@ -87,6 +111,10 @@ spec:
             - { name: TFACTORY_AUTO_GENERATE, value: "true" }
             - { name: TFACTORY_AUTO_EVALUATE, value: "true" }
             - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
+            # RFC-0005 Tier A: the Nix-lane k8s-Job sandbox co-mounts the worktree
+            # from this PVC and runs the per-task flake in this thin Nix image.
+            - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
+            - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
