@@ -112,7 +112,11 @@ spec:
             # Persist plan sessions to the PVC (mounted at ~/.pfactory) so they
             # survive pod restarts/redeploys (the store was in-memory only).
             - { name: PFACTORY_PLAN_PERSIST, value: "1" }
-            - { name: PFACTORY_EXECUTION_MODEL, value: "gemini-2.5-pro" }
+            # Execution model for the per-task build (carried into the signed
+            # contract's phase_models). Claude, not gemini: the gemini-cli QA
+            # subprocess repeatedly hit its 300s timeout and escalated builds to
+            # human_review, so we pin the more reliable claude-code CLI here.
+            - { name: PFACTORY_EXECUTION_MODEL, value: "claude-sonnet-4-5-20250929" }
             # Knowledge enrichment: ground plans in the live Backstage catalog
             # (read-only, no auth needed for catalog reads). PFactory surfaces and
             # CITES matching catalog entities in the best-practices review lens.
