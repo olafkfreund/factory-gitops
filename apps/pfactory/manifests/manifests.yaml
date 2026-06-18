@@ -113,6 +113,11 @@ spec:
             # survive pod restarts/redeploys (the store was in-memory only).
             - { name: PFACTORY_PLAN_PERSIST, value: "1" }
             - { name: PFACTORY_EXECUTION_MODEL, value: "gemini-2.5-pro" }
+            # Knowledge enrichment: ground plans in the live Backstage catalog
+            # (read-only, no auth needed for catalog reads). PFactory surfaces and
+            # CITES matching catalog entities in the best-practices review lens.
+            - { name: PFACTORY_ENRICH_CONNECTORS, value: "backstage,best-practices" }
+            - { name: PFACTORY_BACKSTAGE_URL, value: "https://backstage.freundcloud.org.uk" }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.pfactory }
             - { name: clis,      mountPath: /clis }
