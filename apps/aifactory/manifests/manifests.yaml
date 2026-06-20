@@ -6,6 +6,17 @@ spec:
   storageClassName: local-path
   resources: { requests: { storage: 5Gi } }
 ---
+# RFC-0016 #197 — warm /nix/store shared across per-task Nix sandbox Jobs so they
+# stop cold-fetching the closure every run. RWO is fine on this single-node cluster
+# (all Jobs land on the one node holding local-path); a multi-node fleet needs RWX.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: aifactory-nix-store, namespace: factory, labels: { app: aifactory, role: nix-store } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 20Gi } }
+---
 apiVersion: v1
 kind: Service
 metadata: { name: aifactory, namespace: factory, labels: { app: aifactory } }

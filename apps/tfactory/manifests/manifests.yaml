@@ -6,6 +6,17 @@ spec:
   storageClassName: local-path
   resources: { requests: { storage: 5Gi } }
 ---
+# RFC-0016 #197 — warm /nix/store shared across per-task Nix verify Jobs so they
+# stop cold-fetching the closure every run. RWO is fine on this single-node cluster;
+# a multi-node fleet needs RWX.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tfactory-nix-store, namespace: factory, labels: { app: tfactory, role: nix-store } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 20Gi } }
+---
 # RFC-0005 Tier A: SA + least-privilege RBAC so TFactory can dispatch ephemeral
 # Nix-lane Jobs (tools/runners/kube_sandbox.py) and read their logs. Scoped to
 # the factory namespace; jobs + pod logs only.
