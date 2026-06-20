@@ -1,0 +1,32 @@
+# MinIO — S3-compatible object store for PARR artifacts (RFC-0016 #190).
+#
+# Provides the `factory-artifacts` bucket where PFactory / AIFactory / TFactory
+# write build outputs, test reports, evidence and logs as URIs (references, not
+# blobs) — replacing the RWO local-path PVCs that pin a service to one node.
+# Key layout + env-var contract: Factory apis/concurrency-conventions.md §2.
+# Shared client: Factory scripts/artifact_store.py.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
+# the manifests/ kustomization into the `factory` namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: minio
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/minio/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

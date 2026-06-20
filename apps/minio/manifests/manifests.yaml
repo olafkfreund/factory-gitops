@@ -1,0 +1,125 @@
+################################################################################
+# MinIO — S3-compatible object store for PARR artifacts (RFC-0016 #190)
+#
+# Bucket `factory-artifacts`, key layout <service>/<correlation_key>/<job_id>/
+# <role>[/<path>] (Factory apis/concurrency-conventions.md §2). Services reach it
+# via the env contract S3_ENDPOINT / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY
+# (see Factory scripts/artifact_store.py) using the shared `minio-creds` Secret.
+#
+# CREDENTIALS ARE OUT-OF-BAND. Like oauth2-proxy-* (apps/cfactory-auth), the
+# `minio-creds` Secret is NOT committed here (no sealed-secrets / ESO yet). The
+# operator creates it once:
+#
+#   kubectl -n factory create secret generic minio-creds \
+#     --from-literal=S3_ACCESS_KEY="$(openssl rand -hex 16)" \
+#     --from-literal=S3_SECRET_KEY="$(openssl rand -hex 32)"
+#
+# Keys: S3_ACCESS_KEY (MinIO root user) and S3_SECRET_KEY (root password). MinIO
+# and the bucket-init Job both consume these; the consumer services mount the
+# SAME two keys plus a static S3_ENDPOINT/S3_BUCKET. Rotate by recreating the
+# secret and bouncing the minio Deployment + every consumer.
+################################################################################
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: minio-data, namespace: factory, labels: { app: minio } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 20Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: minio, namespace: factory, labels: { app: minio } }
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: minio, namespace: factory, labels: { app: minio } }
+spec:
+  replicas: 1
+  # RWO data PVC -> single writer. Recreate (not RollingUpdate) so the new pod
+  # can take the volume. (Multi-replica MinIO needs distributed mode; out of
+  # scope for #190 — the artifact STORE existing is what unblocks the fleet.)
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { fsGroup: 1000, runAsUser: 1000, runAsNonRoot: true }
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - { containerPort: 9000, name: s3 }
+            - { containerPort: 9001, name: console }
+          env:
+            # MinIO root creds == the shared S3 access/secret the services use.
+            - { name: MINIO_ROOT_USER, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+            - { name: MINIO_ROOT_PASSWORD, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /minio/health/live, port: 9000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 1Gi } }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: minio-data } }
+---
+# Idempotent bucket creation. Runs after MinIO is reachable, creates the
+# `factory-artifacts` bucket if absent (mc mb --ignore-existing) and applies a
+# per-role retention/ILM policy (logs 30d, evidence 90d — conventions §2).
+# A Job (not initContainer) so it can target the in-cluster Service. ArgoCD
+# re-runs it on hook-changes; `--ignore-existing` keeps it safe to re-apply.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-create-bucket
+  namespace: factory
+  labels: { app: minio }
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      restartPolicy: OnFailure
+      enableServiceLinks: false
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "waiting for minio..."
+              until mc alias set fac http://minio.factory.svc.cluster.local:9000 \
+                    "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1; do
+                sleep 3
+              done
+              mc mb --ignore-existing fac/factory-artifacts
+              # Lifecycle: expire logs after 30d, evidence after 90d (conventions §2).
+              # evidence referenced by a VAL claim must outlive the claim, so 90d
+              # is a floor, not an aggressive purge.
+              mc ilm rule add --expire-days 30 --prefix "pfactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
+              mc ilm rule add --expire-days 30 --prefix "aifactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
+              mc ilm rule add --expire-days 30 --prefix "tfactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
+              echo "bucket ready:"; mc ls fac/
+          env:
+            - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+            - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }
