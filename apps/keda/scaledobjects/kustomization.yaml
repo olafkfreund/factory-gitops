@@ -1,7 +1,11 @@
-# GATED — NOT referenced by any ArgoCD Application yet (see README.md).
-# Apply manually with `kubectl apply -k` only AFTER the prerequisites are met.
+# RFC-0016 #192/#220 — ENABLED. Postgres is deployed (apps/postgres), all three
+# services run on it with DATABASE_URL set and a durable `job_states` table, and
+# the per-service factory-db-<svc> Secrets exist — so the postgres-scaler
+# prerequisites are real and these ScaledObjects reconcile cleanly (no perpetual
+# scaler error). Managed by ArgoCD via application.yaml in this directory.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+namespace: factory
 resources:
   - triggerauthentication.yaml
   - pfactory.yaml

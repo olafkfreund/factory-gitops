@@ -30,4 +30,4 @@ spec:
           SELECT count(*) FROM job_states
           WHERE service = 'pfactory' AND lifecycle_state = 'queued'
       authenticationRef:
-        name: factory-postgres
+        name: factory-postgres-pfactory

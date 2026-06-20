@@ -1,24 +1,58 @@
-# TriggerAuthentication for the KEDA PostgreSQL scaler (RFC-0016 #192).
+# TriggerAuthentications for the KEDA PostgreSQL scaler (RFC-0016 #192/#220).
 #
-# Reuses the SAME Postgres connection the control-plane services use. Per
-# Factory apis/concurrency-conventions.md §1 the services read `DATABASE_URL`;
-# KEDA reads the same connection string from a Secret key so the scaler and the
-# app agree on which database holds `job_states`.
+# Topology: one Postgres DB PER SERVICE (apps/postgres). Each service's
+# `job_states` lives in its own DB, so each ScaledObject must connect to ITS
+# OWN database — hence one TriggerAuthentication per service rather than a single
+# shared one.
 #
-# PREREQUISITE: a `factory-db` Secret with key `DATABASE_URL` must exist in the
-# `factory` namespace (created when Postgres is deployed — RFC-0016 Phase 1).
-# Example connection string:
-#   postgresql://factory:<pw>@postgres.factory.svc.cluster.local:5432/<db>?sslmode=disable
+# The KEDA postgres scaler is Go (lib/pq) and needs a LIBPQ connection string
+# (`postgresql://...?sslmode=disable`), NOT the app's SQLAlchemy
+# `postgresql+asyncpg://...` URL. So KEDA reads the `connection` key (libpq form)
+# from the same out-of-band per-service Secret the app mounts.
 #
-# NOTE: TriggerAuthentication is namespace-scoped. It must live in the same
-# namespace as the ScaledObject (here: `factory`, alongside the workloads).
+# PREREQUISITE: per-service `factory-db-<svc>` Secrets with a `connection` key
+# must exist in the `factory` namespace. Created out-of-band when Postgres is
+# deployed (apps/postgres/manifests header), e.g.:
+#
+#   PW=$(kubectl get secret factory-secrets -n factory -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d)
+#   for svc in pfactory tfactory aifactory; do
+#     kubectl create secret generic factory-db-$svc -n factory \
+#       --from-literal=DATABASE_URL="postgresql+asyncpg://factory:$PW@postgres.factory.svc.cluster.local:5432/$svc" \
+#       --from-literal=connection="postgresql://factory:$PW@postgres.factory.svc.cluster.local:5432/$svc?sslmode=disable" \
+#       --dry-run=client -o yaml | kubectl apply -f -
+#   done
+#
+# TriggerAuthentication is namespace-scoped — must live alongside the ScaledObject
+# (here: `factory`).
 apiVersion: keda.sh/v1alpha1
 kind: TriggerAuthentication
 metadata:
-  name: factory-postgres
+  name: factory-postgres-pfactory
   namespace: factory
 spec:
   secretTargetRef:
     - parameter: connection
-      name: factory-db
-      key: DATABASE_URL
+      name: factory-db-pfactory
+      key: connection
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: factory-postgres-tfactory
+  namespace: factory
+spec:
+  secretTargetRef:
+    - parameter: connection
+      name: factory-db-tfactory
+      key: connection
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: factory-postgres-aifactory
+  namespace: factory
+spec:
+  secretTargetRef:
+    - parameter: connection
+      name: factory-db-aifactory
+      key: connection

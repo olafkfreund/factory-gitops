@@ -17,9 +17,13 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: { name: pfactory, namespace: factory, labels: { app: pfactory } }
 spec:
-  replicas: 1
+  # No `replicas:` — KEDA's HPA owns the replica count (RFC-0016 #192). ArgoCD
+  # ignores /spec/replicas (see application.yaml ignoreDifferences) so selfHeal
+  # does not fight the HPA. RollingUpdate (not Recreate) so KEDA can run >1 pod;
+  # the RWO data PVC co-mounts on the single k3d node (multi-replica-safe now
+  # that authoritative state is in Postgres, #220).
   selector: { matchLabels: { app: pfactory } }
-  strategy: { type: Recreate }
+  strategy: { type: RollingUpdate, rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }
   template:
     metadata: { labels: { app: pfactory } }
     spec:

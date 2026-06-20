@@ -1,0 +1,26 @@
+# KEDA ScaledObjects — admission-queue autoscaling for the PARR control plane
+# (RFC-0016 #192/#220). Enabled now that Postgres + DATABASE_URL + job_states +
+# the per-service factory-db-<svc> Secrets are live. Scales pfactory/tfactory on
+# durable queue depth (aifactory wired but capped at 1 — rmux WS fan-out).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: keda-scaledobjects
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/keda/scaledobjects
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
