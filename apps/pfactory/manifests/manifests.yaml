@@ -80,6 +80,15 @@ spec:
             # defaults true), creating job_states + all tables. Out-of-band secret
             # factory-db-pfactory (see apps/postgres/manifests for the convention).
             - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: factory-db-pfactory, key: DATABASE_URL } } }
+            # RFC-0016 #190: S3-compatible object store (in-cluster MinIO) for
+            # the plan's emitted documents (plan/spec markdown + audit pack).
+            # The shared client (apps/backend/runners/artifact_store.py) reads
+            # these; emission is fail-open so an outage never blocks an emit.
+            # Creds from the out-of-band `minio-creds` Secret.
+            - { name: S3_ENDPOINT, value: "http://minio.factory.svc.cluster.local:9000" }
+            - { name: S3_BUCKET, value: "factory-artifacts" }
+            - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+            - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
