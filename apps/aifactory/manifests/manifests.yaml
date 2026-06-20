@@ -112,13 +112,18 @@ spec:
             - { name: AIFACTORY_AUTO_PR, value: "false" }
             # RFC-0005/0006 in-cluster verification gate (#594). Trailing build
             # gates run as ephemeral k8s Jobs co-mounting the task worktree.
-            # SCOPED EXPERIMENT 2026-06-16: enabled with a Go toolchain image to
-            # prove the path in a real Go build. The kubejob backend takes ONE
-            # image, so this only suits single-language (Go) builds — revert to
-            # GATES="false" after the proof so non-Go builds aren't gated wrong.
-            - { name: AIFACTORY_SANDBOX_GATES, value: "false" }
-            - { name: AIFACTORY_SANDBOX_BACKEND, value: "kubejob" }
-            - { name: AIFACTORY_SANDBOX_IMAGE, value: "golang:1.25" }
+            # RFC-0016 #674: nixjob is now the DEFAULT build/gate execution path.
+            # The thin nix-base image carries no toolchains; each task's flake
+            # (materialized from the contract `environment`) provides them, so this
+            # is language-agnostic (retires the single-image golang:1.25 experiment).
+            # The warm /nix store PVC (AIFACTORY_NIX_STORE_PVC) persists closures
+            # across Jobs. Live-proven 2026-06-20: a real Go gate ran green via
+            # _nix_kube_runner (go1.26.3 from Nix), aifactory-nix-store bound + warm.
+            - { name: AIFACTORY_SANDBOX_GATES, value: "true" }
+            - { name: AIFACTORY_SANDBOX_BACKEND, value: "nixjob" }
+            - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
+            - { name: AIFACTORY_NIX_STORE_PVC, value: "aifactory-nix-store" }
+            - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model

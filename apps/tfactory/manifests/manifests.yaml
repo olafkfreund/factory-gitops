@@ -122,10 +122,15 @@ spec:
             - { name: TFACTORY_AUTO_GENERATE, value: "true" }
             - { name: TFACTORY_AUTO_EVALUATE, value: "true" }
             - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
-            # RFC-0005 Tier A: the Nix-lane k8s-Job sandbox co-mounts the worktree
-            # from this PVC and runs the per-task flake in this thin Nix image.
+            # RFC-0005 Tier A / RFC-0016 #469: the Nix-lane k8s-Job sandbox
+            # co-mounts the worktree from this PVC and runs the per-task flake in
+            # the thin Nix image. nixjob is now the DEFAULT verify execution path
+            # (the code prefers it when TFACTORY_NIX_RUNNER_IMAGE is set and the
+            # contract environment is a nix env; catalog-image/host-venv remain
+            # fallbacks). TFACTORY_NIX_STORE_PVC warms the /nix closure across Jobs.
             - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
+            - { name: TFACTORY_NIX_STORE_PVC, value: "tfactory-nix-store" }
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
