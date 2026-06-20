@@ -68,6 +68,14 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3114" }
+            # RFC-0016 #220: durable shared state in Postgres (per-service DB).
+            # Replaces pod-local SQLite (~/.pfactory/data.db); makes the admission
+            # cap/queue durable + multi-replica safe and creates the job_states
+            # table KEDA scales on. Unset → SQLite fallback (single-pod only).
+            # init_db() runs `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY
+            # defaults true), creating job_states + all tables. Out-of-band secret
+            # factory-db-pfactory (see apps/postgres/manifests for the convention).
+            - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: factory-db-pfactory, key: DATABASE_URL } } }
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
