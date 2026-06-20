@@ -103,6 +103,12 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3103" }
+            # RFC-0016 #220/#468: durable shared state in Postgres (tfactory DB).
+            # Replaces pod-local SQLite (~/.tfactory/data.db); init_db() runs
+            # `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY default true),
+            # creating job_states + all tables. Makes verify-job state durable +
+            # multi-replica safe. Out-of-band secret factory-db-tfactory.
+            - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: factory-db-tfactory, key: DATABASE_URL } } }
             # bwrap can't run on k3d (node is a container) — disable the bash sandbox
             # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
