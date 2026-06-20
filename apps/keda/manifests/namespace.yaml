@@ -1,0 +1,10 @@
+# KEDA runs in its own `keda` namespace (chart convention). ArgoCD also has
+# CreateNamespace=true on the Application, but we declare it explicitly so the
+# namespace is a managed, prunable resource rather than an implicit side effect.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keda
+  labels:
+    app.kubernetes.io/part-of: keda
+    pod-security.kubernetes.io/enforce: baseline

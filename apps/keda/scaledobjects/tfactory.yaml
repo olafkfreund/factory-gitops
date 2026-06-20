@@ -1,0 +1,32 @@
+# TFactory admission-queue autoscaler (RFC-0016 #192) — GATED, see README.
+#
+# Scales the TFactory control-plane Deployment on verify jobs in the durable
+# admission queue (`job_states` rows for service=tfactory in
+# lifecycle_state='queued'). TFactory has no WebSocket fan-out comparable to
+# AIFactory's rmux, so once its state is in shared Postgres (TFactory #465) it is
+# safe to scale >1. minReplicaCount 1 (never scale to zero).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: tfactory
+  namespace: factory
+spec:
+  scaleTargetRef:
+    name: tfactory
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 120
+  triggers:
+    - type: postgresql
+      metadata:
+        targetQueryValue: "2"
+        activationTargetQueryValue: "0"
+        query: >-
+          SELECT count(*) FROM job_states
+          WHERE service = 'tfactory' AND lifecycle_state = 'queued'
+      authenticationRef:
+        name: factory-postgres

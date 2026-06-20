@@ -1,0 +1,33 @@
+# PFactory admission-queue autoscaler (RFC-0016 #192) — GATED, see README.
+#
+# Scales the PFactory control-plane Deployment on the number of plan jobs sitting
+# in the durable admission queue (`job_states` rows for service=pfactory in
+# lifecycle_state='queued'). PFactory has NO WebSocket fan-out, so it is safe to
+# scale >1 once its state is in shared Postgres (PFactory #217). minReplicaCount
+# is 1 (never scale to zero — no cold-start disruption to the API).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: pfactory
+  namespace: factory
+spec:
+  scaleTargetRef:
+    name: pfactory
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 120
+  triggers:
+    - type: postgresql
+      metadata:
+        # ~1-2 queued plans per replica before scaling out.
+        targetQueryValue: "2"
+        activationTargetQueryValue: "0"
+        query: >-
+          SELECT count(*) FROM job_states
+          WHERE service = 'pfactory' AND lifecycle_state = 'queued'
+      authenticationRef:
+        name: factory-postgres

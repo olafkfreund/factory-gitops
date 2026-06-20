@@ -1,0 +1,9 @@
+# GATED — NOT referenced by any ArgoCD Application yet (see README.md).
+# Apply manually with `kubectl apply -k` only AFTER the prerequisites are met.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - triggerauthentication.yaml
+  - pfactory.yaml
+  - tfactory.yaml
+  - aifactory.yaml

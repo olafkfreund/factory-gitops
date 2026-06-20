@@ -1,0 +1,43 @@
+# KEDA — event-driven autoscaler for the PARR control plane (RFC-0016 #192).
+#
+# Phase 3 of RFC-0016 scales the control-plane Deployments on *admission-queue
+# depth* — the count of durable `job_states` rows in `lifecycle_state = 'queued'`
+# (Factory apis/job-state.schema.json) — using KEDA's PostgreSQL scaler. KEDA
+# moves replicas; the in-app global admission cap (MAX_CONCURRENT_TASKS /
+# PFACTORY_MAX_CONCURRENT_PLANS, FOR-UPDATE-safe across replicas) bounds actual
+# concurrency. See Factory apis/concurrency-conventions.md §1.
+#
+# This Application installs ONLY the KEDA operator (operator + metrics-apiserver
+# + admission webhooks + CRDs), rendered from the upstream Helm chart pinned to
+# v2.20.1 (apps/keda/manifests/). The ScaledObjects themselves live, gated, under
+# apps/keda/scaledobjects/ and are deliberately NOT synced yet — they require the
+# shared Postgres `job_states` table to exist first (RFC-0016 Phase 1:
+# PFactory #217 / AIFactory #668 / TFactory #465 + the Postgres deploy). See
+# apps/keda/scaledobjects/README.md for the enablement steps.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: keda
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/keda/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: keda
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # KEDA ships large CRDs; server-side apply avoids the
+      # last-applied-configuration annotation size limit.
+      - ServerSideApply=true

@@ -1,0 +1,24 @@
+# TriggerAuthentication for the KEDA PostgreSQL scaler (RFC-0016 #192).
+#
+# Reuses the SAME Postgres connection the control-plane services use. Per
+# Factory apis/concurrency-conventions.md §1 the services read `DATABASE_URL`;
+# KEDA reads the same connection string from a Secret key so the scaler and the
+# app agree on which database holds `job_states`.
+#
+# PREREQUISITE: a `factory-db` Secret with key `DATABASE_URL` must exist in the
+# `factory` namespace (created when Postgres is deployed — RFC-0016 Phase 1).
+# Example connection string:
+#   postgresql://factory:<pw>@postgres.factory.svc.cluster.local:5432/<db>?sslmode=disable
+#
+# NOTE: TriggerAuthentication is namespace-scoped. It must live in the same
+# namespace as the ScaledObject (here: `factory`, alongside the workloads).
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: factory-postgres
+  namespace: factory
+spec:
+  secretTargetRef:
+    - parameter: connection
+      name: factory-db
+      key: DATABASE_URL

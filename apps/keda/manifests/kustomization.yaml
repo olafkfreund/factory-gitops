@@ -1,0 +1,15 @@
+# KEDA operator — rendered from the upstream Helm chart, pinned.
+#
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm template keda kedacore/keda --version 2.20.1 \
+#     --namespace keda --include-crds > keda.yaml
+#
+# Bump deliberately: re-render with a new --version, never track `latest`.
+# NOTE: no top-level `namespace:` transformer here on purpose — keda.yaml is
+# rendered with --namespace keda so namespaced objects already carry it, while
+# CRDs / ClusterRoles / APIService are cluster-scoped and must NOT be stamped.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - keda.yaml
