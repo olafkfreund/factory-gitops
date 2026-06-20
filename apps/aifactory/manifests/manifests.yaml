@@ -80,6 +80,15 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3101" }
+            # RFC-0016 #220/#673: durable shared state in Postgres (aifactory DB).
+            # Replaces pod-local SQLite (~/.aifactory/data.db); init_db() runs
+            # `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY default true),
+            # creating job_states + all tables. Makes the build admission queue
+            # durable (HA-ready), BUT aifactory stays pinned to replicas:1 — the
+            # rmux Live Agent Console WebSocket fan-out keeps per-pane state in-pod
+            # and needs a shared bus (Redis pub/sub) before >1 (out of scope, #192).
+            # Out-of-band secret factory-db-aifactory.
+            - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: factory-db-aifactory, key: DATABASE_URL } } }
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
