@@ -165,3 +165,35 @@ spec:
         - { name: cc-gemini, emptyDir: {} }
         - { name: cc-config, emptyDir: {} }
         - { name: cli-creds, secret: { secretName: factory-cli-creds } }
+---
+# RFC-0016 #197 — size-capped GC for the warm Nix store (see aifactory twin).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tfactory-nix-store-gc
+  namespace: factory
+  labels: { app: tfactory, role: nix-store-gc }
+spec:
+  schedule: "30 3 * * *"         # nightly 03:30 (offset from aifactory)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata: { labels: { app: tfactory, role: nix-store-gc } }
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          imagePullSecrets: [{ name: ghcr-pull }]
+          containers:
+            - name: gc
+              image: ghcr.io/olafkfreund/tfactory-runner-nix:latest
+              command: ["nix", "store", "gc", "--max", "12G"]
+              volumeMounts: [{ name: nix-store, mountPath: /nix }]
+          volumes:
+            - name: nix-store
+              persistentVolumeClaim: { claimName: tfactory-nix-store }

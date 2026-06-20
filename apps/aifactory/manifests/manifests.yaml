@@ -207,3 +207,40 @@ subjects:
   - kind: ServiceAccount
     name: aifactory-sandbox
     namespace: factory
+---
+# RFC-0016 #197 — size-capped GC for the warm Nix store. Without it the shared
+# /nix store grows unbounded as per-task toolchains accumulate. Runs on the same
+# thin nix-base image the Jobs use, mounts the same PVC, and runs `nix store gc`
+# with a max-free target so the store is trimmed back under a cap. Opt-in by
+# existence: harmless if the PVC is empty/unseeded (gc on an empty store no-ops).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aifactory-nix-store-gc
+  namespace: factory
+  labels: { app: aifactory, role: nix-store-gc }
+spec:
+  schedule: "0 3 * * *"          # nightly 03:00
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata: { labels: { app: aifactory, role: nix-store-gc } }
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          imagePullSecrets: [{ name: ghcr-pull }]
+          containers:
+            - name: gc
+              image: ghcr.io/olafkfreund/tfactory-runner-nix:latest
+              # Trim the store back toward ~12Gi free headroom in the 20Gi PVC.
+              command: ["nix", "store", "gc", "--max", "12G"]
+              volumeMounts: [{ name: nix-store, mountPath: /nix }]
+          volumes:
+            - name: nix-store
+              persistentVolumeClaim: { claimName: aifactory-nix-store }
