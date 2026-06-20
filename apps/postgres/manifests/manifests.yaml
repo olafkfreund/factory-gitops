@@ -1,0 +1,126 @@
+################################################################################
+# Postgres — shared durable state store for the PARR control plane (RFC-0016 #220)
+#
+# Activates the durable-state path: PFactory (#217/#220), TFactory (#465/#468)
+# and AIFactory (#668/#673) externalize their job-state (and other) tables here
+# instead of pod-local SQLite. With DATABASE_URL set + the durable `job_states`
+# table present, the services become multi-replica-safe and KEDA can scale on
+# admission-queue depth (apps/keda/scaledobjects/, RFC-0016 #192).
+#
+# One database per service (cleaner than shared — each service owns its models
+# and runs its own alembic head): pfactory, tfactory, aifactory, cfactory.
+# Created by the postgres-init ConfigMap on first boot (only runs when PGDATA is
+# empty — i.e. fresh volume). Each service auto-migrates on startup
+# (MIGRATIONS_AUTO_APPLY=true → `alembic upgrade head` in init_db()), creating
+# job_states + its other tables; no out-of-band migration Job is needed.
+#
+# CREDENTIALS ARE OUT-OF-BAND. Like minio-creds (apps/minio) and oauth2-proxy-*
+# (apps/cfactory-auth), the superuser password is NOT committed here (no
+# sealed-secrets / ESO yet). It is the SAME key the postgres draft already
+# referenced and that the cluster already carries: factory-secrets/POSTGRES_PASSWORD.
+# If it ever needs (re)creating:
+#
+#   kubectl -n factory create secret generic factory-secrets \
+#     --from-literal=POSTGRES_PASSWORD="$(openssl rand -hex 24)" \
+#     --dry-run=client -o yaml | kubectl apply -f -   # (merge — do not clobber other keys)
+#
+# Superuser is `factory`. The per-service connection strings reuse this same
+# user/password (factory is superuser → has DDL for alembic). The KEDA scaler
+# reuses the connection via the factory-db Secret (created out-of-band too — see
+# apps/keda/scaledobjects/README.md and triggerauthentication.yaml).
+#
+# Single replica on an RWO local-path PVC (single writer). HA Postgres
+# (streaming replication / Patroni) is out of scope for #220 — durable shared
+# state existing is what unblocks the fleet's multi-replica services.
+################################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: factory
+  labels: { app: postgres }
+data:
+  # Runs ONLY on a fresh PGDATA (docker-entrypoint-initdb.d semantics).
+  # Idempotent guards so a manual re-run is safe.
+  init-databases.sql: |
+    SELECT 'CREATE DATABASE pfactory'  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'pfactory')\gexec
+    SELECT 'CREATE DATABASE tfactory'  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'tfactory')\gexec
+    SELECT 'CREATE DATABASE aifactory' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'aifactory')\gexec
+    SELECT 'CREATE DATABASE cfactory'  WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'cfactory')\gexec
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: factory
+  labels: { app: postgres }
+spec:
+  selector: { app: postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: factory
+  labels: { app: postgres }
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: postgres
+          image: postgres:16.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 5432, name: postgres }
+          env:
+            - name: POSTGRES_USER
+              value: factory
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: factory
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+            - { name: dshm, mountPath: /dev/shm }
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U factory -d factory"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U factory -d factory"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: init
+          configMap: { name: postgres-init }
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 256Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests: { storage: 10Gi }

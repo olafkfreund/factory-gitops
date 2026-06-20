@@ -1,0 +1,27 @@
+# Postgres — shared durable state store for the PARR control plane (RFC-0016 #220).
+# One database per service (pfactory/tfactory/aifactory/cfactory). Activates the
+# durable-state path so the services run on Postgres instead of pod-local SQLite,
+# making them multi-replica-safe and KEDA-scalable. See manifests for the
+# out-of-band credential convention (factory-secrets/POSTGRES_PASSWORD).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: postgres
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/postgres/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
