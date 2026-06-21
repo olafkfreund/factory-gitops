@@ -150,6 +150,16 @@ spec:
             - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: TFACTORY_NIX_STORE_PVC, value: "tfactory-nix-store" }
+            # RFC-0016 #466 / RFC-0017: run the whole verify ORCHESTRATION
+            # (evaluate->triage) as a single k8s Job (python -m agents.verify_pipeline)
+            # instead of in-pod background tasks, so the control plane stays thin
+            # and verifies scale across nodes + survive a control-plane roll. The
+            # verify command is wrapped in `nix develop ... --command bash -c`
+            # (nix_develop=True) so bash+toolchain come from the per-task flake on
+            # the thin nix-base image. Falls back to in-pod if the sandbox isn't
+            # configured (it is: TFACTORY_NIX_RUNNER_IMAGE set). Default in code is
+            # `inpod`; this is the FLIP. Revert by removing this line.
+            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
