@@ -176,8 +176,12 @@ spec:
             # Net: Job dispatched but no terminal verdict reached job_states
             # (status/verdict=None). Needs CODE fixes in TFactory (run the enqueue on
             # the store's loop; materialize the task flake into /work for the Job).
-            # Staying on the in-pod verify default until those land.
-            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see above
+            # FIX (#478, merged a82c340): (a) verify_dispatch._record_dispatch builds
+            # a fresh async engine bound to the dispatch's own loop (no cross-loop
+            # Future); (b) the per-task flake is materialized into the project
+            # worktree (flake_subpath) before dispatch so `nix develop path:/work`
+            # resolves. FLIP #3 (2026-06-21, post-#478): re-flip to kubejob.
+            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # FLIP #3 (post-#478)
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
