@@ -150,16 +150,19 @@ spec:
             - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: TFACTORY_NIX_STORE_PVC, value: "tfactory-nix-store" }
-            # RFC-0016 #466 / RFC-0017: run the whole verify ORCHESTRATION
-            # (evaluate->triage) as a single k8s Job (python -m agents.verify_pipeline)
-            # instead of in-pod background tasks, so the control plane stays thin
-            # and verifies scale across nodes + survive a control-plane roll. The
-            # verify command is wrapped in `nix develop ... --command bash -c`
-            # (nix_develop=True) so bash+toolchain come from the per-task flake on
-            # the thin nix-base image. Falls back to in-pod if the sandbox isn't
-            # configured (it is: TFACTORY_NIX_RUNNER_IMAGE set). Default in code is
-            # `inpod`; this is the FLIP. Revert by removing this line.
-            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
+            # RFC-0016 #466 / RFC-0017: Job-native verify orchestration.
+            # FLIP ATTEMPTED 2026-06-21 and REVERTED — the verify_dispatch module
+            # (#466: dispatch the evaluate->triage pipeline as a k8s Job, with
+            # verify_exec_mode() reading TFACTORY_VERIFY_EXEC) is PRESENT in the
+            # deployed image but NOT YET WIRED: nothing imports verify_dispatch /
+            # calls verify_exec_mode (grep finds the symbol only in its own
+            # module). So TFACTORY_VERIFY_EXEC=kubejob is currently inert — the
+            # verify lanes still run in-pod regardless. A validation ingest also
+            # stalled upstream in the LLM review lane and never reached lane
+            # dispatch, so no Job-native verdict could be produced. Needs a CODE
+            # change in TFactory to wire verify_dispatch into the pipeline before
+            # this flip means anything. Leaving on the in-pod default.
+            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
