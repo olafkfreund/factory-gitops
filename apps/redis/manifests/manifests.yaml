@@ -1,0 +1,79 @@
+################################################################################
+# Redis — shared pub/sub bus + panes index for AIFactory rmux fan-out
+# (RFC-0017 §2.2, AIFactory #681)
+#
+# AIFactory is pinned to replicas:1 because the rmux "Live Agent Console"
+# WebSocket fan-out keeps its panes index + pane byte-stream pod-local (a FIFO
+# under AIFACTORY_RMUX_PANES_DIR). A second replica would split console sessions
+# across pods. This Redis gives rmux a SHARED bus so any replica can serve any
+# console session: pane bytes are published to Redis pub/sub and the panes index
+# lives in a Redis hash, both keyed by spec_id.
+#
+# Reuses the established AIFactory event-bus Redis pattern (REDIS_URL +
+# redis.asyncio) — the same instance already backs the cross-replica WebSocket
+# event bus (apps/web-server event_bus.py). rmux pane channels use a distinct
+# key prefix (aifactory:rmux:*) so they don't collide with aifactory:events.
+#
+# IN-CLUSTER, NO AUTH. Like the other in-cluster infra (postgres / minio reach
+# each other over the cluster network), Redis listens only on the cluster
+# Service and runs without a password — it is never exposed outside the cluster.
+# If auth is added later, supply REDIS_URL with credentials from a Secret
+# (out-of-band, like minio-creds) and bounce the consumers.
+#
+# App-of-apps auto-discovers apps/**/application.yaml. ArgoCD syncs this
+# kustomization into the `factory` namespace.
+################################################################################
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: redis-data, namespace: factory, labels: { app: redis } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: factory, labels: { app: redis } }
+spec:
+  selector: { app: redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: 6379 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: factory, labels: { app: redis } }
+spec:
+  replicas: 1
+  # RWO data PVC -> single writer. Recreate (not RollingUpdate) so the new pod
+  # can take the volume. Redis is a shared bus, not itself horizontally scaled
+  # here — one instance fans out for every AIFactory replica.
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { fsGroup: 999, runAsUser: 999, runAsNonRoot: true }
+      containers:
+        - name: redis
+          image: redis:7.4.2-alpine
+          # appendonly: durable-ish across restarts (panes index survives a
+          # bounce). pub/sub itself is fire-and-forget; the AOF only persists
+          # the panes-index hash, which the app also rebuilds on session create.
+          args: ["redis-server", "--appendonly", "yes", "--save", ""]
+          ports:
+            - { containerPort: 6379, name: redis }
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: redis-data } }

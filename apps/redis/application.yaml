@@ -1,0 +1,33 @@
+# Redis — shared pub/sub bus + panes index for AIFactory rmux fan-out
+# (RFC-0017 §2.2, AIFactory #681).
+#
+# Gives the rmux Live Agent Console a SHARED bus so AIFactory can run more than
+# one replica: pane bytes go over Redis pub/sub and the panes index lives in a
+# Redis hash, both keyed by spec_id. Behind REDIS_URL in AIFactory — unset keeps
+# today's pod-local behaviour, so deploying this app is inert until AIFactory is
+# wired to it (see the AIFactory #681 PR for the rollout step).
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
+# the manifests/ kustomization into the `factory` namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: redis
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/redis/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
