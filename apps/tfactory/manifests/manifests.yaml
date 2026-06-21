@@ -216,7 +216,12 @@ spec:
             # package into the verify Job + set PYTHONPATH, or build the runner image
             # to contain it). Cannot be fixed from gitops env. Staying on the in-pod
             # verify default until that lands.
-            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see FLIP #3 above (agents-not-importable in Job)
+            # FLIP #4 (round-4, 2026-06-21, post-#479): re-flip to kubejob. #479
+            # ships the TFactory backend `agents` package on PYTHONPATH in the
+            # verify Job (via TFACTORY_IMAGE), the CODE fix for the
+            # ModuleNotFoundError that reverted FLIP #3. Validated live before
+            # leaving default.
+            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
