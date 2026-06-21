@@ -133,6 +133,13 @@ spec:
             - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: AIFACTORY_NIX_STORE_PVC, value: "aifactory-nix-store" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
+            # RFC-0016 #671 / RFC-0017: run the full coder loop (run.py) as a k8s
+            # Job instead of an in-pod subprocess. The build Job co-mounts the task
+            # worktree (AIFACTORY_SANDBOX_REPO_PVC) + warm /nix store, and its logs
+            # stream back to the cockpit/rmux via Job-native log streaming (#680).
+            # Default in code is `subprocess` (fail-safe); this is the FLIP to the
+            # Job-native build. Reverts to subprocess by removing this line.
+            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
