@@ -1,15 +1,11 @@
-# AIFactory admission-queue autoscaler (RFC-0016 #192) — GATED, see README.
+# AIFactory admission-queue autoscaler (RFC-0016 #192 / RFC-0017 #681).
 #
-# CAPPED AT 1 ON PURPOSE. AIFactory runs the rmux "Live Agent Console" WebSocket
-# fan-out (AIFACTORY_RMUX_ENABLED=true) with pod-local panes on its RWO PVC
-# (AIFACTORY_RMUX_PANES_DIR). A second replica would split WS sessions and panes
-# across pods with no shared pub/sub, breaking the live console. Durable job
-# state in Postgres (AIFactory #668) makes the *admission queue* HA, but true
-# horizontal scaling of AIFactory additionally needs rmux fan-out over a shared
-# bus (Redis pub/sub) — OUT OF SCOPE for #192.
-#
-# So this ScaledObject is wired and validatable but min=max=1 (a no-op for
-# replica count). Raise maxReplicaCount only after rmux is multi-replica safe.
+# Previously capped at min=max=1 because the rmux "Live Agent Console" kept
+# pod-local panes on the RWO PVC, so a 2nd replica would split WS sessions/panes
+# with no shared bus. RFC-0017 #681 puts rmux pane registration + byte fan-out
+# on a shared Redis bus (REDIS_URL), so a console session on any replica reaches
+# the pane regardless of which replica started the build. With durable job state
+# already in Postgres (#668), AIFactory is now safe to scale >1. Cap raised to 3.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -19,7 +15,12 @@ spec:
   scaleTargetRef:
     name: aifactory
   minReplicaCount: 1
-  maxReplicaCount: 1   # capped: rmux WebSocket fan-out is not multi-replica safe yet
+  maxReplicaCount: 3   # rmux multi-replica safe via shared Redis bus (REDIS_URL)
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 120
   triggers:
     - type: postgresql
       metadata:

@@ -26,3 +26,12 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+  # KEDA's HPA owns spec.replicas (RFC-0016 #192 / RFC-0017 #681). Without this,
+  # selfHeal would revert the HPA's scale-out back to the manifest and fight the
+  # autoscaler. Matches the pfactory/tfactory pattern.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: aifactory
+      jsonPointers:
+        - /spec/replicas

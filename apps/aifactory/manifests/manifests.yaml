@@ -28,9 +28,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: { name: aifactory, namespace: factory, labels: { app: aifactory } }
 spec:
-  replicas: 1
+  # No `replicas:` — KEDA's HPA owns the replica count (RFC-0016 #192 / RFC-0017
+  # #681). ArgoCD ignores /spec/replicas (see application.yaml ignoreDifferences)
+  # so selfHeal doesn't fight the autoscaler. rmux is now multi-replica safe via
+  # the shared Redis bus (REDIS_URL), so the old replicas:1 pin is lifted.
   selector: { matchLabels: { app: aifactory } }
-  strategy: { type: Recreate }
+  strategy: { type: RollingUpdate, rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } }
   template:
     metadata: { labels: { app: aifactory } }
     spec:
