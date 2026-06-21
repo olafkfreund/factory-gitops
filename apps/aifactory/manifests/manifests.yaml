@@ -158,13 +158,38 @@ spec:
             # died with `python: can't open file '/work/run.py': [Errno 2]`.
             # FIX (#686, merged f1135ee): build Job invokes run.py by its ABSOLUTE
             # image path while keeping --project-dir /work.
-            # FLIP #3 (2026-06-21, post-#686): re-flip AIFACTORY_BUILD_BACKEND to
-            # kubejob below. AIFACTORY_IMAGE pinned to sha-f1135ee (the #686 build
-            # the build Job must dispatch on).
-            # NOTE: CD bumps the kustomization newTag but NOT this env — keep this
-            # SHA aligned with apps/aifactory/manifests/kustomization.yaml newTag.
+            # FLIP #3 (2026-06-21, post-#686) ALSO REVERTED — but #686 DID work:
+            # the build Job ran on sha-f1135ee, the entrypoint invoked run.py by its
+            # ABSOLUTE image path (`python /home/projects/MagesticAI/apps/backend/
+            # run.py --spec <id> --project-dir /work …`), and run.py EXECUTED — the
+            # AUTO-BUILD FRAMEWORK banner printed (no StartError, no /work/run.py
+            # Errno 2). exit=1 from the app logic itself.
+            # A NEW, distinct defect surfaced (next-in-chain): run.py printed
+            #   `Error: Spec '031-…' not found / No specs found` and exited 1.
+            # Root cause: the kubejob dispatch co-mounts the per-task worktree
+            #   .aifactory/worktrees/tasks/<spec_id>  at /work, but on this fast
+            #   path that worktree is an EMPTY STUB — it contains only
+            #   `.aifactory/.gitignore_checked` + `.gitignore`, NO git checkout and
+            #   NO `.aifactory/specs/<spec_id>/spec.md`. find_spec(/work, <id>)
+            #   (cli/utils.py) therefore finds nothing. The spec DOES exist in the
+            #   PROJECT specs dir (.aifactory/specs/<id>/spec.md), and the in-pod
+            #   path works because _spawn_task_execution creates+populates a real
+            #   git worktree (with the spec) before running; the kubejob dispatch
+            #   skips that worktree materialization. Proven live on aifactory-test:
+            #   Job factory-aifactory-lass-kubejob-b2-vali (BackoffLimitExceeded,
+            #   exit=1); worktree 031-…/ had .aifactory/.gitignore_checked only vs
+            #   a full checkout in the in-pod worktree 028-go-hello-kubejob/.
+            # Needs a CODE fix in AIFactory build dispatch (build_backend.py /
+            #   agent_service): create + populate the per-task worktree (git
+            #   worktree add + copy/sync the spec into .aifactory/specs) BEFORE
+            #   dispatching the Job, mirroring _spawn_task_execution. Cannot be
+            #   fixed from gitops env. Staying on the in-pod subprocess default
+            #   until that lands.
+            # AIFACTORY_IMAGE is left pinned to the #686 build (correct + the next
+            # flip's prerequisite). CD bumps the kustomization newTag but NOT this
+            # env — keep this SHA aligned with kustomization.yaml newTag.
             - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-f1135ee" }
-            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # FLIP #3 (post-#686)
+            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see FLIP #3 above (empty-worktree defect)
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
