@@ -150,28 +150,21 @@ spec:
             # FLIP #1 (2026-06-21) REVERTED: StartError — the build Job ran on the
             # thin AIFACTORY_SANDBOX_IMAGE (no bash/python). FIXED in #685.
             # FLIP #2 (2026-06-21, post-#685) ALSO REVERTED — but #685 DID work:
-            # the build Job now dispatches on the python-capable AIFACTORY_IMAGE
-            # (aifactory:sha-1328e50), the container STARTS (StartError gone —
-            # terminated reason Error/exit=2, not StartError), and bash+python run.
-            # A NEW, distinct defect surfaced: the Job entrypoint is
-            #   bash -c "python run.py --spec <id> --project-dir /work …"
-            # with workingDir=/work, but run.py lives at
-            #   /home/projects/MagesticAI/apps/backend/run.py
-            # in the image — NOT in the co-mounted worktree /work. So every build
-            # Job dies with `python: can't open file '/work/run.py': [Errno 2]`,
-            # run.py never executes, no build logs surface. Proven live on
-            # aifactory-test (Jobs factory-aifactory-llo-kubejob-fastpath +
-            # factory-aifactory-o-kubejob-validation, both exit=2).
-            # Needs a CODE fix in AIFactory build_backend.py / job_dispatch:
-            # invoke run.py by its absolute image path (or set workingDir to the
-            # backend dir) while keeping --project-dir /work. Cannot be fixed from
-            # gitops env. Staying on the in-pod subprocess default until that lands.
-            # AIFACTORY_IMAGE is left injected (harmless + correct: it is the
-            # prerequisite the #685 resolver needs, and the next flip attempt).
+            # the build Job dispatched on the python-capable AIFACTORY_IMAGE, the
+            # container STARTED (StartError gone), bash+python ran. A NEW defect
+            # surfaced: the entrypoint ran `python run.py … ` with workingDir=/work
+            # but run.py lives at /home/projects/MagesticAI/apps/backend/run.py in
+            # the image, NOT in the co-mounted worktree /work → every build Job
+            # died with `python: can't open file '/work/run.py': [Errno 2]`.
+            # FIX (#686, merged f1135ee): build Job invokes run.py by its ABSOLUTE
+            # image path while keeping --project-dir /work.
+            # FLIP #3 (2026-06-21, post-#686): re-flip AIFACTORY_BUILD_BACKEND to
+            # kubejob below. AIFACTORY_IMAGE pinned to sha-f1135ee (the #686 build
+            # the build Job must dispatch on).
             # NOTE: CD bumps the kustomization newTag but NOT this env — keep this
             # SHA aligned with apps/aifactory/manifests/kustomization.yaml newTag.
-            - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-1328e50" }
-            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see above
+            - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-f1135ee" }
+            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # see FLIP #3 above (flipped in next commit)
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
