@@ -245,17 +245,7 @@ spec:
             # the verify Job container, mirroring the in-pod env. This is the same
             # class of fix the build Job needs (AIFactory #671 FLIP #4). Cannot be
             # fixed from gitops. Back to in-pod verify default (safe).
-            # FLIP #5 (round-5, 2026-06-21): RE-FLIPPED to kubejob. #480 (merged
-            # sha-e5f5b01, TFACTORY_IMAGE realigned above) injects
-            # CLAUDE_CODE_OAUTH_TOKEN + the full non-Claude provider env into the
-            # verify Job container env (never argv), resolving the round-4
-            # "No OAuth token found" that reverted FLIP #4. Use the PREFERRED
-            # secretKeyRef path: point at the existing factory-secrets Secret
-            # (flat key CLAUDE_CODE_OAUTH_TOKEN) so NO literal token lands in the
-            # Job manifest/etcd. Validated live on aifactory-test before keeping on.
-            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
-            - { name: TFACTORY_VERIFY_OAUTH_SECRET_NAME, value: "factory-secrets" }
-            - { name: TFACTORY_VERIFY_OAUTH_SECRET_KEY, value: "CLAUDE_CODE_OAUTH_TOKEN" }
+            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see FLIP #4 above (verify Job missing CLAUDE_CODE_OAUTH_TOKEN; #479 agents-import FIXED)
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
