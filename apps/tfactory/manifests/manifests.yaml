@@ -150,6 +150,15 @@ spec:
             - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: TFACTORY_NIX_STORE_PVC, value: "tfactory-nix-store" }
+            # TFACTORY_IMAGE pins the TFactory backend image the verify Job runs
+            # on (the image that now ships the `agents` package on PYTHONPATH —
+            # the ModuleNotFoundError that reverted FLIP #3 was fixed in #479).
+            # CD bumps the kustomization newTag but NOT this env — keep this SHA
+            # aligned with kustomization.yaml newTag (FLAT manifests; no Helm
+            # image-injection). STAGE 0 (round-4, 2026-06-21): added, pinned to the
+            # current sha-fe2cb3b (#479 verify-image, on top of #476 wiring +
+            # #478 loop/flake).
+            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-fe2cb3b" }
             # RFC-0016 #466 / RFC-0017: Job-native verify orchestration.
             # FLIP #1 (2026-06-21) REVERTED — verify_dispatch was present but NOT
             # WIRED (nothing called verify_exec_mode), so the flip was inert.
