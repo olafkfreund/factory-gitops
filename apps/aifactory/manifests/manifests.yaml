@@ -218,13 +218,32 @@ spec:
             # agent_service kubejob Job-spec): inject CLAUDE_CODE_OAUTH_TOKEN (and
             # the rest of the build env / provider keys) into the Job container,
             # mirroring the in-pod subprocess env. Cannot be fixed from gitops.
-            # FLIP #5 (round-5, 2026-06-21): RE-FLIPPED to kubejob. #688 (merged
-            # sha-8e0f0e8, AIFACTORY_IMAGE realigned above) injects the pooled
-            # CLAUDE_CODE_OAUTH_TOKEN + SDK/provider env into the build Job
-            # container env (never argv), resolving the round-4 "No OAuth token
-            # found" that reverted FLIP #4. The Job now authenticates like the
-            # in-pod path. Validated live on aifactory-test before keeping this on.
-            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
+            # FLIP #5 (round-5, 2026-06-21, post-#688) REVERTED — but #688 DID
+            # work, the round-4 "No OAuth token found" that reverted FLIP #4 is
+            # RESOLVED. Proven live on aifactory-test, Job
+            # factory-aifactory-e-b-kubejob-build-sm (image sha-8e0f0e8):
+            #   - the build Job container env now carries CLAUDE_CODE_OAUTH_TOKEN
+            #     (len 108, in `env` NOT argv) + GITHUB_TOKEN + the fixed build
+            #     env (CI/CLAUDE_CODE_ENTRYPOINT/PYTHONUNBUFFERED/IOENCODING).
+            #   - run.py STARTED, the AUTO-BUILD banner printed, it FOUND the spec
+            #     (`Spec: 032-rfc17-stage-b-kubejob-build-sm`), and crucially:
+            #     `Auth: CLAUDE_CODE_OAUTH_TOKEN` + `Auth pre-flight: anthropic OK`
+            #     — the credential AUTHENTICATED. NO "No OAuth token found".
+            #     #688 (build-Job OAuth/env injection) is PROVEN resolved.
+            # A NEW, distinct next-in-chain defect surfaced: setup_workspace →
+            # WorktreeManager(/work) died `core.worktree.WorktreeError: Failed to
+            # get current branch: fatal: not a git repository (null)` /
+            # `Error: No .git directory found at /work`. The kubejob build dispatch
+            # co-mounts the spec + project FILES at /work but NOT a git repo (no
+            # .git), so run.py's isolated-worktree setup (WorktreeManager) cannot
+            # create a worktree. The in-pod path runs in a real git checkout; the
+            # kubejob /work mount is a plain dir. Job terminal Failed (exit 1,
+            # backoffLimit 0). Needs a CODE fix in AIFactory build dispatch:
+            # materialize /work as a git repo (init/clone or co-mount the .git)
+            # before the Job, OR run the build with a worktree mode that does not
+            # require an outer git repo at /work. Cannot be fixed from gitops env.
+            # Back to in-pod subprocess build default (safe).
+            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see FLIP #5 above (kubejob /work has no .git → WorktreeManager fails; #688 OAuth FIXED)
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
