@@ -164,7 +164,7 @@ spec:
             # NOTE: CD bumps the kustomization newTag but NOT this env — keep this
             # SHA aligned with apps/aifactory/manifests/kustomization.yaml newTag.
             - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-f1135ee" }
-            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # see FLIP #3 above (flipped in next commit)
+            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # FLIP #3 (post-#686)
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
