@@ -87,9 +87,9 @@ spec:
             # Replaces pod-local SQLite (~/.aifactory/data.db); init_db() runs
             # `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY default true),
             # creating job_states + all tables. Makes the build admission queue
-            # durable (HA-ready), BUT aifactory stays pinned to replicas:1 — the
-            # rmux Live Agent Console WebSocket fan-out keeps per-pane state in-pod
-            # and needs a shared bus (Redis pub/sub) before >1 (out of scope, #192).
+            # durable (HA-ready). Combined with the rmux shared Redis bus
+            # (APP_REDIS_URL, RFC-0017 #681), aifactory is now multi-replica safe
+            # and the old replicas:1 pin is lifted (KEDA owns replicas, max 3).
             # Out-of-band secret factory-db-aifactory.
             - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: factory-db-aifactory, key: DATABASE_URL } } }
             # Shared HMAC key so PFactory's signed Task Contract verifies in
