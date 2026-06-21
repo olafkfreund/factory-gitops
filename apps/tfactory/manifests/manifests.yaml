@@ -180,8 +180,34 @@ spec:
             # a fresh async engine bound to the dispatch's own loop (no cross-loop
             # Future); (b) the per-task flake is materialized into the project
             # worktree (flake_subpath) before dispatch so `nix develop path:/work`
-            # resolves. FLIP #3 (2026-06-21, post-#478): re-flip to kubejob.
-            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # FLIP #3 (post-#478)
+            # resolves.
+            # FLIP #3 (2026-06-21, post-#478) REVERTED — but #478 DID work, BOTH
+            # fixes PROVEN live on aifactory-test (Job
+            # factory-tfactory-fy-kubejob-d2-044024):
+            #   (a) a durable job_states row LANDED for the verify job
+            #       (kind=verify, worker_ref recorded; NO "Future attached to a
+            #       different loop" error), and the control-plane reconcile PICKED
+            #       IT UP (lifecycle_state transitioned to a terminal `stuck` with
+            #       an honest "no verdict" error). Cross-loop store defect: FIXED.
+            #   (b) the per-task flake MATERIALIZED into /work — the entrypoint
+            #       `nix develop path:/work/workspaces/olafkfreund-aifactory-test
+            #       #default` SUCCEEDED (whole nix env incl. pytest/fastapi fetched
+            #       from cache, python3-3.13 env built). NO "flake.nix does not
+            #       exist". Missing-flake defect: FIXED.
+            # A NEW, distinct next-in-chain defect surfaced: after nix develop
+            # succeeded, the Job's `python -m agents.verify_pipeline …` died with
+            # `ModuleNotFoundError: No module named 'agents'`. The nix runner image
+            # (TFACTORY_NIX_RUNNER_IMAGE) + per-task flake provide the TOOLCHAIN
+            # (python/pytest/deps) but NOT TFactory's own backend `agents` package,
+            # and it isn't on PYTHONPATH from /work (which is the SUT workspace, not
+            # the TFactory backend). So verify_pipeline never runs evaluate→triage,
+            # the Job produces no verdict, and reconcile honestly marks the row
+            # `stuck` ("verify Job finished … with no verdict — lanes pending #464").
+            # Needs a CODE fix in TFactory dispatch (ship/mount the backend `agents`
+            # package into the verify Job + set PYTHONPATH, or build the runner image
+            # to contain it). Cannot be fixed from gitops env. Staying on the in-pod
+            # verify default until that lands.
+            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see FLIP #3 above (agents-not-importable in Job)
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
