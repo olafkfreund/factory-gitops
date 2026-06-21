@@ -194,12 +194,31 @@ spec:
             # runs on the image whose dispatch now materializes the per-task
             # worktree (the empty-worktree defect that reverted FLIP #3's fix).
             - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-b91f6a4" }
-            # FLIP #4 (round-4, 2026-06-21, post-#687): re-flip to kubejob. #687
-            # makes the build dispatch materialize the per-task worktree (git
-            # worktree add + sync the spec into .aifactory/specs) BEFORE the Job,
-            # which is the CODE fix for the empty-worktree defect that reverted
-            # FLIP #3. Validated live before leaving default.
-            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
+            # FLIP #4 (round-4, 2026-06-21, post-#687) REVERTED — but #687 DID
+            # work, the empty-worktree defect that reverted FLIP #3 is RESOLVED.
+            # Proven live on aifactory-test, Job
+            # factory-aifactory-hello-class-b4-vali (image sha-b91f6a4):
+            #   - the per-task worktree MATERIALIZED at /work — full git checkout
+            #     (src/ tests/ pyproject.toml …) AND
+            #     .aifactory/specs/032-go-hello-class-b4-vali/spec.md present
+            #     (SPEC_FOUND). No empty stub.
+            #   - run.py STARTED on the python-capable AIFACTORY_IMAGE, the
+            #     AUTO-BUILD FRAMEWORK banner printed, and it FOUND the spec
+            #     (`Spec: 032-go-hello-class-b4-vali`). No StartError, no
+            #     /work/run.py Errno 2, no "Spec not found".
+            # A NEW, distinct next-in-chain defect surfaced: the build Job was
+            # created with ONLY 2 env vars (JOB_ID, FACTORY_SERVICE) — the
+            # dispatch does NOT propagate the LLM credential the in-pod path has
+            # (CLAUDE_CODE_OAUTH_TOKEN), nor the other ~37 env vars — so run.py
+            # died: `Error: No OAuth token found … Magestic AI requires Claude
+            # Code OAuth authentication`. Job reached terminal Failed
+            # (BackoffLimitExceeded, exit !=0).
+            # Needs a CODE fix in AIFactory build dispatch (build_backend.py /
+            # agent_service kubejob Job-spec): inject CLAUDE_CODE_OAUTH_TOKEN (and
+            # the rest of the build env / provider keys) into the Job container,
+            # mirroring the in-pod subprocess env. Cannot be fixed from gitops.
+            # Staying on the in-pod subprocess default until that lands.
+            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see FLIP #4 above (Job missing CLAUDE_CODE_OAUTH_TOKEN)
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
