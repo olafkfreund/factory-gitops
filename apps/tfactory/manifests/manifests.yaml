@@ -151,17 +151,33 @@ spec:
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: TFACTORY_NIX_STORE_PVC, value: "tfactory-nix-store" }
             # RFC-0016 #466 / RFC-0017: Job-native verify orchestration.
-            # FLIP #1 (2026-06-21) was REVERTED — verify_dispatch was present but
-            # NOT WIRED (nothing called verify_exec_mode), so the flip was inert.
-            # FIXED in TFactory #476 (merged, live as sha-081cc6d): verify_dispatch
-            # is now wired into gen_functional._advance_to_evaluator, which branches
-            # on verify_exec_mode(); reconcile/reaper run in lifespan; fail-safe
-            # in-pod fallback retained.
-            # FLIP #2 (2026-06-21, post-#476): dispatch the evaluate->triage verify
-            # pipeline as a k8s Job. Prereqs already set above:
-            # TFACTORY_NIX_RUNNER_IMAGE + DATABASE_URL. Reversible — revert to the
-            # in-pod default if validation is not green.
-            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
+            # FLIP #1 (2026-06-21) REVERTED — verify_dispatch was present but NOT
+            # WIRED (nothing called verify_exec_mode), so the flip was inert.
+            # #476 (live as sha-081cc6d) FIXED the wiring, AND IT WORKS: with
+            # TFACTORY_VERIFY_EXEC=kubejob the verify now DISPATCHES a real k8s Job
+            # (factory-tfactory-erify-<spec>) with the correct nix-develop-wrapped
+            # entrypoint `nix develop path:/work#default --command python -m
+            # agents.verify_pipeline …` on TFACTORY_NIX_RUNNER_IMAGE. So the wiring
+            # defect #466 fixed is PROVEN resolved (verified live on aifactory-test,
+            # spec verify-kubejob-035558).
+            # FLIP #2 (2026-06-21, post-#476) REVERTED — two NEW downstream defects
+            # (NOT the wiring, NOT the pre-existing review-lane stall — the pipeline
+            # got all the way past review to dispatch):
+            #   (a) verify_dispatch._record_dispatch raised RuntimeError "got Future
+            #       attached to a different loop" — _run_dispatch_blocking runs the
+            #       async job_state_store.enqueue on its own event loop while the
+            #       store's asyncpg/SQLAlchemy session is bound to the main loop. The
+            #       dispatch record FAILED (logged WARNING + continued), so no durable
+            #       job_states row exists → reconcile can never produce a verdict.
+            #   (b) the verify Job pod failed exit=1: `flake.nix does not exist` at
+            #       /work — the per-task Nix flake is not materialized into the
+            #       co-mounted worktree PVC, so `nix develop path:/work#default`
+            #       fails before verify_pipeline runs.
+            # Net: Job dispatched but no terminal verdict reached job_states
+            # (status/verdict=None). Needs CODE fixes in TFactory (run the enqueue on
+            # the store's loop; materialize the task flake into /work for the Job).
+            # Staying on the in-pod verify default until those land.
+            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see above
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
