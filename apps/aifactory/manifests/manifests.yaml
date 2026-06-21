@@ -194,7 +194,12 @@ spec:
             # runs on the image whose dispatch now materializes the per-task
             # worktree (the empty-worktree defect that reverted FLIP #3's fix).
             - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-b91f6a4" }
-            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see FLIP #3 above (empty-worktree defect)
+            # FLIP #4 (round-4, 2026-06-21, post-#687): re-flip to kubejob. #687
+            # makes the build dispatch materialize the per-task worktree (git
+            # worktree add + sync the spec into .aifactory/specs) BEFORE the Job,
+            # which is the CODE fix for the empty-worktree defect that reverted
+            # FLIP #3. Validated live before leaving default.
+            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
