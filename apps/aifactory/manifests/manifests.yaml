@@ -147,23 +147,31 @@ spec:
             - { name: AIFACTORY_NIX_STORE_PVC, value: "aifactory-nix-store" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
             # RFC-0016 #671 / RFC-0017: run.py-as-a-k8s-Job build backend.
-            # FLIP #1 (2026-06-21) was REVERTED: the build Job dispatched but the
-            # pod hit StartError — the entrypoint `bash -c "python run.py …"` ran
-            # on AIFACTORY_SANDBOX_IMAGE (thin tfactory-runner-nix, no bash/python
-            # outside `nix develop`), so run.py never executed and no logs surfaced.
-            # FIXED in AIFactory #685 (merged, live as sha-1328e50): the build Job
-            # now resolves a python-capable image via a dedicated resolver —
-            # AIFACTORY_BUILD_IMAGE → AIFACTORY_IMAGE → fallback. Gates keep the
-            # thin nix image (AIFACTORY_SANDBOX_IMAGE untouched).
-            # #685's chart injects AIFACTORY_IMAGE via the Helm template; this
-            # gitops uses a FLAT manifest (no chart), so we inject it here. The
-            # pod can't read its own image via the downward API, so we pin it to
-            # the same reference the kustomization `images:` transformer sets.
+            # FLIP #1 (2026-06-21) REVERTED: StartError — the build Job ran on the
+            # thin AIFACTORY_SANDBOX_IMAGE (no bash/python). FIXED in #685.
+            # FLIP #2 (2026-06-21, post-#685) ALSO REVERTED — but #685 DID work:
+            # the build Job now dispatches on the python-capable AIFACTORY_IMAGE
+            # (aifactory:sha-1328e50), the container STARTS (StartError gone —
+            # terminated reason Error/exit=2, not StartError), and bash+python run.
+            # A NEW, distinct defect surfaced: the Job entrypoint is
+            #   bash -c "python run.py --spec <id> --project-dir /work …"
+            # with workingDir=/work, but run.py lives at
+            #   /home/projects/MagesticAI/apps/backend/run.py
+            # in the image — NOT in the co-mounted worktree /work. So every build
+            # Job dies with `python: can't open file '/work/run.py': [Errno 2]`,
+            # run.py never executes, no build logs surface. Proven live on
+            # aifactory-test (Jobs factory-aifactory-llo-kubejob-fastpath +
+            # factory-aifactory-o-kubejob-validation, both exit=2).
+            # Needs a CODE fix in AIFactory build_backend.py / job_dispatch:
+            # invoke run.py by its absolute image path (or set workingDir to the
+            # backend dir) while keeping --project-dir /work. Cannot be fixed from
+            # gitops env. Staying on the in-pod subprocess default until that lands.
+            # AIFACTORY_IMAGE is left injected (harmless + correct: it is the
+            # prerequisite the #685 resolver needs, and the next flip attempt).
             # NOTE: CD bumps the kustomization newTag but NOT this env — keep this
             # SHA aligned with apps/aifactory/manifests/kustomization.yaml newTag.
             - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-1328e50" }
-            # FLIP #2 (2026-06-21, post-#685): build backend = run.py-as-k8s-Job.
-            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
+            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see above
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
