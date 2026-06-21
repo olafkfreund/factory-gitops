@@ -216,12 +216,21 @@ spec:
             # package into the verify Job + set PYTHONPATH, or build the runner image
             # to contain it). Cannot be fixed from gitops env. Staying on the in-pod
             # verify default until that lands.
-            # FLIP #4 (round-4, 2026-06-21, post-#479): re-flip to kubejob. #479
-            # ships the TFactory backend `agents` package on PYTHONPATH in the
-            # verify Job (via TFACTORY_IMAGE), the CODE fix for the
-            # ModuleNotFoundError that reverted FLIP #3. Validated live before
-            # leaving default.
-            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
+            # FLIP #4 (round-4, 2026-06-21, post-#479) REVERTED — NOT a verify
+            # defect: the verify stage was never reached, so #479's agents-import
+            # fix could not be exercised. The pipeline stalled BEFORE dispatch in
+            # the plan→generate→replan loop (the known pre-existing pre-dispatch
+            # stall). Proven live on aifactory-test, spec
+            # verify-kubejob-d4-130020: generation cycled
+            # generating→planning(replan)→generating; both test subtasks hit
+            # `replan_count=2` "stuck" (Triager omits from commit), tests_generated
+            # stayed 0, status never left `generating`, NO verify Job was
+            # dispatched, NO verify-dispatch/reconcile lines in logs.
+            # This is a pre-existing generation/replan-loop blocker (not introduced
+            # by the flip and not the #466 wiring nor the #479 image). Re-attempt
+            # the verify kubejob flip once a verify run can get PAST generation to
+            # dispatch. Back to in-pod verify default (safe).
+            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see FLIP #4 above (pre-existing pre-dispatch generate/replan stall; verify never reached)
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
