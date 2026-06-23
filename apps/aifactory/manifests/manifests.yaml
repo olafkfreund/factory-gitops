@@ -274,6 +274,17 @@ spec:
             - { name: S3_BUCKET, value: "factory-artifacts" }
             - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
             - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+            # RFC-0017 #190 (Stage E) FLIP: turn ON workspace packing. The build
+            # producer (build_backend) now packs the populated /work to MinIO and
+            # threads the s3:// URI onto the Job's WORKSPACE_URI; the Job drops the
+            # RWO /work co-mount (slice 5) and unpacks from object storage instead
+            # (core/workspace_fetch), so a build Job is no longer pinned to the
+            # worktree's node. Requires: AIFACTORY_BUILD_BACKEND=kubejob (set
+            # above), the S3_* env (above), and AIFactory #721-#726 (all shipped).
+            # Producer is fail-safe (pack error → falls back to co-mount); once a
+            # pack succeeds the Job unpack is fail-loud (no co-mount). Pre-flip S3
+            # round-trip from the live pod verified OK. REVERT = remove this line.
+            - { name: AIFACTORY_PACK_WORKSPACE, value: "true" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
