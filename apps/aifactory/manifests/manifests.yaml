@@ -258,6 +258,22 @@ spec:
             # ahead of the build-default flip: the Job then has file-auth provider
             # parity (codex/gemini-oauth/copilot) the moment kubejob is enabled.
             - { name: AIFACTORY_CLI_CREDS_SECRET, value: "factory-cli-creds" }
+            # RFC-0017 #190 (Stage E): S3-compatible object store (in-cluster
+            # MinIO) for packed build workspaces. The shared client
+            # (apps/backend/core/artifact_store.py) reads this S3_* namespace —
+            # NOT the chart's fsspec AIFACTORY_S3_*/AWS_* WorkspaceStore vars.
+            # The producer (build_backend pack) AND the dispatched build Job
+            # (core/workspace_fetch unpack, which inherits these via
+            # build_backend._PASSTHROUGH_BUILD_ENV, AIFactory #726) both need
+            # them. INERT until AIFACTORY_PACK_WORKSPACE=true (default off): with
+            # the flag off the producer never packs, so /work still comes from the
+            # RWO co-mount and these vars are unused. Safe to set ahead of the
+            # pack flip. Mirrors TFactory's verify-artifact S3_* block. Creds from
+            # the out-of-band `minio-creds` Secret. REVERT = remove these lines.
+            - { name: S3_ENDPOINT, value: "http://minio.factory.svc.cluster.local:9000" }
+            - { name: S3_BUCKET, value: "factory-artifacts" }
+            - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+            - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
