@@ -242,8 +242,15 @@ spec:
             # materialize /work as a git repo (init/clone or co-mount the .git)
             # before the Job, OR run the build with a worktree mode that does not
             # require an outer git repo at /work. Cannot be fixed from gitops env.
-            # Back to in-pod subprocess build default (safe).
-            # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see FLIP #5 above (kubejob /work has no .git → WorktreeManager fails; #688 OAuth FIXED)
+            # FLIP #5 blocker RESOLVED (2026-06-23): AIFactory #716 makes
+            # populate_build_worktree build a SELF-CONTAINED git clone at /work
+            # (real .git dir + aifactory/<spec> branch + GitHub origin + spec),
+            # so WorktreeManager + the PR-endgame push work in-Job. #51 (below)
+            # seeds the file-auth CLI creds. All build-Job code blockers are now
+            # fixed (#685 image / #686 abs run.py / #716 self-contained /work /
+            # #688 OAuth / #689 provider env / #690 file-auth creds) → flipping the
+            # build to Job-native. REVERT = re-comment this one line.
+            - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
             # #690: file-auth CLI creds for the dispatched build Job — seeds the
             # factory-cli-creds secret into the Job pod via the seed-creds
             # initContainer (build_backend._inject_seed_creds). INERT until
