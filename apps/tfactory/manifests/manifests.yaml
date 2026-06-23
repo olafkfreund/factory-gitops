@@ -245,7 +245,20 @@ spec:
             # the verify Job container, mirroring the in-pod env. This is the same
             # class of fix the build Job needs (AIFactory #671 FLIP #4). Cannot be
             # fixed from gitops. Back to in-pod verify default (safe).
-            # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see FLIP #4 above (verify Job missing CLAUDE_CODE_OAUTH_TOKEN; #479 agents-import FIXED)
+            # FLIP #5 (round-5, 2026-06-23) — ENABLED. The FLIP #4 blocker (verify
+            # Job missing CLAUDE_CODE_OAUTH_TOKEN → core/auth.require_auth_token
+            # ValueError) is RESOLVED on the current runtime image. Proof: a
+            # side-process dispatch_verify_job smoke (job_id verifysmoke466, verify
+            # image sha-e5f5b01) ran the FULL pipeline in a real k8s Job —
+            # `agents` imported (no ModuleNotFoundError), the evaluator ran the
+            # generated pytest (stability 3/3, mutation killed Eq→NotEq), and the
+            # triager executed a full LLM agent session (prompt-cache
+            # read=46225/write=25147 tok — the exact credential path that failed
+            # FLIP #4), returned verdict=accept, and wrote a durable job_states row
+            # lifecycle_state=done / service_status=triaged with a traceability
+            # matrix (tests/test_smoke.py::u1, VAL-1, passed). #481 CLI-creds seed
+            # (below) adds file-auth provider parity. TFactory #466.
+            - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
             # #481: file-auth CLI creds for the dispatched verify Job — seeds the
             # factory-cli-creds secret into the Job pod via the seed-creds
             # initContainer (verify_dispatch._inject_verify_seed_creds). INERT
