@@ -244,6 +244,13 @@ spec:
             # require an outer git repo at /work. Cannot be fixed from gitops env.
             # Back to in-pod subprocess build default (safe).
             # - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }  # REVERTED — see FLIP #5 above (kubejob /work has no .git → WorktreeManager fails; #688 OAuth FIXED)
+            # #690: file-auth CLI creds for the dispatched build Job — seeds the
+            # factory-cli-creds secret into the Job pod via the seed-creds
+            # initContainer (build_backend._inject_seed_creds). INERT until
+            # AIFACTORY_BUILD_BACKEND=kubejob (default off), so it is safe to set
+            # ahead of the build-default flip: the Job then has file-auth provider
+            # parity (codex/gemini-oauth/copilot) the moment kubejob is enabled.
+            - { name: AIFACTORY_CLI_CREDS_SECRET, value: "factory-cli-creds" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
