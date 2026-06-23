@@ -290,6 +290,23 @@ spec:
             # pack succeeds the Job unpack is fail-loud (no co-mount). Pre-flip S3
             # round-trip from the live pod verified OK. REVERT = remove this line.
             - { name: AIFACTORY_PACK_WORKSPACE, value: "true" }
+            # RFC-0017 #190 (Stage E) DEPIN: source nix from the build IMAGE
+            # instead of the node-pinned aifactory-nix-store warm-store PVC, so a
+            # PACKED build Job is no longer re-pinned to that PVC's node — the last
+            # node-affinity on the packed path (closes #190 / epic #206).
+            # AIFACTORY_BUILD_IMAGE overrides AIFACTORY_IMAGE for the build Job ONLY
+            # (build_backend._resolve_build_image precedence) and points at the
+            # `-nix` variant: the SAME e386c4c runtime image — a superset of the
+            # ccbd0ce AIFACTORY_IMAGE pin, so it still carries the #727 writable-/work
+            # + git-safe-/work packed-Job fixes — PLUS a baked /nix/store (Dockerfile
+            # build-runtime stage, published by build-nix.yml). AIFACTORY_PACKED_NIX_IN_IMAGE
+            # makes build_backend DROP the nix-store PVC volume from the packed build
+            # Job (Slice A gate, #730); the Job then resolves `nix develop` from the
+            # image's own /nix/store. INERT unless AIFACTORY_PACK_WORKSPACE=true
+            # (packed path only) — the GATE/sandbox Jobs keep AIFACTORY_NIX_STORE_PVC
+            # above. REVERT = remove these two lines.
+            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-e386c4c-nix" }
+            - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
