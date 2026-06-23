@@ -246,6 +246,13 @@ spec:
             # class of fix the build Job needs (AIFactory #671 FLIP #4). Cannot be
             # fixed from gitops. Back to in-pod verify default (safe).
             # - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }  # REVERTED — see FLIP #4 above (verify Job missing CLAUDE_CODE_OAUTH_TOKEN; #479 agents-import FIXED)
+            # #481: file-auth CLI creds for the dispatched verify Job — seeds the
+            # factory-cli-creds secret into the Job pod via the seed-creds
+            # initContainer (verify_dispatch._inject_verify_seed_creds). INERT
+            # until TFACTORY_VERIFY_EXEC=kubejob (default in-pod), so it is safe to
+            # set ahead of the verify-default flip: the Job then has file-auth
+            # provider parity (codex/gemini-oauth/copilot) once kubejob is enabled.
+            - { name: TFACTORY_VERIFY_CLI_CREDS_SECRET, value: "factory-cli-creds" }
             # Opt-in LLM staff-engineer review lane (additive, parallel, never
             # feeds the verdict path). Writes findings/review.json each verify.
             - { name: TFACTORY_REVIEW_LANE, value: "1" }
