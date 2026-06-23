@@ -188,17 +188,18 @@ spec:
             # AIFACTORY_IMAGE pins the python-capable image the build Job runs on.
             # CD bumps the kustomization newTag but NOT this env — keep this SHA
             # aligned with kustomization.yaml newTag (FLAT manifests; no Helm
-            # image-injection). RFC-0017 #190 (Stage E, 2026-06-23): realigned from
-            # the stale sha-8e0f0e8 (#688, Jun 21) to sha-54ccf04 (== current
-            # kustomization newTag / running Deployment image). sha-8e0f0e8
-            # PREDATES the slice-4 unpack consumer (core/workspace_fetch +
-            # cli/main.maybe_unpack_workspace, #724) — so once AIFACTORY_PACK_WORKSPACE
-            # is ON, a build Job dispatched on sha-8e0f0e8 has no consumer, the
-            # WORKSPACE_URI is never unpacked, and run.py dies on an empty/unwritable
-            # /work (caught in live pack-flip validation). sha-54ccf04 carries the
-            # consumer AND the #688 OAuth/provider-env dispatch, so it is the correct
-            # build image for the packed-workspace path.
-            - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-54ccf04" }
+            # image-injection). RFC-0017 #190 (Stage E, 2026-06-23): realigned to
+            # sha-ccbd0ce (== current kustomization newTag / running Deployment
+            # image) from sha-54ccf04. sha-54ccf04 carried the unpack consumer but
+            # NOT the packed-Job fixes in #727: it mounts no writable /work for a
+            # packed Job (nonroot unpack dies PermissionError: /work) and its
+            # consumer doesn't mark the unpacked repo git-safe (worktree setup dies
+            # `detected dubious ownership in repository at '/work'`). Both were
+            # caught in live #190 validation and fixed in #727 (ccbd0ce). So with
+            # AIFACTORY_PACK_WORKSPACE ON, the build Job MUST run sha-ccbd0ce — the
+            # control plane (newTag) emits the writable-/work emptyDir manifest and
+            # the build Job (this pin) unpacks + git-safes /work end-to-end.
+            - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-ccbd0ce" }
             # FLIP #4 (round-4, 2026-06-21, post-#687) REVERTED — but #687 DID
             # work, the empty-worktree defect that reverted FLIP #3 is RESOLVED.
             # Proven live on aifactory-test, Job
