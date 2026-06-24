@@ -296,16 +296,18 @@ spec:
             # node-affinity on the packed path (closes #190 / epic #206).
             # AIFACTORY_BUILD_IMAGE overrides AIFACTORY_IMAGE for the build Job ONLY
             # (build_backend._resolve_build_image precedence) and points at the
-            # `-nix` variant: the SAME e386c4c runtime image — a superset of the
+            # `-nix` variant: the cf0dea8 runtime image — a strict superset of the
             # ccbd0ce AIFACTORY_IMAGE pin, so it still carries the #727 writable-/work
-            # + git-safe-/work packed-Job fixes — PLUS a baked /nix/store (Dockerfile
+            # + git-safe-/work packed-Job fixes (cf0dea8 = e386c4c + docs + the
+            # chainguard/python CVE base-digest bump #735, no functional change) —
+            # PLUS a baked /nix/store (Dockerfile
             # build-runtime stage, published by build-nix.yml). AIFACTORY_PACKED_NIX_IN_IMAGE
             # makes build_backend DROP the nix-store PVC volume from the packed build
             # Job (Slice A gate, #730); the Job then resolves `nix develop` from the
             # image's own /nix/store. INERT unless AIFACTORY_PACK_WORKSPACE=true
             # (packed path only) — the GATE/sandbox Jobs keep AIFACTORY_NIX_STORE_PVC
             # above. REVERT = remove these two lines.
-            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-e386c4c-nix" }
+            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-cf0dea8-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
