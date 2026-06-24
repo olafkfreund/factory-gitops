@@ -293,7 +293,7 @@ spec:
             # contract — same config AIFactory uses. Without the base URL the
             # provider defaults to api.openai.com and the planner session fails
             # fast (missing/None → planner_failed) for an Ollama-routed verify.
-            - { name: OPENAI_COMPATIBLE_BASE_URL, value: "https://ollama.com" }
+            - { name: OPENAI_COMPATIBLE_BASE_URL, value: "http://host.k3d.internal:11434" }
             - { name: OPENAI_COMPATIBLE_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_COMPATIBLE_API_KEY } } }
             - { name: CONTEXT7_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CONTEXT7_KEY } } }
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
