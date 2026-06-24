@@ -7,4 +7,4 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/aifactory
   newName: ghcr.io/olafkfreund/aifactory
-  newTag: sha-d0ca435
+  newTag: sha-26d2a74
