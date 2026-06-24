@@ -155,13 +155,14 @@ spec:
             # the ModuleNotFoundError that reverted FLIP #3 was fixed in #479).
             # CD bumps the kustomization newTag but NOT this env — keep this SHA
             # aligned with kustomization.yaml newTag (FLAT manifests; no Helm
-            # image-injection). STAGE 0 (round-5, 2026-06-21): realigned to
-            # sha-e5f5b01 — the #480 merge that injects CLAUDE_CODE_OAUTH_TOKEN
-            # (+ full provider env) into the verify Job, on top of #479 verify-image
-            # / #476 wiring / #478 loop+flake. The verify Job now runs on the image
-            # whose dispatch propagates the LLM credential (resolves the round-4
-            # "No OAuth token found" that reverted FLIP #4).
-            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-e5f5b01" }
+            # image-injection). 2026-06-24: realigned sha-e5f5b01 (2026-06-21,
+            # pre-#544) -> sha-cbc593a (== kustomization newTag). The stale pin
+            # meant the verify Job ran an evaluator WITHOUT the Go test-lane
+            # dispatch (#544 `_completed_go_subtasks` / run_gotest_lane_via_nix),
+            # so a Go verify found 0 completed subtasks -> empty verdicts ->
+            # triaged_empty. cbc593a carries #544 + the spec-ingest delete fix
+            # (#546). Keep this in lockstep with the newTag on every CD bump.
+            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-cbc593a" }
             # RFC-0016 #466 / RFC-0017: Job-native verify orchestration.
             # FLIP #1 (2026-06-21) REVERTED — verify_dispatch was present but NOT
             # WIRED (nothing called verify_exec_mode), so the flip was inert.
