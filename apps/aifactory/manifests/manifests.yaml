@@ -307,7 +307,7 @@ spec:
             # image's own /nix/store. INERT unless AIFACTORY_PACK_WORKSPACE=true
             # (packed path only) — the GATE/sandbox Jobs keep AIFACTORY_NIX_STORE_PVC
             # above. REVERT = remove these two lines.
-            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-cf0dea8-nix" }
+            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-205d6f19-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
