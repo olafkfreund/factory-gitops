@@ -295,6 +295,11 @@ spec:
             # fast (missing/None → planner_failed) for an Ollama-routed verify.
             - { name: OPENAI_COMPATIBLE_BASE_URL, value: "http://host.k3d.internal:11434" }
             - { name: OPENAI_COMPATIBLE_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_COMPATIBLE_API_KEY } } }
+            # Bound local-model thinking + reserve output budget (verify Planner
+            # else returns finish=length empty on big prompts). Forwarded to the
+            # verify Job by verify_dispatch._SDK_PASSTHROUGH_ENV.
+            - { name: OPENAI_COMPATIBLE_REASONING_EFFORT, value: "low" }
+            - { name: OPENAI_COMPATIBLE_MAX_TOKENS, value: "4096" }
             - { name: CONTEXT7_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CONTEXT7_KEY } } }
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
             - { name: RAPIDAPI_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: RAPIDAPI_KEY } } }
