@@ -6,7 +6,7 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/cfactory
   newName: ghcr.io/olafkfreund/cfactory
-  newTag: sha-1ac29e4
+  newTag: sha-edf2057
 - name: ghcr.io/olafkfreund/cfactory-frontend
   newName: ghcr.io/olafkfreund/cfactory-frontend
-  newTag: sha-1ac29e4
+  newTag: sha-edf2057
