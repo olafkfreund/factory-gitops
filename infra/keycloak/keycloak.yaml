@@ -41,6 +41,12 @@ spec:
             - { name: KC_HOSTNAME_STRICT, value: "false" }
           ports: [{ containerPort: 8080 }]
           volumeMounts: [{ name: data, mountPath: /opt/keycloak/data }]
+          # startupProbe gates liveness/readiness during the slow Quarkus
+          # `start-dev` augmentation. Under post-reboot CPU/IO load this can take
+          # >180s; the old liveness (initialDelay 90 + 3x30 = 180s) killed it
+          # mid-build, causing an infinite crash-loop (incident 2026-06-25).
+          # 60 x 10s = 600s budget before the container is considered failed.
+          startupProbe:   { httpGet: { path: /realms/master, port: 8080 }, periodSeconds: 10, failureThreshold: 60, timeoutSeconds: 3 }
           readinessProbe: { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 25, periodSeconds: 10, failureThreshold: 30 }
           livenessProbe:  { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 90, periodSeconds: 30 }
           resources: { requests: { cpu: 250m, memory: 1Gi }, limits: { memory: 2560Mi } }
