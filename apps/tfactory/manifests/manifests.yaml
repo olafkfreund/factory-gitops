@@ -279,6 +279,9 @@ spec:
             # send it as `Authorization: Bearer`). Matches aifactory so all three
             # factories accept the one shared token from factory-secrets.
             - { name: APP_API_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
+            # Federated cross-portal search (#149): read-scoped cockpit key so this
+            # portal's /api/search proxy can query the cockpit's aggregated index.
+            - { name: CFACTORY_READ_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_READ_KEY } } }
             # OIDC SSO via Keycloak
             - { name: APP_OIDC_ENABLED, value: "true" }
             - { name: APP_OIDC_ISSUER_URL, value: "https://keycloak.freundcloud.org.uk/realms/factory" }
