@@ -318,6 +318,12 @@ spec:
             # nix 2.30.1 (121 /nix/store entries) on a 2nd k3d node, no nix PVC.
             - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-24b2796-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
+            # Operator runtime allowlist (RFC-0014, core/runtime_gating.py). `claude`
+            # is always on; opt in to others by naming them. Copilot enabled here
+            # (AIFactory #790) — REQUIRES the copilot CLI in the coder image (done)
+            # AND a GitHub Copilot subscription sign-in on the pod. A task must set
+            # runtime=copilot explicitly; default tasks still use claude.
+            - { name: AIFACTORY_RUNTIMES, value: "claude,copilot" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
