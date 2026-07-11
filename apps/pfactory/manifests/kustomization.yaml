@@ -9,4 +9,4 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/pfactory
   newName: ghcr.io/olafkfreund/pfactory
-  newTag: sha-a893d6d
+  newTag: sha-07d7e3a
