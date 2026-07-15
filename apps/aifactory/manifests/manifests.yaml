@@ -189,6 +189,18 @@ spec:
             - { name: AIFACTORY_INTAKE_POLLER, value: "true" }
             - { name: AIFACTORY_INTAKE_INTERVAL_S, value: "30" }
             - { name: AIFACTORY_URL, value: "http://localhost:3101" }
+            # The poller calls its OWN /api/tasks/from-issue and authenticates
+            # with `AIFACTORY_TOKEN or GH_TOKEN` (intake_poller._post_json).
+            # Unset, it fell back to GH_TOKEN — a GitHub PAT — and AIFactory
+            # rightly answered 401, which the poller reported on the issue:
+            #   "AIFactory intake failed (terminal):
+            #    http://localhost:3101/api/tasks/from-issue -> HTTP 401"
+            # Point it at the API's own token. (The GH_TOKEN fallback is a code
+            # smell — a GitHub PAT is never valid against our API — tracked
+            # separately; this is the config that makes intake work today.)
+            - name: AIFACTORY_TOKEN
+              valueFrom:
+                secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN }
             # project_id is the AIFactory project the repo maps to (registered via
             # POST /api/projects with gitUrl, which clones into the workspaces
             # PVC). Start with the demo target only — it is disposable and is the
