@@ -6,16 +6,26 @@ spec:
   storageClassName: local-path
   resources: { requests: { storage: 5Gi } }
 ---
-# RFC-0016 #197 — warm /nix/store shared across per-task Nix sandbox Jobs so they
-# stop cold-fetching the closure every run. RWO is fine on this single-node cluster
-# (all Jobs land on the one node holding local-path); a multi-node fleet needs RWX.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: { name: aifactory-nix-store, namespace: factory, labels: { app: aifactory, role: nix-store } }
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: local-path
-  resources: { requests: { storage: 20Gi } }
+# The warm /nix/store PVC (RFC-0016 #197) is GONE — removed with its GC CronJob and
+# AIFACTORY_NIX_STORE_PVC env (Factory#253, AIFactory#830).
+#
+# Its own comment carried the assumption that broke it: "RWO is fine on this
+# single-node cluster (all Jobs land on the one node holding local-path)". The
+# cluster grew a second node and the comment did not. local-path is
+# WaitForFirstConsumer, so each PV is created wherever its first consumer lands:
+# aifactory-data settled on k3d-factory-server-0 and aifactory-nix-store on
+# k3d-agent-0-0. Any pod mounting both RWO claims then satisfies NO node's
+# affinity — the gate Job could not schedule at all. It also serialised concurrent
+# Jobs on one mount (TFactory#623), which is what capped the fleet at 3-4
+# concurrent tasks on 80 idle cores.
+#
+# Nothing needs it now: the -nix images bake the very store the PVC was seeded
+# from (kube_sandbox's seed initContainer did `cp -a /nix/. /warm/` FROM the
+# image), and both Job paths resolve /nix from the image —
+# AIFACTORY_PACKED_NIX_IN_IMAGE=true covers the build path (build_backend) and the
+# gate path (gate_runner, via core.nix_env.nix_in_image). The cost is only the
+# closures realised during a task, re-fetched per Job instead of persisting:
+# speed traded for schedulability.
 ---
 apiVersion: v1
 kind: Service
@@ -141,13 +151,15 @@ spec:
             # The thin nix-base image carries no toolchains; each task's flake
             # (materialized from the contract `environment`) provides them, so this
             # is language-agnostic (retires the single-image golang:1.25 experiment).
-            # The warm /nix store PVC (AIFACTORY_NIX_STORE_PVC) persists closures
-            # across Jobs. Live-proven 2026-06-20: a real Go gate ran green via
-            # _nix_kube_runner (go1.26.3 from Nix), aifactory-nix-store bound + warm.
+            # AIFACTORY_NIX_STORE_PVC is deliberately UNSET (Factory#253): /nix now
+            # comes from the image, not a node-pinned RWO warm store. Unset means
+            # gate_runner and build_backend both pass nix_store_pvc=None, which
+            # kube_sandbox/job_dispatch treat as "no mount" — the documented
+            # cold-fetch path. Do not reintroduce it without RWX storage; the two
+            # RWO claims stranding on different nodes is what deadlocked the gate.
             - { name: AIFACTORY_SANDBOX_GATES, value: "true" }
             - { name: AIFACTORY_SANDBOX_BACKEND, value: "nixjob" }
             - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
-            - { name: AIFACTORY_NIX_STORE_PVC, value: "aifactory-nix-store" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
             # RFC-0016 #671 / RFC-0017: run.py-as-a-k8s-Job build backend.
             # FLIP #1 (2026-06-21) REVERTED: StartError — the build Job ran on the
@@ -307,9 +319,16 @@ spec:
             # build-runtime stage, published by build-nix.yml). AIFACTORY_PACKED_NIX_IN_IMAGE
             # makes build_backend DROP the nix-store PVC volume from the packed build
             # Job (Slice A gate, #730); the Job then resolves `nix develop` from the
-            # image's own /nix/store. INERT unless AIFACTORY_PACK_WORKSPACE=true
-            # (packed path only) — the GATE/sandbox Jobs keep AIFACTORY_NIX_STORE_PVC
-            # above. REVERT = remove these two lines.
+            # image's own /nix/store.
+            # UPDATE (Factory#253, AIFactory#830): this flag is no longer packed-path
+            # only. The line that used to sit here — "INERT unless
+            # AIFACTORY_PACK_WORKSPACE=true (packed path only) — the GATE/sandbox Jobs
+            # keep AIFACTORY_NIX_STORE_PVC above" — described the bug: the flip landed
+            # on the build path and silently missed the gate path, which kept mounting
+            # the stranded RWO PVC and could not schedule once the PVs split across
+            # nodes. gate_runner now reads the SAME predicate (core.nix_env.nix_in_image),
+            # and AIFACTORY_NIX_STORE_PVC is gone entirely, so both paths source /nix
+            # from their image. REVERT = remove these two lines.
             # NOTE (2026-06-25): the build-nix.yml publish workflow tags the -nix
             # image with a 7-char short SHA (sha-205d6f1-nix), but git abbreviates
             # commit #745 to 8 chars (205d6f19) for uniqueness. Pinning the git
@@ -412,39 +431,7 @@ subjects:
     name: aifactory-sandbox
     namespace: factory
 ---
-# RFC-0016 #197 — size-capped GC for the warm Nix store. Without it the shared
-# /nix store grows unbounded as per-task toolchains accumulate. Runs on the same
-# thin nix-base image the Jobs use, mounts the same PVC, and runs `nix store gc`
-# with a max-free target so the store is trimmed back under a cap. Opt-in by
-# existence: harmless if the PVC is empty/unseeded (gc on an empty store no-ops).
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: aifactory-nix-store-gc
-  namespace: factory
-  labels: { app: aifactory, role: nix-store-gc }
-spec:
-  schedule: "0 3 * * *"          # nightly 03:00
-  concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 1
-  failedJobsHistoryLimit: 1
-  jobTemplate:
-    spec:
-      backoffLimit: 0
-      activeDeadlineSeconds: 1800
-      ttlSecondsAfterFinished: 600
-      template:
-        metadata: { labels: { app: aifactory, role: nix-store-gc } }
-        spec:
-          restartPolicy: Never
-          automountServiceAccountToken: false
-          imagePullSecrets: [{ name: ghcr-pull }]
-          containers:
-            - name: gc
-              image: ghcr.io/olafkfreund/tfactory-runner-nix:latest
-              # Trim the store back toward ~12Gi free headroom in the 20Gi PVC.
-              command: ["nix", "store", "gc", "--max", "12G"]
-              volumeMounts: [{ name: nix-store, mountPath: /nix }]
-          volumes:
-            - name: nix-store
-              persistentVolumeClaim: { claimName: aifactory-nix-store }
+# The aifactory-nix-store-gc CronJob (RFC-0016 #197) is GONE with the PVC it
+# trimmed (Factory#253). It nightly `nix store gc`'d a warm store that nothing
+# writes to any more — garbage-collecting garbage. Per-Job /nix now comes from
+# the image and dies with the Job, so there is nothing to cap.
