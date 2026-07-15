@@ -6,16 +6,29 @@ spec:
   storageClassName: local-path
   resources: { requests: { storage: 5Gi } }
 ---
-# RFC-0016 #197 — warm /nix/store shared across per-task Nix verify Jobs so they
-# stop cold-fetching the closure every run. RWO is fine on this single-node cluster;
-# a multi-node fleet needs RWX.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: { name: tfactory-nix-store, namespace: factory, labels: { app: tfactory, role: nix-store } }
-spec:
-  accessModes: ["ReadWriteOnce"]
-  storageClassName: local-path
-  resources: { requests: { storage: 20Gi } }
+# The warm /nix/store PVC (RFC-0016 #197) is GONE — removed with its GC CronJob
+# and TFACTORY_NIX_STORE_PVC env (TFactory#623/#665, mirrors AIFactory's
+# factory-gitops#60).
+#
+# Its own comment carried the assumption that broke it: "RWO is fine on this
+# single-node cluster". The cluster has had two nodes since 2026-06-26. RWO means
+# only ONE pod mounts it at a time, so the evaluator's concurrent per-test /
+# stability-sample / mutation Jobs SERIALISED on a single mount — the fleet's
+# 3-4 concurrent ceiling was this lock, not a resource limit, which is why 80
+# idle cores never helped. It also explained #623's intermittency: a Job that won
+# the mount race found the closure prebuilt, one that lost got a cold /nix.
+#
+# It was a latent hard failure too: local-path is WaitForFirstConsumer, so each PV
+# lands wherever its first consumer did. tfactory-data and tfactory-nix-store
+# happened to land on the same node — luck, not design. AIFactory's split across
+# nodes and every pod mounting both RWO claims became unschedulable outright
+# (Factory#253, AIFactory#830).
+#
+# Nothing needs it: the tfactory-runner-nix image bakes the very store the PVC was
+# seeded from (build_job_manifest's seed initContainer copied the image's own /nix
+# INTO it), and TFACTORY_NIX_IN_IMAGE=true makes both the control plane and the
+# dispatched Job resolve /nix from the image. Cost: closures realised during a
+# task are re-fetched per Job instead of persisting — speed for concurrency.
 ---
 # RFC-0005 Tier A: SA + least-privilege RBAC so TFactory can dispatch ephemeral
 # Nix-lane Jobs (tools/runners/kube_sandbox.py) and read their logs. Scoped to
@@ -146,10 +159,20 @@ spec:
             # the thin Nix image. nixjob is now the DEFAULT verify execution path
             # (the code prefers it when TFACTORY_NIX_RUNNER_IMAGE is set and the
             # contract environment is a nix env; catalog-image/host-venv remain
-            # fallbacks). TFACTORY_NIX_STORE_PVC warms the /nix closure across Jobs.
+            # fallbacks).
+            #
+            # TFACTORY_NIX_STORE_PVC is deliberately UNSET (#623): /nix comes from
+            # the runner image, not a node-pinned RWO warm store. Unset means
+            # nix_runner_from_env passes nix_store_pvc=None, which kube_sandbox
+            # documents as "no mount" — the cold-fetch path. TFACTORY_NIX_IN_IMAGE
+            # keeps it dropped even if the var is ever reintroduced, and MUST reach
+            # the dispatched Job: nix_runner_from_env runs again in there, so a flag
+            # that does not travel reads False and re-mounts the PVC (verify_dispatch
+            # propagates it; that half-applied shape is how AIFactory#840 broke its
+            # gate lane). Do not reintroduce the PVC without RWX storage.
             - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
-            - { name: TFACTORY_NIX_STORE_PVC, value: "tfactory-nix-store" }
+            - { name: TFACTORY_NIX_IN_IMAGE, value: "true" }
             # TFACTORY_IMAGE pins the TFactory backend image the verify Job runs
             # on (the image that now ships the `agents` package on PYTHONPATH —
             # the ModuleNotFoundError that reverted FLIP #3 was fixed in #479).
@@ -326,34 +349,8 @@ spec:
         - { name: cc-config, emptyDir: {} }
         - { name: cli-creds, secret: { secretName: factory-cli-creds } }
 ---
-# RFC-0016 #197 — size-capped GC for the warm Nix store (see aifactory twin).
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: tfactory-nix-store-gc
-  namespace: factory
-  labels: { app: tfactory, role: nix-store-gc }
-spec:
-  schedule: "30 3 * * *"         # nightly 03:30 (offset from aifactory)
-  concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 1
-  failedJobsHistoryLimit: 1
-  jobTemplate:
-    spec:
-      backoffLimit: 0
-      activeDeadlineSeconds: 1800
-      ttlSecondsAfterFinished: 600
-      template:
-        metadata: { labels: { app: tfactory, role: nix-store-gc } }
-        spec:
-          restartPolicy: Never
-          automountServiceAccountToken: false
-          imagePullSecrets: [{ name: ghcr-pull }]
-          containers:
-            - name: gc
-              image: ghcr.io/olafkfreund/tfactory-runner-nix:latest
-              command: ["nix", "store", "gc", "--max", "12G"]
-              volumeMounts: [{ name: nix-store, mountPath: /nix }]
-          volumes:
-            - name: nix-store
-              persistentVolumeClaim: { claimName: tfactory-nix-store }
+# The tfactory-nix-store-gc CronJob (RFC-0016 #197) is GONE with the PVC it
+# trimmed (#623). It nightly `nix store gc`'d a warm store that nothing writes to
+# any more — garbage-collecting garbage. Per-Job /nix now comes from the image and
+# dies with the Job, so there is nothing to cap. Its aifactory twin went the same
+# way in factory-gitops#60.
