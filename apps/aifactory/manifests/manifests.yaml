@@ -161,6 +161,41 @@ spec:
             - { name: AIFACTORY_SANDBOX_BACKEND, value: "nixjob" }
             - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
+            # ── RFC-0011 label-driven intake poller (#636) — the issue->build
+            # handover. INERT until an issue carries a `factory:*` label: the loop
+            # lists issues, skips anything already `factory:queued` (its
+            # idempotency guard, paired with a SQLite one), and ignores everything
+            # without a `factory:` prefix. So enabling it with no labelled issues
+            # is a no-op; labelling ONE issue fires exactly one run.
+            #
+            # Routing is by RFC-0011 difficulty tier: low/medium take the
+            # skip-planning fast path straight to a build; hard routes to PFactory.
+            #
+            # PFACTORY_INGEST_URL is deliberately LEFT UNSET. _route_hard POSTs the
+            # URL *directly* (not as a base) with {repo, provider, issue_number,
+            # title, body, labels} — and PFactory has no route accepting that
+            # shape: its only ingest is POST /api/plan/ingest-text taking
+            # {text, title, channel}. Pointing this at PFactory would 422, and
+            # pointing it anywhere would be a guess. Unset makes _route_hard raise
+            # TerminalIntakeError("PFACTORY_INGEST_URL unset; cannot route hard")
+            # — a LOUD refusal on a hard-tier issue instead of a silent 422. Fix
+            # the contract mismatch, then set this. Low/medium are unaffected.
+            #
+            # AIFACTORY_URL is the poller's base for its OWN /api/tasks/from-issue
+            # route — in-cluster localhost (Service port 3101, verified), not the
+            # public ingress, so intake does not depend on Cloudflare/oauth2-proxy
+            # being in the path. GITHUB_TOKEN (factory-secrets) is the fetch/label
+            # credential.
+            - { name: AIFACTORY_INTAKE_POLLER, value: "true" }
+            - { name: AIFACTORY_INTAKE_INTERVAL_S, value: "30" }
+            - { name: AIFACTORY_URL, value: "http://localhost:3101" }
+            # project_id is the AIFactory project the repo maps to (registered via
+            # POST /api/projects with gitUrl, which clones into the workspaces
+            # PVC). Start with the demo target only — it is disposable and is the
+            # same repo the recorded poller demo ran against. Add fleet repos here
+            # once the chain is proven end-to-end on it.
+            - name: AIFACTORY_INTAKE_REPOS
+              value: '[{"provider":"github","repo":"olafkfreund/aifactory-demo","project_id":"5d78d4b9-35f9-4445-92c1-78f3ff60a494"}]'
             # RFC-0016 #671 / RFC-0017: run.py-as-a-k8s-Job build backend.
             # FLIP #1 (2026-06-21) REVERTED: StartError — the build Job ran on the
             # thin AIFACTORY_SANDBOX_IMAGE (no bash/python). FIXED in #685.
