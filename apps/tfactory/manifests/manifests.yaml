@@ -113,6 +113,50 @@ spec:
             - { name: cc-config, mountPath: /h/.config }
             - { name: cli-creds, mountPath: /seed, readOnly: true }
       containers:
+        # Credential sync (Factory#292). seed-creds copies the Secret into the
+        # writable ~/.claude emptyDir ONCE at pod start, so a credential the
+        # cred-broker CronJob refreshes never reaches a long-running pod (the
+        # pod keeps a stale/expired token until it happens to restart). The
+        # cli-creds Secret VOLUME is auto-refreshed by kubelet, so this sidecar
+        # just re-copies it in whenever the seed is newer than what's on disk.
+        # "Newer only" matters: the agent SDK also writes this file when it
+        # refreshes, and we must not clobber a fresher token with a staler one.
+        - name: cred-sync
+          image: python:3.12-slim
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import json, os, shutil, time
+              SEED = "/seed/claude-credentials.json"
+              DEST = "/h/.claude/.credentials.json"
+              def exp(p):
+                  try:
+                      with open(p) as f:
+                          return int(json.load(f).get("claudeAiOauth", {}).get("expiresAt", 0))
+                  except Exception:
+                      return 0
+              while True:
+                  try:
+                      s, d = exp(SEED), exp(DEST)
+                      if s > d:
+                          tmp = DEST + ".tmp"
+                          shutil.copyfile(SEED, tmp)
+                          os.chmod(tmp, 0o660)
+                          os.replace(tmp, DEST)  # atomic; readers never see a partial file
+                          print(f"cred-sync: adopted fresher credential (+{(s - d) / 3600000:.1f}h)", flush=True)
+                  except Exception as e:
+                      print(f"cred-sync: {type(e).__name__}: {e}", flush=True)
+                  time.sleep(60)
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 5m, memory: 24Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          volumeMounts:
+            - { name: cc-claude, mountPath: /h/.claude }
+            - { name: cli-creds, mountPath: /seed, readOnly: true }
         - name: tfactory
           image: ghcr.io/olafkfreund/tfactory:0.6.4
           imagePullPolicy: IfNotPresent
