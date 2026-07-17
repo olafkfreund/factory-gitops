@@ -215,15 +215,16 @@ spec:
             # Routing is by RFC-0011 difficulty tier: low/medium take the
             # skip-planning fast path straight to a build; hard routes to PFactory.
             #
-            # PFACTORY_INGEST_URL is deliberately LEFT UNSET. _route_hard POSTs the
-            # URL *directly* (not as a base) with {repo, provider, issue_number,
-            # title, body, labels} — and PFactory has no route accepting that
-            # shape: its only ingest is POST /api/plan/ingest-text taking
-            # {text, title, channel}. Pointing this at PFactory would 422, and
-            # pointing it anywhere would be a guess. Unset makes _route_hard raise
-            # TerminalIntakeError("PFACTORY_INGEST_URL unset; cannot route hard")
-            # — a LOUD refusal on a hard-tier issue instead of a silent 422. Fix
-            # the contract mismatch, then set this. Low/medium are unaffected.
+            # PFACTORY_INGEST_URL: hard-tier issues route to PFactory planning.
+            # The contract mismatch that kept this unset is fixed: PFactory#306
+            # added POST /api/plan/sessions/from-issue accepting exactly
+            # _route_hard's payload {repo, provider, issue_number, title, body,
+            # labels, autonomy_tier, change_mode}; shipped to main via PFactory
+            # PR #312 (2026-07-17) and probed live from this pod (401 without
+            # auth, i.e. the route exists). Auth: _pfactory_token() falls back to
+            # the shared APP_API_TOKEN this pod already carries. _route_hard
+            # POSTs this URL DIRECTLY (not as a base) — keep the full path.
+            - { name: PFACTORY_INGEST_URL, value: "http://pfactory.factory.svc.cluster.local:3114/api/plan/sessions/from-issue" }
             #
             # AIFACTORY_URL is the poller's base for its OWN /api/tasks/from-issue
             # route — in-cluster localhost (Service port 3101, verified), not the
