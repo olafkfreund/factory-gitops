@@ -198,6 +198,14 @@ spec:
             - { name: TFACTORY_AUTO_GENERATE, value: "true" }
             - { name: TFACTORY_AUTO_EVALUATE, value: "true" }
             - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
+            # VAL-3 disposable-target provisioner (TFactory#607, Factory#257):
+            # verify runs whose val block requires a disposable target get a
+            # real throwaway k8s Job. Lazily registered at the
+            # disposable_target() choke point when this flag is set; inert for
+            # specs without a disposable-target requirement. Job is torn down
+            # on all paths, no credentials in Job env/argv.
+            - { name: TFACTORY_VAL3_K8S_JOB, value: "1" }
+            - { name: TFACTORY_VAL3_K8S_JOB_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             # RFC-0005 Tier A / RFC-0016 #469: the Nix-lane k8s-Job sandbox
             # co-mounts the worktree from this PVC and runs the per-task flake in
             # the thin Nix image. nixjob is now the DEFAULT verify execution path
