@@ -103,6 +103,59 @@ Result keys in `factory-secrets`: `AIFACTORY_OIDC_CLIENT_SECRET`,
     `/realms/master/...`) yields the dreaded *"redirect_uri not associated"*. When the public
     hostname changes, update the client redirect URIs too.
 
+## 2b. Tenant groups + `tenant` claim (multi-tenancy, #13)
+
+Tenancy = one Keycloak **group per tenant**. A group-membership protocol mapper on the
+`cfactory` and `factory-vscode` clients emits the user's groups as a `tenant` claim in the
+token; oauth2-proxy (`apps/cfactory-auth/`) turns that claim into an `X-Tenant-Id` request
+header for CFactory. Keep users in **exactly one** tenant group — multiple memberships would
+yield a comma-joined header value.
+
+```bash
+kubectl -n factory exec "$KCPOD" -c keycloak -- bash -c '
+  set -e
+  K=/opt/keycloak/bin/kcadm.sh
+  $K config credentials --server http://localhost:8080 --realm master \
+     --user admin --password "$KC_BOOTSTRAP_ADMIN_PASSWORD"
+
+  # tenant group (repeat per tenant; "default" is the single-tenant fallback)
+  $K create groups -r factory -s name=default || echo "group exists"
+  GID=$($K get groups -r factory -q search=default --fields id --format csv --noquotes | head -1)
+
+  # realm default group: new users (incl. GitHub-brokered JIT users) auto-join "default"
+  $K update realms/factory/default-groups/$GID -n
+
+  # add an existing user to a tenant group
+  UID=$($K get users -r factory -q username=<username> --fields id --format csv --noquotes)
+  $K update users/$UID/groups/$GID -r factory -s realm=factory -s userId=$UID -s groupId=$GID -n
+
+  # tenant claim mapper on the clients whose tokens reach CFactory:
+  # cfactory (browser session) + factory-vscode (editor JWT bearer)
+  for C in cfactory factory-vscode; do
+    CID=$($K get clients -r factory -q clientId=$C --fields id --format csv --noquotes)
+    $K create clients/$CID/protocol-mappers/models -r factory \
+      -s name=tenant -s protocol=openid-connect \
+      -s protocolMapper=oidc-group-membership-mapper \
+      -s "config.\"claim.name\"=tenant" \
+      -s "config.\"full.path\"=false" \
+      -s "config.\"id.token.claim\"=true" \
+      -s "config.\"access.token.claim\"=true" \
+      -s "config.\"userinfo.token.claim\"=true" || echo "mapper exists on $C"
+  done
+'
+```
+
+Verify without a login round-trip (server-side example token for a user):
+
+```bash
+$K get clients/$CID/evaluate-scopes/generate-example-access-token \
+  -r factory -q userId=$UID | grep tenant     # expect  "tenant" : [ "default" ]
+```
+
+Applied 2026-07-17: group `default` created + set as realm default group, all existing
+users joined, mapper on both clients. See [Multi-tenancy](multi-tenancy.md) for the
+oauth2-proxy header wiring and the data-scoping status.
+
 ## 3. GitHub as an identity provider (broker)
 
 Create a **GitHub OAuth App** (GitHub → Settings → Developer settings → OAuth Apps):
