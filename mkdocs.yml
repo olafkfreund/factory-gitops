@@ -55,6 +55,7 @@ nav:
   - Deploying the Factory Suite: deploying-the-factory-suite.md
   - Build & Deploy: build-and-deploy.md
   - Keycloak SSO: keycloak-sso.md
+  - Multi-tenancy: multi-tenancy.md
   - Apps:
       - SkillAI: apps-skillai.md
       - RoleHunter: apps-rolehunter.md
