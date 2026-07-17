@@ -15,7 +15,7 @@ spec:
   scaleTargetRef:
     name: aifactory
   minReplicaCount: 1
-  maxReplicaCount: 3   # rmux multi-replica safe via shared Redis bus (REDIS_URL)
+  maxReplicaCount: 6   # raised 3->6 for the concurrency sweep (Factory#295 E1); rmux multi-replica safe via shared Redis bus
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
@@ -30,7 +30,7 @@ spec:
         userName: factory
         dbName: aifactory
         sslmode: disable
-        targetQueryValue: "2"
+        targetQueryValue: "1"
         activationTargetQueryValue: "0"
         query: >-
           SELECT count(*) FROM job_states
