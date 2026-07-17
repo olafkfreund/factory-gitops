@@ -1,0 +1,73 @@
+# oauth2-proxy "alpha config" for the CFactory gate.
+#
+# Why alpha config: injecting an OIDC claim as a request header (tenant ->
+# X-Tenant-Id, #13) is only possible via alpha config, and enabling it moves
+# the upstream, header and provider settings out of legacy flags (which become
+# forbidden). Cookie/proxy options stay as flags on the Deployment.
+#
+# Tenant plumbing: oauth2-proxy can only inject SESSION-backed claims (user,
+# email, groups, tokens) — not arbitrary token claims. So the Keycloak `tenant`
+# claim (see docs/keycloak-sso.md §2b) is mapped into the session's groups slot
+# via oidcConfig.groupsClaim, and injected from there as X-Tenant-Id. That is
+# also why the provider is generic `oidc`, not `keycloak-oidc`: the keycloak
+# provider appends realm/client roles ("role:...") to the session groups, which
+# would corrupt the header. Users must be in exactly one tenant group.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oauth2-proxy-cfactory-alpha
+  namespace: factory
+  labels:
+    app: oauth2-proxy-cfactory
+    app.kubernetes.io/instance: cfactory-auth
+data:
+  oauth2-proxy.yaml: |
+    server:
+      bindAddress: "0.0.0.0:4180"
+    upstreamConfig:
+      upstreams:
+        - id: cfactory-frontend
+          path: /
+          uri: http://cfactory-frontend.factory.svc.cluster.local:80
+    injectRequestHeaders:
+      # tenant claim -> CFactory's tenant seam (CFACTORY_MULTI_TENANT/#23).
+      # Session groups == the token's `tenant` claim (groupsClaim below).
+      - name: X-Tenant-Id
+        values:
+          - claim: groups
+      # equivalents of the former --pass-authorization-header/--pass-access-token
+      - name: Authorization
+        values:
+          - claim: id_token
+            prefix: "Bearer "
+      - name: X-Forwarded-Access-Token
+        values:
+          - claim: access_token
+    # equivalents of the former --set-xauthrequest (response side)
+    injectResponseHeaders:
+      - name: X-Auth-Request-User
+        values:
+          - claim: user
+      - name: X-Auth-Request-Email
+        values:
+          - claim: email
+      - name: X-Auth-Request-Preferred-Username
+        values:
+          - claim: preferred_username
+      - name: X-Auth-Request-Groups
+        values:
+          - claim: groups
+    providers:
+      - id: keycloak-factory
+        provider: oidc
+        clientID: cfactory
+        clientSecretFile: /etc/oauth2-proxy/secrets/client-secret
+        oidcConfig:
+          issuerURL: https://keycloak.freundcloud.org.uk/realms/factory
+          audienceClaims: [aud]
+          # editor OIDC layer: accept factory-vscode JWT bearers (was --oidc-extra-audience)
+          extraAudiences: [factory-vscode]
+          emailClaim: email
+          userIDClaim: email
+          # session groups <- the Keycloak `tenant` claim (see header note above)
+          groupsClaim: tenant

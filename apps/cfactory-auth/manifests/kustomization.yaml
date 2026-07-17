@@ -3,3 +3,4 @@ kind: Kustomization
 namespace: factory
 resources:
   - manifests.yaml
+  - alpha-config.yaml

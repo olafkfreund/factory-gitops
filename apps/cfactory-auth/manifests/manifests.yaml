@@ -38,43 +38,38 @@ spec:
         - name: oauth2-proxy
           image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0
           args:
-            - --provider=keycloak-oidc
-            - --oidc-issuer-url=https://keycloak.freundcloud.org.uk/realms/factory
+            # Provider, upstream and header injection live in the alpha config
+            # (see alpha-config.yaml) — required for the tenant claim ->
+            # X-Tenant-Id header (#13). That includes the editor OIDC layer:
+            # --skip-jwt-bearer-tokens accepts a valid Keycloak JWT bearer (from
+            # the factory-vscode public client, which carries `cfactory` in its
+            # audience via a Keycloak audience mapper) instead of forcing an
+            # interactive browser login; the extra audience itself is
+            # oidcConfig.extraAudiences in the alpha config.
+            - --alpha-config=/etc/oauth2-proxy/config/oauth2-proxy.yaml
             - --redirect-url=https://cfactory.freundcloud.org.uk/oauth2/callback
-            - --upstream=http://cfactory-frontend.factory.svc.cluster.local:80
-            - --http-address=0.0.0.0:4180
             - --reverse-proxy=true
             - --email-domain=*
             - --cookie-secure=true
             - --cookie-samesite=lax
-            - --pass-access-token=true
-            - --pass-authorization-header=true
-            - --set-xauthrequest=true
             - --skip-provider-button=true
             - --whitelist-domain=cfactory.freundcloud.org.uk
-            # Editor OIDC layer: accept a valid Keycloak JWT bearer (from the
-            # factory-vscode public client) instead of forcing an interactive
-            # browser login, so the editor connects via SSO with no API key. The
-            # JWT must carry `cfactory` in its audience (a Keycloak audience mapper
-            # on the factory-vscode client adds it). Browser login is unaffected.
             - --skip-jwt-bearer-tokens=true
-            - --oidc-extra-audience=factory-vscode
           env:
-            - name: OAUTH2_PROXY_CLIENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: oauth2-proxy-cfactory
-                  key: client-id
-            - name: OAUTH2_PROXY_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: oauth2-proxy-cfactory
-                  key: client-secret
             - name: OAUTH2_PROXY_COOKIE_SECRET
               valueFrom:
                 secretKeyRef:
                   name: oauth2-proxy-cfactory
                   key: cookie-secret
+          volumeMounts:
+            - name: alpha-config
+              mountPath: /etc/oauth2-proxy/config
+              readOnly: true
+            # client-secret consumed as a file (alpha config clientSecretFile);
+            # same out-of-band `oauth2-proxy-cfactory` Secret as before.
+            - name: oidc-secrets
+              mountPath: /etc/oauth2-proxy/secrets
+              readOnly: true
           ports:
             - name: http
               containerPort: 4180
@@ -97,6 +92,16 @@ spec:
             limits:
               cpu: 200m
               memory: 128Mi
+      volumes:
+        - name: alpha-config
+          configMap:
+            name: oauth2-proxy-cfactory-alpha
+        - name: oidc-secrets
+          secret:
+            secretName: oauth2-proxy-cfactory
+            items:
+              - key: client-secret
+                path: client-secret
 ---
 apiVersion: v1
 kind: Service
