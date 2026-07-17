@@ -251,8 +251,11 @@ spec:
             # PVC). Start with the demo target only — it is disposable and is the
             # same repo the recorded poller demo ran against. Add fleet repos here
             # once the chain is proven end-to-end on it.
+            # olafkfreund/TFactory added 2026-07-17: first fleet repo dogfooding
+            # the factory on its own code (project registered with branch=dev so
+            # builds base off the integration branch).
             - name: AIFACTORY_INTAKE_REPOS
-              value: '[{"provider":"github","repo":"olafkfreund/aifactory-demo","project_id":"5d78d4b9-35f9-4445-92c1-78f3ff60a494"}]'
+              value: '[{"provider":"github","repo":"olafkfreund/aifactory-demo","project_id":"5d78d4b9-35f9-4445-92c1-78f3ff60a494"},{"provider":"github","repo":"olafkfreund/TFactory","project_id":"de08a1a1-d9ba-4ff0-a1f6-80db8be476a1"}]'
             # RFC-0016 #671 / RFC-0017: run.py-as-a-k8s-Job build backend.
             # FLIP #1 (2026-06-21) REVERTED: StartError — the build Job ran on the
             # thin AIFACTORY_SANDBOX_IMAGE (no bash/python). FIXED in #685.
