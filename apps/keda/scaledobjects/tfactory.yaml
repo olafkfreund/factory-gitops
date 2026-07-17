@@ -23,10 +23,16 @@ spec:
   triggers:
     - type: postgresql
       metadata:
+        # Connection (PFactory #265) — FQDN, resolved from the `keda` namespace.
+        host: postgres.factory.svc.cluster.local
+        port: "5432"
+        userName: factory
+        dbName: tfactory
+        sslmode: disable
         targetQueryValue: "2"
         activationTargetQueryValue: "0"
         query: >-
           SELECT count(*) FROM job_states
           WHERE service = 'tfactory' AND lifecycle_state = 'queued'
       authenticationRef:
-        name: factory-postgres-tfactory
+        name: factory-postgres

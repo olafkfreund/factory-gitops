@@ -30,9 +30,17 @@ prerequisites below are real on the cluster.
    PFactory #217, AIFactory #668, TFactory #465. Until merged + deployed, the
    table has no `queued` rows to scale on.
 3. **`DATABASE_URL` set on the service pods** (the in-memory/SQLite path is the
-   single-pod fallback) **and** a `factory-db` Secret with key `DATABASE_URL`
-   exists in the `factory` namespace for the `factory-postgres`
-   TriggerAuthentication to reuse.
+   single-pod fallback) **and** the `factory-secrets` Secret has a
+   `POSTGRES_PASSWORD` key in the `factory` namespace, which the shared
+   `factory-postgres` TriggerAuthentication reads.
+
+   The scaler needs NO per-service Secret: host/port/userName/dbName/sslmode are
+   plain trigger metadata in each ScaledObject, and the password comes from
+   `factory-secrets`. This is deliberate (PFactory #265) — the scaler used to
+   need a libpq `connection` key in an out-of-band `factory-db-<svc>` Secret,
+   and a cluster rebuild recreated those Secrets with only `DATABASE_URL` (the
+   key this README used to name), which made KEDA fail every scaler with
+   "no host given" and silently pinned all three services to 1 replica.
 
 When 1-3 are true, enable autoscaling:
 
@@ -60,9 +68,11 @@ cold-start disruption to the always-on APIs.
 
 - Deploy Postgres + create `job_states` (Phase 1 platform work).
 - Merge + deploy the per-service Postgres externalization (#217 / #668 / #465).
-- Set `DATABASE_URL` + create the `factory-db` Secret.
+- Set `DATABASE_URL` on the pods (the scaler itself needs only
+  `factory-secrets/POSTGRES_PASSWORD`; see the prerequisite chain above).
 - For AIFactory >1: move rmux WS fan-out onto a shared bus (Redis pub/sub), then
   raise its `maxReplicaCount`.
-- Remove the `replicas: 1` pin from the pfactory/tfactory Deployments so the HPA
-  KEDA creates can own the replica count (KEDA respects min on first reconcile,
-  but a hard pin in gitops + selfHeal will fight the HPA).
+- ~~Remove the `replicas: 1` pin from the pfactory/tfactory Deployments~~ DONE —
+  no Deployment pins `replicas:` any more, so the HPA KEDA creates owns the
+  replica count. Keep it that way: a hard pin in gitops + selfHeal fights the
+  HPA and silently caps concurrency.
