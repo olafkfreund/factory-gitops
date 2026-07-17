@@ -188,7 +188,7 @@ spec:
             # without it the watcher degrades to pending→timeout→human-stop.
             # See guides/pr-endgame.md. Verified live 2026-06-10 (PR #10 on
             # aifactory-test). Left OFF after the test — flip to "true" to opt in.
-            - { name: AIFACTORY_AUTO_PR, value: "false" }
+            - { name: AIFACTORY_AUTO_PR, value: "true" }
             # RFC-0005/0006 in-cluster verification gate (#594). Trailing build
             # gates run as ephemeral k8s Jobs co-mounting the task worktree.
             # RFC-0016 #674: nixjob is now the DEFAULT build/gate execution path.
