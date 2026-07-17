@@ -1,0 +1,36 @@
+# Credential broker — keeps the fleet's shared Claude OAuth credential fresh
+# (Factory#292).
+#
+# The fleet (aifactory/tfactory/pfactory) seeds ~/.claude/.credentials.json from
+# the factory-cli-creds Secret. Anthropic ROTATES the refresh token on every
+# refresh, so when several services each refresh the same seeded credential only
+# the first one stays valid — everyone else gets
+# "OAuth session expired and could not be refreshed" (the #666 tail).
+#
+# This broker makes the Secret the single refresher: a CronJob refreshes the
+# credential every 4h (access TTL is 8h) and patches the Secret in place, so the
+# access token services seed is always valid and they never need to refresh —
+# no rotation race. Each refresh also rolls the refresh token forward, well
+# inside its ~30d TTL, so no human re-login is needed while the broker runs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cred-broker
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/cred-broker/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

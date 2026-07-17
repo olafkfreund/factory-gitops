@@ -1,0 +1,207 @@
+# Credential broker (Factory#292) — RBAC + refresh script + CronJob.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cred-broker
+  namespace: factory
+---
+# Least privilege: read/patch ONLY the one Secret this broker owns.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cred-broker
+  namespace: factory
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["factory-cli-creds"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cred-broker
+  namespace: factory
+subjects:
+  - kind: ServiceAccount
+    name: cred-broker
+    namespace: factory
+roleRef:
+  kind: Role
+  name: cred-broker
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cred-broker-script
+  namespace: factory
+data:
+  refresh.py: |
+    #!/usr/bin/env python3
+    """Refresh the fleet's shared Claude OAuth credential in place (Factory#292).
+
+    Reads the claude-credentials.json key of the factory-cli-creds Secret via the
+    kubernetes API, performs the OAuth refresh_token grant, and patches the Secret
+    with the new access + rotated refresh token. Other keys (codex/copilot/gemini)
+    are untouched: the patch is a strategic merge on that one key.
+
+    Stdlib only. Never prints a token value. Exits non-zero on any failure so a
+    broken broker is visible as CronJob failures rather than silently letting the
+    credential lapse.
+    """
+
+    import base64
+    import json
+    import ssl
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    # Verified live: console.anthropic.com 404s these paths; api.anthropic.com is
+    # the OAuth token endpoint. Cloudflare 1010-blocks a default urllib UA, so a
+    # real client UA is required.
+    TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+    CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    UA = "claude-cli/1.0.0 (external, cli)"
+
+    NS = "factory"
+    SECRET = "factory-cli-creds"
+    KEY = "claude-credentials.json"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def k8s(method, path, body=None, content_type="application/json"):
+        with open(f"{SA}/token") as f:
+            token = f.read().strip()
+        url = f"https://kubernetes.default.svc{path}"
+        headers = {"authorization": f"Bearer {token}", "accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["content-type"] = content_type
+            data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            return json.load(r)
+
+
+    def main() -> int:
+        # 1. Read the current credential out of the Secret.
+        sec = k8s("GET", f"/api/v1/namespaces/{NS}/secrets/{SECRET}")
+        raw = json.loads(base64.b64decode(sec["data"][KEY]).decode())
+        oauth = raw.get("claudeAiOauth", raw)
+        rt = oauth.get("refreshToken")
+        if not rt:
+            eprint("FATAL: no refreshToken in the Secret — needs a human re-seed")
+            return 2
+
+        # 2. Refresh (rotates both tokens).
+        body = json.dumps(
+            {"grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID}
+        ).encode()
+        req = urllib.request.Request(
+            TOKEN_URL,
+            data=body,
+            headers={
+                "content-type": "application/json",
+                "accept": "application/json",
+                "user-agent": UA,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                tok = json.load(resp)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            eprint(f"FATAL: refresh HTTP {e.code}: {detail}")
+            if e.code == 400 and "invalid_grant" in detail:
+                eprint(
+                    "the refresh token was consumed elsewhere or expired — a human "
+                    "must re-seed the Secret from a fresh `claude auth login`"
+                )
+            return 3
+
+        at = tok.get("access_token")
+        expires_in = tok.get("expires_in")
+        if not at or expires_in is None:
+            eprint(f"FATAL: unexpected refresh response keys: {sorted(tok)}")
+            return 4
+
+        oauth["accessToken"] = at
+        oauth["refreshToken"] = tok.get("refresh_token", rt)
+        oauth["expiresAt"] = int(time.time() * 1000) + int(expires_in) * 1000
+        raw["claudeAiOauth"] = oauth
+
+        # 3. Patch just this key back (merge patch leaves sibling keys alone).
+        payload = base64.b64encode(json.dumps(raw).encode()).decode()
+        k8s(
+            "PATCH",
+            f"/api/v1/namespaces/{NS}/secrets/{SECRET}",
+            {"data": {KEY: payload}},
+            content_type="application/merge-patch+json",
+        )
+        eprint(f"OK: credential refreshed, access TTL {int(expires_in) / 3600:.1f}h")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cred-broker
+  namespace: factory
+spec:
+  # Access TTL is 8h; refresh every 4h so the token services seed is never
+  # close to expiry and one missed run is harmless.
+  schedule: "0 */4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: cred-broker
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: refresh
+              # Stock python; the script is stdlib-only so no custom image.
+              image: python:3.12-slim
+              command: ["python3", "/script/refresh.py"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: cred-broker-script
