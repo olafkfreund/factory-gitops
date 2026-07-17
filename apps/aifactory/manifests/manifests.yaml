@@ -430,7 +430,7 @@ spec:
             # short-SHA here (sha-205d6f19-nix) 404s — the pushed tag is 7-char.
             # Corrected to the actual published tag. Validated live: pulls + runs
             # nix 2.30.1 (121 /nix/store entries) on a 2nd k3d node, no nix PVC.
-            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-a9d93ed-nix" }
+            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-b1e812f-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
