@@ -189,6 +189,14 @@ spec:
             # See guides/pr-endgame.md. Verified live 2026-06-10 (PR #10 on
             # aifactory-test). Left OFF after the test — flip to "true" to opt in.
             - { name: AIFACTORY_AUTO_PR, value: "true" }
+            # RFC-0014 runtime allowlist (AIFactory #790). "claude" is always-on;
+            # naming "copilot" here makes provider=copilot tasks runnable on the
+            # coder pods. The Copilot CLI is already baked into the coder image
+            # (@github/copilot). PREREQUISITE, DO NOT MERGE UNTIL DONE: a GitHub
+            # Copilot subscription credential must exist as a pod secret first —
+            # without it, copilot-routed tasks fail at exec with "CLI not found /
+            # not signed in". Order: provision credential, then merge this.
+            - { name: AIFACTORY_RUNTIMES, value: "claude,copilot" }
             # RFC-0005/0006 in-cluster verification gate (#594). Trailing build
             # gates run as ephemeral k8s Jobs co-mounting the task worktree.
             # RFC-0016 #674: nixjob is now the DEFAULT build/gate execution path.
