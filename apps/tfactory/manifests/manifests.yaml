@@ -204,6 +204,10 @@ spec:
             # Default is dry-run; this flag makes the write live. (git_writer
             # resolves the handoff's source_branch as of TFactory#716.)
             - { name: TFACTORY_TRIAGER_GIT_WRITE, value: "1" }
+            # Post the triage report as a PR comment (#964). AIFactory attaches
+            # the PR number after it opens (POST /api/specs/{p}/{s}/pr); the
+            # triager then comments the verdict. Default is dry-run.
+            - { name: TFACTORY_TRIAGER_PR_COMMENT, value: "1" }
             # VAL-3 disposable-target provisioner (TFactory#607, Factory#257):
             # verify runs whose val block requires a disposable target get a
             # real throwaway k8s Job. Lazily registered at the
