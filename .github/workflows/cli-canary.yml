@@ -1,0 +1,69 @@
+name: cli-canary
+
+# Gate on the agent CLIs (#298). The pods reinstall these CLIs on every start, so
+# a broken or yanked upstream release would reach the whole fleet untested. This
+# runs on any change to the pinned versions (Renovate's weekly bump PR, or a hand
+# edit) and fails if a pinned version cannot install or launch — a bad bump can
+# never merge.
+#
+# This is the install + launch smoke gate. The heavier PARR --full canary (drive
+# one real task per runtime end-to-end against staging) is the intended follow-up
+# once staging cluster credentials are wired as repo secrets; see #298.
+
+on:
+  pull_request:
+    paths:
+      - 'apps/aifactory/manifests/manifests.yaml'
+      - 'apps/pfactory/manifests/manifests.yaml'
+      - 'apps/tfactory/manifests/manifests.yaml'
+      - '.github/workflows/cli-canary.yml'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: install + launch the pinned agent CLIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Extract the pinned CLI versions from the manifests
+        id: pins
+        run: |
+          set -euo pipefail
+          # The three manifests must agree on the versions; take aifactory as the
+          # source and assert the others match.
+          line() { grep -oE '@(anthropic-ai/claude-code|openai/codex|google/gemini-cli)@[0-9]+\.[0-9]+\.[0-9]+' "$1" | sort -u; }
+          a=$(line apps/aifactory/manifests/manifests.yaml)
+          p=$(line apps/pfactory/manifests/manifests.yaml)
+          t=$(line apps/tfactory/manifests/manifests.yaml)
+          if [ "$a" != "$p" ] || [ "$a" != "$t" ]; then
+            echo "::error::pinned CLI versions differ across the three manifests"
+            printf 'aifactory:\n%s\npfactory:\n%s\ntfactory:\n%s\n' "$a" "$p" "$t"
+            exit 1
+          fi
+          echo "pins<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$a" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "Pinned CLIs:"; echo "$a"
+      - name: Install the exact pinned versions (fails on a yanked/broken pin)
+        run: |
+          set -euo pipefail
+          export npm_config_prefix="$RUNNER_TEMP/clis"
+          # Install exactly what the pods install, in the same layout.
+          npm install -g $(echo "${{ steps.pins.outputs.pins }}" | tr '\n' ' ')
+          ln -sf "$npm_config_prefix/bin/gemini" "$npm_config_prefix/bin/antigravity"
+          echo "$npm_config_prefix/bin" >> "$GITHUB_PATH"
+      - name: Launch smoke — each CLI must start and report a version
+        run: |
+          set -euo pipefail
+          fail=0
+          for bin in claude codex gemini antigravity; do
+            if v=$("$bin" --version 2>&1); then
+              echo "OK  $bin -> $v"
+            else
+              echo "::error::$bin failed to launch: $v"; fail=1
+            fi
+          done
+          exit $fail
