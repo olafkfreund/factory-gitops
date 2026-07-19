@@ -79,7 +79,7 @@ spec:
       enableServiceLinks: false
       securityContext: { fsGroup: 65532 }
       initContainers:
-        # Always-fresh provider CLIs (upgraded on every pod start) into a shared volume.
+        # Pinned provider CLIs (Renovate-tracked; bumped via PR + canary, #298) into a shared volume.
         - name: install-clis
           image: node:22-bookworm-slim
           command: ["sh","-c"]
@@ -87,7 +87,7 @@ spec:
             - |
               set -e
               export npm_config_prefix=/clis
-              npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli
+              npm install -g @anthropic-ai/claude-code@2.1.215 @openai/codex@0.144.6 @google/gemini-cli@0.51.0
               ln -sf /clis/bin/gemini /clis/bin/antigravity   # antigravity CLI == gemini-cli, invoked as `antigravity`
               echo "installed:"; ls -la /clis/bin
           volumeMounts:
