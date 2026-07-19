@@ -198,6 +198,12 @@ spec:
             - { name: TFACTORY_AUTO_GENERATE, value: "true" }
             - { name: TFACTORY_AUTO_EVALUATE, value: "true" }
             - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
+            # Surface the VAL verdict on the PR (#964): commit the triager's
+            # accepted+flagged tests back onto the AIFactory feature branch so
+            # a green verify visibly adds its verified tests to the open PR.
+            # Default is dry-run; this flag makes the write live. (git_writer
+            # resolves the handoff's source_branch as of TFactory#716.)
+            - { name: TFACTORY_TRIAGER_GIT_WRITE, value: "1" }
             # VAL-3 disposable-target provisioner (TFactory#607, Factory#257):
             # verify runs whose val block requires a disposable target get a
             # real throwaway k8s Job. Lazily registered at the
