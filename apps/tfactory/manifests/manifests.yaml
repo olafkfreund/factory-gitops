@@ -164,6 +164,12 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3103" }
+            # Liveness sweep (#95): flip a silent in-process stage (planning /
+            # generating / evaluating) to `stalled` after the deadline, so a hung
+            # gen_functional/evaluator LLM session (updated_at frozen) does not
+            # strand the spec as "running" forever. Was OFF by default; a live gcd
+            # spec hung 23min in gen_functional with no safety net (2026-07-22).
+            - { name: APP_LIVENESS_SWEEP_ENABLED, value: "true" }
             # RFC-0016 #220/#468: durable shared state in Postgres (tfactory DB).
             # Replaces pod-local SQLite (~/.tfactory/data.db); init_db() runs
             # `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY default true),
