@@ -251,7 +251,7 @@ spec:
             # 12-Jobs-per-module path let a transient dispatch error flip stability
             # to ERROR, downgrading accept->flag). Keep in lockstep with newTag on
             # every CD bump.
-            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-4898b72" }
+            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-62e3030" }
             # RFC-0016 #466 / RFC-0017: Job-native verify orchestration.
             # FLIP #1 (2026-06-21) REVERTED — verify_dispatch was present but NOT
             # WIRED (nothing called verify_exec_mode), so the flip was inert.
