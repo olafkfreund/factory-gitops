@@ -231,7 +231,7 @@ spec:
             # public ingress, so intake does not depend on Cloudflare/oauth2-proxy
             # being in the path. GITHUB_TOKEN (factory-secrets) is the fetch/label
             # credential.
-            - { name: AIFACTORY_INTAKE_POLLER, value: "true" }
+            - { name: AIFACTORY_INTAKE_POLLER, value: "false" }
             - { name: AIFACTORY_INTAKE_INTERVAL_S, value: "30" }
             - { name: AIFACTORY_URL, value: "http://localhost:3101" }
             # The poller calls its OWN /api/tasks/from-issue and authenticates
