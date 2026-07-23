@@ -134,33 +134,11 @@ spec:
       enableServiceLinks: false
       securityContext: { fsGroup: 65532 }
       initContainers:
-        # Pinned provider CLIs (Renovate-tracked; bumped via PR + canary, #298) into a shared volume.
-        - name: install-clis
-          image: node:22-bookworm-slim
-          command: ["sh","-c"]
-          args:
-            - |
-              set -e
-              export npm_config_prefix=/clis
-              # #791: bound the fetch. A slow/hung npm registry left this init
-              # RUNNING for 8+ min and stalled the whole rollout (stranding
-              # in-flight specs). Cap each attempt at 180s and retry so a
-              # transient hiccup recovers instead of hanging forever; npm's own
-              # fetch-retry handles per-request flakiness within an attempt.
-              export npm_config_fetch_retries=5
-              export npm_config_fetch_timeout=60000
-              export npm_config_fetch_retry_maxtimeout=120000
-              for attempt in 1 2 3; do
-                if timeout 180 npm install -g @anthropic-ai/claude-code@2.1.215 @openai/codex@0.144.6 @google/gemini-cli@0.51.0; then
-                  break
-                fi
-                echo "install-clis: npm attempt $attempt failed/timed out"
-                [ "$attempt" = 3 ] && { echo "install-clis: giving up after 3 attempts"; exit 1; }
-              done
-              ln -sf /clis/bin/gemini /clis/bin/antigravity   # antigravity CLI == gemini-cli, invoked as `antigravity`
-              echo "installed:"; ls -la /clis/bin
-          volumeMounts:
-            - { name: clis, mountPath: /clis }
+        # The provider CLIs (claude-code/codex/gemini + antigravity) are now BAKED
+        # into the image at /home/nonroot/.npm-global (TFactory #791) — the
+        # install-clis init container that npm-installed them at boot hung 8+ min
+        # on a slow registry and stalled the whole rollout. Versions are pinned +
+        # Renovate-tracked in the Dockerfile; a bump is an image rebuild + canary.
         # Seed per-CLI OAuth credential files into writable dirs (so the CLIs can refresh tokens).
         - name: seed-creds
           image: busybox:1.36
@@ -257,7 +235,7 @@ spec:
             # bwrap can't run on k3d (node is a container) — disable the bash sandbox
             # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
-            - { name: PATH, value: "/clis/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            - { name: PATH, value: "/home/nonroot/.npm-global/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             # The web-server process must import the backend's `agents` package
             # (create_spec_ingest_workspace schedules agents.planner on ingest).
             # Without apps/backend on the path the import fails silently and the
@@ -473,7 +451,6 @@ spec:
             - { name: CLAUDE_CODE_OAUTH_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: CLAUDE_CODE_OAUTH_TOKEN } } }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.tfactory }
-            - { name: clis,      mountPath: /clis }
             - { name: cc-claude, mountPath: /home/nonroot/.claude }
             - { name: cc-codex,  mountPath: /home/nonroot/.codex }
             - { name: cc-gemini, mountPath: /home/nonroot/.gemini }
@@ -483,7 +460,6 @@ spec:
           resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
       volumes:
         - { name: data,      persistentVolumeClaim: { claimName: tfactory-data-rwx } }
-        - { name: clis,      emptyDir: {} }
         - { name: cc-claude, emptyDir: {} }
         - { name: cc-codex,  emptyDir: {} }
         - { name: cc-gemini, emptyDir: {} }
