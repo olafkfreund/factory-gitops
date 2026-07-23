@@ -60,7 +60,21 @@ spec:
             - |
               set -e
               export npm_config_prefix=/clis
-              npm install -g @anthropic-ai/claude-code@2.1.215 @openai/codex@0.144.6 @google/gemini-cli@0.51.0
+              # #791: bound the fetch. A slow/hung npm registry left this init
+              # RUNNING for 8+ min and stalled the whole rollout (stranding
+              # in-flight specs). Cap each attempt at 180s and retry so a
+              # transient hiccup recovers instead of hanging forever; npm's own
+              # fetch-retry handles per-request flakiness within an attempt.
+              export npm_config_fetch_retries=5
+              export npm_config_fetch_timeout=60000
+              export npm_config_fetch_retry_maxtimeout=120000
+              for attempt in 1 2 3; do
+                if timeout 180 npm install -g @anthropic-ai/claude-code@2.1.215 @openai/codex@0.144.6 @google/gemini-cli@0.51.0; then
+                  break
+                fi
+                echo "install-clis: npm attempt $attempt failed/timed out"
+                [ "$attempt" = 3 ] && { echo "install-clis: giving up after 3 attempts"; exit 1; }
+              done
               ln -sf /clis/bin/gemini /clis/bin/antigravity   # antigravity CLI == gemini-cli, invoked as `antigravity`
               echo "installed:"; ls -la /clis/bin
           volumeMounts:
