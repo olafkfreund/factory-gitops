@@ -67,6 +67,46 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: tfactory-sandb
 subjects:
   - { kind: ServiceAccount, name: tfactory-sandbox, namespace: factory }
 ---
+# Deploy-lane dry-run SA (#603 gap 2) — the SERVICE ACCOUNT the deploy verify Job
+# runs as for `kubectl apply --dry-run=server` (VAL-2). Namespaced Role: get/list
+# + create on the common app kinds in `factory` (create authorizes dryRun=All; a
+# real apply is still blocked by deploy_runner.assert_dry_run). Scoped to
+# namespaced resources — cluster-scoped kinds stay an honest not_run. Named to
+# the control plane via TFACTORY_DEPLOY_DRYRUN_SA (below).
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: tfactory-deploy-dryrun, namespace: factory, labels: { app: tfactory } }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: tfactory-deploy-dryrun, namespace: factory, labels: { app: tfactory } }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: tfactory-deploy-dryrun, namespace: factory, labels: { app: tfactory } }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: tfactory-deploy-dryrun }
+subjects:
+  - { kind: ServiceAccount, name: tfactory-deploy-dryrun, namespace: factory }
+---
 apiVersion: v1
 kind: Service
 metadata: { name: tfactory, namespace: factory, labels: { app: tfactory } }
@@ -268,6 +308,10 @@ spec:
             # propagates it; that half-applied shape is how AIFactory#840 broke its
             # gate lane). Do not reintroduce the PVC without RWX storage.
             - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data-rwx" }
+            # #603 gap 2: names the SA the deploy Job runs as for kubectl
+            # --dry-run=server (VAL-2). Set => the kubectl rung runs; unset =>
+            # honest not_run. RBAC = the tfactory-deploy-dryrun SA/Role above.
+            - { name: TFACTORY_DEPLOY_DRYRUN_SA, value: "tfactory-deploy-dryrun" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: TFACTORY_NIX_IN_IMAGE, value: "true" }
             # TFACTORY_IMAGE pins the TFactory backend image the verify Job runs
