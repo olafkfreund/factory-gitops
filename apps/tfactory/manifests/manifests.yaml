@@ -1,3 +1,6 @@
+# Legacy RWO data PVC — kept for rollback only; the live data volume is now
+# tfactory-data-rwx (below). local-path RWO pinned this to one node, so a roll
+# onto the other node couldn't mount it and workspace specs were lost (#781).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: { name: tfactory-data, namespace: factory, labels: { app: tfactory } }
@@ -5,6 +8,18 @@ spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: local-path
   resources: { requests: { storage: 5Gi } }
+---
+# Live workspace data on RWX NFS (#781) — any node's control-plane pod OR verify
+# Job can mount it, so a cross-node roll no longer strands specs. Migrated from
+# tfactory-data 2026-07-23 (spec state copied; git clones re-materialize via the
+# #539 self-heal). Provisioned by apps/nfs-provisioner.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tfactory-data-rwx, namespace: factory, labels: { app: tfactory } }
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: nfs
+  resources: { requests: { storage: 20Gi } }
 ---
 # The warm /nix/store PVC (RFC-0016 #197) is GONE — removed with its GC CronJob
 # and TFACTORY_NIX_STORE_PVC env (TFactory#623/#665, mirrors AIFactory's
@@ -252,7 +267,7 @@ spec:
             # that does not travel reads False and re-mounts the PVC (verify_dispatch
             # propagates it; that half-applied shape is how AIFactory#840 broke its
             # gate lane). Do not reintroduce the PVC without RWX storage.
-            - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
+            - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data-rwx" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
             - { name: TFACTORY_NIX_IN_IMAGE, value: "true" }
             # TFACTORY_IMAGE pins the TFactory backend image the verify Job runs
@@ -423,7 +438,7 @@ spec:
           livenessProbe:  { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 30, periodSeconds: 20 }
           resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
       volumes:
-        - { name: data,      persistentVolumeClaim: { claimName: tfactory-data } }
+        - { name: data,      persistentVolumeClaim: { claimName: tfactory-data-rwx } }
         - { name: clis,      emptyDir: {} }
         - { name: cc-claude, emptyDir: {} }
         - { name: cc-codex,  emptyDir: {} }
