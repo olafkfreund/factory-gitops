@@ -1,0 +1,34 @@
+# NFS RWX provisioner (nfs-ganesha-server-and-external-provisioner) — #781.
+#
+# The cluster ships only local-path (RWO), which pins a PVC to the node its first
+# consumer landed on; a control-plane roll onto the OTHER node then can't mount
+# it, and in-flight workspace spec files are stranded/lost (#781, and the
+# cross-node delivery ceiling of #774). This app runs an in-pod ganesha NFS
+# server backed by a local-path PVC and hands out ReadWriteMany volumes via the
+# `nfs` storageClass, so any node's pod can mount the same volume.
+#
+# Proven cross-node 2026-07-23: two pods on k3d-agent-0-0 + k3d-factory-server-0
+# mounted one `nfs` PVC simultaneously and shared files. App-of-apps
+# auto-discovers this file (apps/**/application.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nfs-provisioner
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/nfs-provisioner/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

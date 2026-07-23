@@ -1,0 +1,150 @@
+# NFS RWX provisioner (nfs-ganesha-server-and-external-provisioner) — #781.
+# One Deployment runs an in-pod ganesha NFS server backed by a local-path PVC and
+# hands out ReadWriteMany volumes via the `nfs` storageClass, so any node's pod
+# can mount the shared workspaces volume (the cluster otherwise ships only
+# local-path RWO, which pins a PVC to one node).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: nfs-provisioner, namespace: factory, labels: { app: nfs-provisioner } }
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata: { name: nfs-provisioner-runner, labels: { app: nfs-provisioner } }
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get"]
+  - apiGroups: ["extensions"]
+    resources: ["podsecuritypolicies"]
+    resourceNames: ["nfs-provisioner"]
+    verbs: ["use"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata: { name: run-nfs-provisioner, labels: { app: nfs-provisioner } }
+subjects:
+  - kind: ServiceAccount
+    name: nfs-provisioner
+    namespace: factory
+roleRef:
+  kind: ClusterRole
+  name: nfs-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata: { name: leader-locking-nfs-provisioner, namespace: factory, labels: { app: nfs-provisioner } }
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata: { name: leader-locking-nfs-provisioner, namespace: factory, labels: { app: nfs-provisioner } }
+subjects:
+  - kind: ServiceAccount
+    name: nfs-provisioner
+    namespace: factory
+roleRef:
+  kind: Role
+  name: leader-locking-nfs-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+# Backing store for the in-pod NFS server (local-path, RWO — the ganesha pod owns
+# it and re-exports it as RWX). Sized for the workspaces it will hold.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: nfs-provisioner-backing, namespace: factory, labels: { app: nfs-provisioner } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 20Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-provisioner
+  namespace: factory
+  labels: { app: nfs-provisioner }
+spec:
+  selector: { app: nfs-provisioner }
+  ports:
+    - { name: nfs, port: 2049 }
+    - { name: nfs-udp, port: 2049, protocol: UDP }
+    - { name: nlockmgr, port: 32803 }
+    - { name: nlockmgr-udp, port: 32803, protocol: UDP }
+    - { name: mountd, port: 20048 }
+    - { name: mountd-udp, port: 20048, protocol: UDP }
+    - { name: rquotad, port: 875 }
+    - { name: rquotad-udp, port: 875, protocol: UDP }
+    - { name: rpcbind, port: 111 }
+    - { name: rpcbind-udp, port: 111, protocol: UDP }
+    - { name: statd, port: 662 }
+    - { name: statd-udp, port: 662, protocol: UDP }
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata: { name: nfs-provisioner, namespace: factory, labels: { app: nfs-provisioner } }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: nfs-provisioner } }
+  template:
+    metadata: { labels: { app: nfs-provisioner } }
+    spec:
+      serviceAccountName: nfs-provisioner
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: nfs-provisioner
+          image: registry.k8s.io/sig-storage/nfs-provisioner:v4.0.8
+          ports:
+            - { name: nfs, containerPort: 2049 }
+            - { name: nfs-udp, containerPort: 2049, protocol: UDP }
+            - { name: nlockmgr, containerPort: 32803 }
+            - { name: nlockmgr-udp, containerPort: 32803, protocol: UDP }
+            - { name: mountd, containerPort: 20048 }
+            - { name: mountd-udp, containerPort: 20048, protocol: UDP }
+            - { name: rquotad, containerPort: 875 }
+            - { name: rquotad-udp, containerPort: 875, protocol: UDP }
+            - { name: rpcbind, containerPort: 111 }
+            - { name: rpcbind-udp, containerPort: 111, protocol: UDP }
+            - { name: statd, containerPort: 662 }
+            - { name: statd-udp, containerPort: 662, protocol: UDP }
+          securityContext:
+            capabilities:
+              add: ["DAC_READ_SEARCH", "SYS_RESOURCE"]
+          args:
+            - "-provisioner=factory.io/nfs"
+          env:
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+            - { name: SERVICE_NAME, value: nfs-provisioner }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - { name: export-volume, mountPath: /export }
+      volumes:
+        - name: export-volume
+          persistentVolumeClaim: { claimName: nfs-provisioner-backing }
+---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata: { name: nfs, labels: { app: nfs-provisioner } }
+provisioner: factory.io/nfs
+mountOptions:
+  - vers=4.1
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
