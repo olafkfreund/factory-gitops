@@ -52,33 +52,11 @@ spec:
       enableServiceLinks: false
       securityContext: { fsGroup: 65532 }
       initContainers:
-        # Pinned provider CLIs (Renovate-tracked; bumped via PR + canary, #298) into a shared volume.
-        - name: install-clis
-          image: node:22-bookworm-slim
-          command: ["sh","-c"]
-          args:
-            - |
-              set -e
-              export npm_config_prefix=/clis
-              # #791: bound the fetch. A slow/hung npm registry left this init
-              # RUNNING for 8+ min and stalled the whole rollout (stranding
-              # in-flight specs). Cap each attempt at 180s and retry so a
-              # transient hiccup recovers instead of hanging forever; npm's own
-              # fetch-retry handles per-request flakiness within an attempt.
-              export npm_config_fetch_retries=5
-              export npm_config_fetch_timeout=60000
-              export npm_config_fetch_retry_maxtimeout=120000
-              for attempt in 1 2 3; do
-                if timeout 180 npm install -g @anthropic-ai/claude-code@2.1.215 @openai/codex@0.144.6 @google/gemini-cli@0.51.0; then
-                  break
-                fi
-                echo "install-clis: npm attempt $attempt failed/timed out"
-                [ "$attempt" = 3 ] && { echo "install-clis: giving up after 3 attempts"; exit 1; }
-              done
-              ln -sf /clis/bin/gemini /clis/bin/antigravity   # antigravity CLI == gemini-cli, invoked as `antigravity`
-              echo "installed:"; ls -la /clis/bin
-          volumeMounts:
-            - { name: clis, mountPath: /clis }
+        # #791: provider CLIs (claude-code, codex, gemini-cli + the `antigravity`
+        # alias, and copilot) are now BAKED into the image at
+        # /home/nonroot/.npm-global/bin (Dockerfile), so the old install-clis
+        # init container + its /clis emptyDir are gone — no per-pod npm fetch to
+        # stall the rollout. PATH above points at the baked bin dir.
         # Seed per-CLI OAuth credential files into writable dirs (so the CLIs can refresh tokens).
         - name: seed-creds
           image: busybox:1.36
@@ -163,7 +141,7 @@ spec:
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
-            - { name: PATH, value: "/clis/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            - { name: PATH, value: "/home/nonroot/.npm-global/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
             # Static API token for programmatic/MCP access (alongside OIDC SSO).
@@ -483,7 +461,6 @@ spec:
             - { name: OTEL_EXPORTER_OTLP_HEADERS, valueFrom: { secretKeyRef: { name: otel-otlp-auth, key: headers } } }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.aifactory }
-            - { name: clis,      mountPath: /clis }
             - { name: cc-claude, mountPath: /home/nonroot/.claude }
             - { name: cc-codex,  mountPath: /home/nonroot/.codex }
             - { name: cc-gemini, mountPath: /home/nonroot/.gemini }
@@ -493,7 +470,6 @@ spec:
           resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 12Gi } }
       volumes:
         - { name: data,      persistentVolumeClaim: { claimName: aifactory-data } }
-        - { name: clis,      emptyDir: {} }
         - { name: cc-claude, emptyDir: {} }
         - { name: cc-codex,  emptyDir: {} }
         - { name: cc-gemini, emptyDir: {} }
