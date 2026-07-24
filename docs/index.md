@@ -11,6 +11,8 @@ cluster itself lives in [olafkfreund/nixos_config](https://github.com/olafkfreun
 - **[Why not the operator](why-not-operator.md)** — design decision
 - **[Bootstrap flow](bootstrap-flow.md)** — what happens on first boot
 - **[Operating guide](operating.md)** — day-2 ops, rotation, reset
+- **[Encryption at rest](encryption-at-rest.md)** — MinIO SSE (shipped) + etcd/LUKS runbooks
+- **[Secrets management](secrets-management.md)** — inventory, rotation runbook, SOPS/ESO plan
 
 ## Cross-repo references
 

@@ -18,6 +18,26 @@
 # and the bucket-init Job both consume these; the consumer services mount the
 # SAME two keys plus a static S3_ENDPOINT/S3_BUCKET. Rotate by recreating the
 # secret and bouncing the minio Deployment + every consumer.
+#
+# ENCRYPTION AT REST (Factory#314 / #310 gap #3): MinIO is given a built-in
+# single-key KMS via MINIO_KMS_SECRET_KEY, and the bucket-init Job turns on
+# automatic SSE-S3 (`mc encrypt set sse-s3`) so every object PUT to the buckets
+# is encrypted at rest with a per-object data key wrapped by that master key.
+# This protects object CONTENT on the PVC; it does NOT encrypt the underlying
+# block device (see docs/encryption-at-rest.md for the node-level LUKS runbook).
+#
+# The KMS master key (the KEK) is a SEPARATE out-of-band Secret `minio-kms`, key
+# MINIO_KMS_SECRET_KEY, format `<key-name>:<base64 32-byte key>`. The operator
+# seeds it ONCE, before first sync (the minio pod and the Job both reference it):
+#
+#   kubectl -n factory create secret generic minio-kms \
+#     --from-literal=MINIO_KMS_SECRET_KEY="factory-kek-1:$(openssl rand -base64 32)"
+#
+# KEY CUSTODY: this KEK is the root of trust for all object encryption. Lose it
+# and every encrypted object is unrecoverable; leak it and encryption-at-rest is
+# void. Keep it in the SAME custody as minio-creds (agenix on p510 — see
+# docs/secrets-management.md), never in git. Rotating the KEK is NOT a drop-in
+# replace (existing objects are wrapped by the old key); see the runbook.
 ################################################################################
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -62,6 +82,12 @@ spec:
             # MinIO root creds == the shared S3 access/secret the services use.
             - { name: MINIO_ROOT_USER, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
             - { name: MINIO_ROOT_PASSWORD, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+            # Built-in single-key KMS (KEK) that wraps per-object data keys for
+            # SSE-S3. Format `<key-name>:<base64 32-byte key>`, seeded out-of-band
+            # in the `minio-kms` Secret (see header + docs/encryption-at-rest.md).
+            # Required before sync: without it the pod fails to start and the
+            # bucket-init `mc encrypt set sse-s3` step below has no KMS to target.
+            - { name: MINIO_KMS_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-kms, key: MINIO_KMS_SECRET_KEY } } }
           readinessProbe:
             httpGet: { path: /minio/health/ready, port: 9000 }
             initialDelaySeconds: 5
@@ -116,6 +142,19 @@ spec:
               # here so bucket lifecycle lives in one place; the backup CronJob also
               # `mc mb --ignore-existing` defensively.
               mc mb --ignore-existing fac/factory-backups
+              # Encryption at rest (Factory#314): auto-encrypt every new object
+              # with SSE-S3. MinIO generates a per-object data key, wraps it with
+              # the MINIO_KMS_SECRET_KEY KEK, and stores only the wrapped key +
+              # ciphertext on the PVC. NOT `|| true`: if the KMS key is missing
+              # this MUST fail loudly (unencrypted buckets are the bug we are
+              # fixing). Idempotent — re-running re-asserts the same policy.
+              # Applies only to objects PUT after this runs; pre-existing objects
+              # stay as-is (a fresh cluster/bucket has none, so first sync covers
+              # everything). See docs/encryption-at-rest.md.
+              mc encrypt set sse-s3 fac/factory-artifacts
+              mc encrypt set sse-s3 fac/factory-backups
+              mc encrypt info fac/factory-artifacts
+              mc encrypt info fac/factory-backups
               # Durability: object versioning so an overwrite or delete is
               # recoverable (a prior version survives). Floor for DR alongside the
               # off-cluster copy tracked in docs/restore.md (#321). Idempotent.
