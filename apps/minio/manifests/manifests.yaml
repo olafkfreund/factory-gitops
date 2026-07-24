@@ -118,6 +118,12 @@ spec:
               mc ilm rule add --expire-days 30 --prefix "pfactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
               mc ilm rule add --expire-days 30 --prefix "aifactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
               mc ilm rule add --expire-days 30 --prefix "tfactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
+              # Evidence (role=evidence) retained 90d — must outlive any VAL claim
+              # that references it and the tamper-evident hash-chain built over it.
+              # Without these rules evidence had NO lifecycle guarantee (#313, #321).
+              mc ilm rule add --expire-days 90 --prefix "pfactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
+              mc ilm rule add --expire-days 90 --prefix "aifactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
+              mc ilm rule add --expire-days 90 --prefix "tfactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
               echo "bucket ready:"; mc ls fac/
           env:
             - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
