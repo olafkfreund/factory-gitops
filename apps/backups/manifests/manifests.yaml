@@ -1,0 +1,118 @@
+################################################################################
+# Postgres logical backups (Factory#321 / #310) — the fleet's FIRST backup job.
+#
+# Daily pg_dumpall of the shared Postgres (apps/postgres StatefulSet) -> gzip ->
+# a dedicated MinIO bucket `factory-backups` (created + versioned + lifecycled by
+# the apps/minio bucket-init Job). One plain-SQL cluster dump per day captures
+# every database (pfactory/tfactory/aifactory/cfactory + factory) AND global
+# roles, so a restore is a single `gunzip | psql` — see docs/restore.md.
+#
+# CREDENTIALS ARE OUT-OF-BAND, reused from the existing Secrets — nothing is
+# hardcoded here:
+#   - Postgres superuser password: factory-secrets/POSTGRES_PASSWORD (apps/postgres)
+#   - MinIO access/secret:         minio-creds/S3_ACCESS_KEY,S3_SECRET_KEY (apps/minio)
+#
+# Security model copied from the cred-broker CronJob (apps/cred-broker): runs
+# non-root, readOnlyRootFilesystem, all capabilities dropped, resource limits.
+# The dump is written to an in-memory/emptyDir scratch volume, never the rootfs.
+#
+# RESIDUAL DR GAP: MinIO lives on the SAME cluster (RWO local-path PVC, one node).
+# A backup that shares a failure domain with its source is not disaster recovery.
+# The off-cluster copy (mc mirror to an external S3 / restic to remote) is the
+# required next step — tracked in docs/restore.md "Off-cluster follow-up".
+#
+# Retention: enforced by the bucket lifecycle rule (keep ~14 dailies), NOT by a
+# prune step here (apps/minio/manifests.yaml: `mc ilm rule add --expire-days 14`).
+################################################################################
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: factory
+  labels: { app: postgres-backup }
+spec:
+  # 02:15 UTC daily — off the peak build window. RPO <= 24h (see docs/restore.md).
+  schedule: "15 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # Reap the Job (and its pod) an hour after it finishes.
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata: { labels: { app: postgres-backup } }
+        spec:
+          restartPolicy: OnFailure
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999          # postgres uid in postgres:16.4; mc runs as any uid
+            fsGroup: 999            # so the mc container can read the dump file
+            seccompProfile: { type: RuntimeDefault }
+          # Step 1 (initContainer, runs to completion first): dump -> gzip -> scratch.
+          initContainers:
+            - name: dump
+              image: postgres:16.4
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+                  out="/scratch/factory-cluster-${ts}.sql.gz"
+                  echo "pg_dumpall -> ${out}"
+                  # --clean so the dump can rebuild over an existing cluster on restore.
+                  # Password comes from PGPASSWORD (env, from the Secret) — never argv.
+                  pg_dumpall -h postgres -U factory --clean | gzip -9 > "${out}"
+                  ls -lh "${out}"
+                  echo "${out##*/}" > /scratch/latest.name
+              env:
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: POSTGRES_PASSWORD } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { cpu: 500m, memory: 512Mi }
+          # Step 2: upload the gzip to MinIO. Retention is the bucket lifecycle rule.
+          containers:
+            - name: upload
+              image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  export MC_CONFIG_DIR=/scratch/.mc
+                  name="$(cat /scratch/latest.name)"
+                  until mc alias set fac http://minio.factory.svc.cluster.local:9000 \
+                        "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1; do
+                    echo "waiting for minio..."; sleep 3
+                  done
+                  # Defensive: bucket is normally created by apps/minio bucket-init.
+                  mc mb --ignore-existing fac/factory-backups
+                  mc cp "/scratch/${name}" "fac/factory-backups/postgres/${name}"
+                  echo "uploaded: postgres/${name}"
+                  mc ls fac/factory-backups/postgres/ | tail -n 5
+              env:
+                - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+                - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { cpu: 200m, memory: 256Mi }
+          volumes:
+            # emptyDir: holds the gzip between the two steps + mc's config dir.
+            # Sized for a plausible dump; bump if the cluster grows past a few GB.
+            - name: scratch
+              emptyDir: { sizeLimit: 5Gi }
