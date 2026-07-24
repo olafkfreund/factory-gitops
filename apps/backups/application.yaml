@@ -1,0 +1,30 @@
+# Backups — daily Postgres logical backup CronJob to MinIO (Factory#321 / #310).
+#
+# The fleet's first backup/DR mechanism. pg_dumpall of the shared Postgres
+# (apps/postgres) -> gzip -> the versioned+lifecycled `factory-backups` MinIO
+# bucket (apps/minio). Restore procedure + RTO/RPO targets: docs/restore.md.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
+# the manifests/ kustomization into the `factory` namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: backups
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/backups/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

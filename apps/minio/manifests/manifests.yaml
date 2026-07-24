@@ -112,6 +112,19 @@ spec:
                 sleep 3
               done
               mc mb --ignore-existing fac/factory-artifacts
+              # Dedicated bucket for Postgres logical backups (apps/backups). Kept
+              # here so bucket lifecycle lives in one place; the backup CronJob also
+              # `mc mb --ignore-existing` defensively.
+              mc mb --ignore-existing fac/factory-backups
+              # Durability: object versioning so an overwrite or delete is
+              # recoverable (a prior version survives). Floor for DR alongside the
+              # off-cluster copy tracked in docs/restore.md (#321). Idempotent.
+              mc version enable fac/factory-artifacts 2>/dev/null || true
+              mc version enable fac/factory-backups 2>/dev/null || true
+              # Backup retention = ~14 dailies. Lifecycle enforces it (no prune
+              # step in the CronJob); noncurrent versions reaped a week later so
+              # versioning does not grow storage unbounded.
+              mc ilm rule add --expire-days 14 --noncurrentversion-expiration-days 7 fac/factory-backups 2>/dev/null || true
               # Lifecycle: expire logs after 30d, evidence after 90d (conventions §2).
               # evidence referenced by a VAL claim must outlive the claim, so 90d
               # is a floor, not an aggressive purge.
