@@ -1,0 +1,51 @@
+# The `factory` namespace, declared explicitly so its Pod Security Admission
+# (PSA) labels are a managed, reviewable resource rather than an implicit side
+# effect of the aifactory/tfactory/pfactory Applications' CreateNamespace=true.
+# Same rationale as apps/keda/manifests/namespace.yaml.
+#
+# WHY THIS MATTERS: the per-task sandbox Jobs (AIFactory/TFactory kube_sandbox
+# — Nix verify/build lanes, AIFactory#812/TFactory#651 shipped their per-Job
+# NetworkPolicy + non-root securityContext default-on) run in THIS namespace,
+# alongside the control plane. There is no separate task namespace, so a
+# dispatcher regression that drops the per-Job securityContext would today land
+# an unrestricted pod with nothing at the namespace level to catch it. PSA is
+# that namespace-level backstop.
+#
+# MODE: warn + audit at `baseline` ONLY. Deliberately NOT enforce:
+#   - enforce rejects violating pods at admission — a false step here would
+#     break running task Jobs AND control-plane pods that share this namespace.
+#   - warn surfaces violations to the client that creates the pod (kubectl /
+#     the dispatcher) and audit records them in the API-server audit log,
+#     WITHOUT blocking anything. This lets us observe the real violation set
+#     before committing to enforce.
+#
+# PATH TO ENFORCE (do NOT do these in this PR — each is its own reviewed change):
+#   1. (this PR) warn=baseline + audit=baseline. Observe warnings for ~1-2 weeks
+#      across real PARR runs; confirm control-plane and task Jobs are clean.
+#   2. Add enforce=baseline once the audit log is quiet. baseline still allows
+#      the writable rootfs and default seccomp the Nix lanes rely on.
+#   3. Raise warn=restricted + audit=restricted; observe the stricter delta
+#      (runAsNonRoot, seccompProfile=RuntimeDefault, no writable rootfs, dropped
+#      capabilities). Some verify lanes run as root today and Nix writes
+#      /nix/var + $HOME — those must be reconciled (see docs/egress-allowlist.md
+#      follow-ups) BEFORE enforce=restricted.
+#   4. Finally enforce=restricted, pinned to a specific version.
+#
+# Pin the level version so a cluster upgrade cannot silently tighten the policy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: factory
+  annotations:
+    # This namespace holds the entire platform. Never let an ArgoCD prune or an
+    # accidental Application delete cascade into deleting it (and everything in
+    # it). The PSA labels can still be updated in place; only deletion is blocked.
+    argocd.argoproj.io/sync-options: Delete=false
+  labels:
+    app.kubernetes.io/part-of: factory
+    # --- Pod Security Admission: WARN + AUDIT only (see header) ---
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/warn-version: v1.31
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/audit-version: v1.31
+    # enforce is intentionally ABSENT — do not add it in this PR.

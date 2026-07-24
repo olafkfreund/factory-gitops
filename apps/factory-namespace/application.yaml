@@ -1,0 +1,28 @@
+# factory-namespace — owns the `factory` namespace object and its Pod Security
+# Admission labels (currently warn+audit=baseline only; see manifests/namespace.yaml).
+#
+# The aifactory/tfactory/pfactory Applications still target namespace `factory`
+# with CreateNamespace=true; that only ensures the namespace EXISTS. This app is
+# the single owner of its labels/annotations, so the PSA policy lives in exactly
+# one place. selfHeal keeps the labels from being silently stripped; the
+# Delete=false annotation on the namespace prevents a prune from ever deleting it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: factory-namespace
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/factory-namespace/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
