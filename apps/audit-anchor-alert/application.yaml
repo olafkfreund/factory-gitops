@@ -1,0 +1,30 @@
+# Audit-anchor alert — the fleet's first real security alert (Factory#313, #319).
+#
+# There is zero security alerting in the fleet and no Prometheus/Alertmanager to
+# hang a rule on (OpenObserve is the only telemetry backend). The single
+# highest-value, most tractable signal is CFactory's tamper-evident audit chain
+# silently going stale or breaking: a daily CronJob verifies it via the read-only
+# /api/audit surface and fails (non-zero exit -> failed Job) when it does. The
+# failed Job is the alert. See manifests/ and README.md.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: audit-anchor-alert
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/audit-anchor-alert/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

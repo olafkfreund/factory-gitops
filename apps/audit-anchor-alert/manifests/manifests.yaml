@@ -1,0 +1,198 @@
+# Audit-anchor freshness/integrity alert (Factory#313, #319).
+#
+# There is NO Prometheus/Alertmanager/kube-state-metrics in this cluster —
+# OpenObserve (apps/observe) is the only telemetry backend and it is a log/metric
+# sink, not an alerting engine. So the smallest thing that actually ALERTS on a
+# broken tamper-evident audit chain is a daily CronJob that verifies the chain and
+# exits non-zero when it is stale or broken. A failed Job is the alert: it is
+# visible in `kubectl get jobs`, in ArgoCD, and in the OpenObserve pod-log stream.
+#
+# ponytail: failed-Job IS the notification because no Slack/Alertmanager path
+# exists yet. Wire failed-Job -> notifier when that plumbing lands (see README).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-anchor-alert-script
+  namespace: factory
+  labels: { app: audit-anchor-alert }
+data:
+  check.py: |
+    #!/usr/bin/env python3
+    """Alert when CFactory's tamper-evident audit chain is stale or broken.
+
+    The audit "anchor" is the HMAC hash chain CFactory maintains over every
+    confirmed HITL action (cfactory/audit.py, #21): each entry chains to the
+    prior one via prev_hash == previous entry_hash. If CFactory or its audit
+    store dies, the chain stops being written and its external attestation
+    silently lapses — exactly the failure Factory#313/#319 has no alert for.
+
+    This checker reads the read-only /api/audit surface and fails (non-zero exit
+    -> failed CronJob = the alert) when the chain is unreachable, empty, broken
+    (a prev_hash link does not match), or STALE (newest entry older than
+    STALE_HOURS). Stdlib only; no HMAC secret needed — link integrity is checked
+    structurally, full HMAC re-verification stays CFactory's job.
+
+    Env:
+      CFACTORY_URL   base url (default in-cluster service)
+      STALE_HOURS    max age of the newest entry, hours (default 26; <=0 disables)
+      API_KEY        optional bearer for /api/* when the keystore is enforced
+    """
+
+    import json
+    import os
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def _parse_ts(raw: str) -> datetime:
+        # pydantic emits ISO-8601; tolerate a trailing Z and naive (assume UTC).
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+    def evaluate(entries: list[dict], now: datetime, stale_hours: float) -> list[str]:
+        """Pure chain check -> list of problems (empty == healthy)."""
+        problems: list[str] = []
+        if not entries:
+            return ["audit chain is EMPTY — no anchored entries at all"]
+        rows = sorted(entries, key=lambda e: e["id"])
+        prev = None
+        for e in rows:
+            if e.get("prev_hash") != prev:
+                problems.append(
+                    f"chain BREAK at id={e.get('id')}: prev_hash={e.get('prev_hash')!r} "
+                    f"!= expected {prev!r} (deletion/reorder/tamper)"
+                )
+                break
+            prev = e.get("entry_hash")
+        if stale_hours > 0:
+            newest = _parse_ts(str(rows[-1]["ts"]))
+            age_h = (now - newest).total_seconds() / 3600.0
+            if age_h > stale_hours:
+                problems.append(
+                    f"anchor STALE: newest entry is {age_h:.1f}h old (> {stale_hours}h)"
+                )
+        return problems
+
+
+    def main() -> int:
+        base = os.environ.get(
+            "CFACTORY_URL", "http://cfactory.factory.svc.cluster.local:3111"
+        ).rstrip("/")
+        stale_hours = float(os.environ.get("STALE_HOURS", "26"))
+        req = urllib.request.Request(f"{base}/api/audit", method="GET")
+        key = os.environ.get("API_KEY")
+        if key:
+            req.add_header("authorization", f"Bearer {key}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                payload = json.load(r)
+        except urllib.error.HTTPError as e:
+            eprint(f"ALERT: /api/audit HTTP {e.code} — audit surface unreachable")
+            return 3
+        except Exception as e:  # noqa: BLE001 — any failure is a real alert
+            eprint(f"ALERT: cannot reach /api/audit: {e!r}")
+            return 3
+
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            eprint(f"ALERT: /api/audit gave no entries list: keys={sorted(payload)}")
+            return 4
+
+        problems = evaluate(entries, datetime.now(timezone.utc), stale_hours)
+        if problems:
+            for p in problems:
+                eprint(f"ALERT: {p}")
+            return 5
+        eprint(f"OK: audit chain intact, {len(entries)} entries, fresh (<{stale_hours}h)")
+        return 0
+
+
+    def _selftest() -> int:
+        now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+        good = [
+            {"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-24T11:00:00"},
+            {"id": 2, "prev_hash": "a", "entry_hash": "b", "ts": "2026-07-24T11:30:00"},
+        ]
+        assert evaluate(good, now, 26) == [], "healthy chain must pass"
+        assert evaluate([], now, 26), "empty chain must alert"
+        broken = [dict(good[0]), {**good[1], "prev_hash": "WRONG"}]
+        assert evaluate(broken, now, 26), "broken link must alert"
+        stale = [{"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-01T00:00:00"}]
+        assert evaluate(stale, now, 26), "stale chain must alert"
+        assert evaluate(stale, now, 0) == [], "stale disabled (<=0) must pass"
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-anchor-alert
+  namespace: factory
+  labels: { app: audit-anchor-alert }
+spec:
+  # Daily at 06:00. Freshness window (26h) > 24h so one skipped run is harmless.
+  schedule: "0 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 7
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: { labels: { app: audit-anchor-alert } }
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: check
+              # Stock python; the script is stdlib-only so no custom image.
+              image: python:3.12-slim
+              command: ["python3", "/script/check.py"]
+              env:
+                - { name: STALE_HOURS, value: "26" }
+                # Optional bearer for /api/* if the keystore is enforced. The
+                # frontend uses the same bare key; absent secret => no header,
+                # which is correct while the keystore is open.
+                - name: API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: cfactory-api-keys
+                      key: api-key
+                      optional: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: audit-anchor-alert-script
