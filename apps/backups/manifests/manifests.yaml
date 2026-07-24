@@ -16,10 +16,12 @@
 # non-root, readOnlyRootFilesystem, all capabilities dropped, resource limits.
 # The dump is written to an in-memory/emptyDir scratch volume, never the rootfs.
 #
-# RESIDUAL DR GAP: MinIO lives on the SAME cluster (RWO local-path PVC, one node).
-# A backup that shares a failure domain with its source is not disaster recovery.
-# The off-cluster copy (mc mirror to an external S3 / restic to remote) is the
-# required next step — tracked in docs/restore.md "Off-cluster follow-up".
+# DR GAP CLOSED BELOW: MinIO lives on the SAME cluster (RWO local-path PVC, one
+# node). A backup that shares a failure domain with its source is not disaster
+# recovery. The second CronJob in this file (`offsite-backup-mirror`) mirrors the
+# `factory-backups` bucket to an EXTERNAL S3 target off this cluster's failure
+# domain, which is what makes this actual DR. Continuous WAL archiving / PITR is
+# the further step — designed in docs/ha-postgres-and-pitr.md.
 #
 # Retention: enforced by the bucket lifecycle rule (keep ~14 dailies), NOT by a
 # prune step here (apps/minio/manifests.yaml: `mc ilm rule add --expire-days 14`).
@@ -116,3 +118,107 @@ spec:
             # Sized for a plausible dump; bump if the cluster grows past a few GB.
             - name: scratch
               emptyDir: { sizeLimit: 5Gi }
+---
+################################################################################
+# Off-cluster backup mirror (Factory#321 / #310) — makes the above ACTUAL DR.
+#
+# `mc mirror` of the in-cluster `factory-backups` bucket -> an EXTERNAL S3 target
+# that lives OFF this cluster's failure domain (AWS S3, Backblaze B2, another
+# MinIO on a different node/site). Without this, a node/cluster loss takes the
+# backups with the source (see the header of this file); with it, the daily
+# dumps survive losing the whole cluster.
+#
+# OPERATOR-SUPPLIED SECRET — this is the ONE thing you must provide. Nothing here
+# points at any real endpoint or credential; the CronJob is inert until you
+# create the `offsite-s3-creds` Secret with YOUR external target:
+#
+#   kubectl -n factory create secret generic offsite-s3-creds \
+#     --from-literal=OFFSITE_S3_ENDPOINT="https://s3.eu-west-1.amazonaws.com" \
+#     --from-literal=OFFSITE_S3_ACCESS_KEY="<your external access key>" \
+#     --from-literal=OFFSITE_S3_SECRET_KEY="<your external secret key>" \
+#     --from-literal=OFFSITE_S3_BUCKET="my-org-factory-dr"
+#
+#   # AWS S3:        endpoint https://s3.<region>.amazonaws.com
+#   # Backblaze B2:  endpoint https://s3.<region>.backblazeb2.com
+#   # remote MinIO:  endpoint https://minio.dr.example.com
+#   # The bucket must already exist at the target (create it there, with its own
+#   # versioning/retention). This job does NOT create the remote bucket.
+#
+# The local (source) side reuses the SAME in-cluster `minio-creds` Secret as the
+# backup job above — no new local credential. `--remove` is deliberately NOT set,
+# so objects the local 14-day lifecycle expires are RETAINED off-cluster: the
+# external target keeps its own, typically longer, retention. Mirroring is
+# idempotent — `--overwrite` re-copies only changed/new objects each run.
+################################################################################
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: offsite-backup-mirror
+  namespace: factory
+  labels: { app: offsite-backup-mirror }
+spec:
+  # 03:15 UTC daily — an hour after postgres-backup (02:15) so the day's dump is
+  # already in factory-backups before we mirror it off-cluster.
+  schedule: "15 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata: { labels: { app: offsite-backup-mirror } }
+        spec:
+          restartPolicy: OnFailure
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: mirror
+              image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  export MC_CONFIG_DIR=/scratch/.mc
+                  # Source: in-cluster MinIO (reuses minio-creds, same as the dump job).
+                  until mc alias set fac http://minio.factory.svc.cluster.local:9000 \
+                        "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1; do
+                    echo "waiting for local minio..."; sleep 3
+                  done
+                  # Target: the operator-supplied external S3. mc infers region;
+                  # creds/endpoint come from the offsite-s3-creds Secret (env).
+                  mc alias set offsite "$OFFSITE_S3_ENDPOINT" \
+                    "$OFFSITE_S3_ACCESS_KEY" "$OFFSITE_S3_SECRET_KEY" >/dev/null
+                  echo "mirroring factory-backups -> offsite/${OFFSITE_S3_BUCKET}"
+                  # No --remove: the external copy keeps its own retention, so
+                  # locally-expired dailies survive off-cluster.
+                  mc mirror --overwrite fac/factory-backups "offsite/${OFFSITE_S3_BUCKET}"
+                  echo "offsite mirror complete"
+                  mc ls "offsite/${OFFSITE_S3_BUCKET}/postgres/" | tail -n 5
+              env:
+                # Local source creds — same Secret the dump/upload job uses.
+                - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+                - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+                # External target — the operator-supplied Secret (see header).
+                - { name: OFFSITE_S3_ENDPOINT,   valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_ENDPOINT } } }
+                - { name: OFFSITE_S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_ACCESS_KEY } } }
+                - { name: OFFSITE_S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_SECRET_KEY } } }
+                - { name: OFFSITE_S3_BUCKET,     valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_BUCKET } } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { cpu: 500m, memory: 256Mi }
+          volumes:
+            # mc writes its alias config + transfer state here (rootfs is read-only).
+            - name: scratch
+              emptyDir: { sizeLimit: 1Gi }

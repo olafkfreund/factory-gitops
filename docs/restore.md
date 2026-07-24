@@ -33,27 +33,59 @@ so a full restore is one `psql` feed.
 
 ## Current gaps (read before relying on this)
 
-- Not true disaster recovery yet. MinIO runs on the same cluster as Postgres, on
-  an RWO `local-path` PVC pinned to one node (`apps/minio/manifests.yaml`). A node
-  or cluster loss takes the backups with the source. The off-cluster copy is the
-  required next step (see below).
+- MinIO runs on the same cluster as Postgres, on an RWO `local-path` PVC pinned
+  to one node (`apps/minio/manifests.yaml`), so the in-cluster backup shares the
+  source's failure domain. The `offsite-backup-mirror` CronJob (see "Off-cluster
+  copy" below) closes this by mirroring the backups to an external S3 target —
+  once the operator supplies `offsite-s3-creds`, this is true DR.
 - No point-in-time recovery. These are daily logical snapshots, not WAL
   archiving; you can only restore to a backup boundary, not an arbitrary moment.
+  A CloudNativePG migration adding continuous WAL archiving for PITR is designed
+  in `docs/ha-postgres-and-pitr.md` (design-only, not yet applied).
 - Restore is not yet automated. The `restore.sh` helper is run deliberately by a
   human; there is no self-service restore.
 
-## Off-cluster follow-up (required to call this DR)
+## Off-cluster copy (implemented — this is what makes it DR)
 
-Pick one and schedule it off the cluster's failure domain:
+Implemented as a second CronJob in `apps/backups/manifests/manifests.yaml`:
+`offsite-backup-mirror` (03:15 UTC daily, an hour after the dump). It runs
+`mc mirror --overwrite` from the in-cluster `factory-backups` bucket to an
+EXTERNAL S3 target off this cluster's failure domain. `--remove` is deliberately
+omitted, so dailies the local 14-day lifecycle expires survive off-cluster (the
+external target keeps its own, typically longer, retention).
 
-- `mc mirror --watch` (or a second CronJob) replicating `factory-backups` and
-  `factory-artifacts` to an external S3 target (AWS S3, Backblaze B2, another
-  MinIO on a different node/site).
-- MinIO bucket replication to a remote MinIO once a second site exists.
-- `restic`/`rclone` of the gzip objects to remote storage with its own retention.
+The external target is entirely operator-supplied via a Secret — the CronJob is
+inert until you create it:
 
-Until one of these is live, treat the "backups" as protection against accidental
-deletion and logical corruption only, not against losing the node.
+```
+kubectl -n factory create secret generic offsite-s3-creds \
+  --from-literal=OFFSITE_S3_ENDPOINT="https://s3.eu-west-1.amazonaws.com" \
+  --from-literal=OFFSITE_S3_ACCESS_KEY="<external access key>" \
+  --from-literal=OFFSITE_S3_SECRET_KEY="<external secret key>" \
+  --from-literal=OFFSITE_S3_BUCKET="my-org-factory-dr"
+```
+
+Endpoint examples: AWS `https://s3.<region>.amazonaws.com`, Backblaze B2
+`https://s3.<region>.backblazeb2.com`, remote MinIO `https://minio.dr.example.com`.
+Create the target bucket at the remote first (with its own versioning/retention);
+the job does not create it. The local source side reuses the existing
+`minio-creds` Secret — no new in-cluster credential.
+
+To also mirror `factory-artifacts` (evidence objects), add a second
+`mc mirror ... fac/factory-artifacts offsite/<bucket-or-prefix>` line to the same
+job; the failure-domain argument is identical.
+
+Alternatives not used (documented for the record): MinIO server-side bucket
+replication once a second site exists; `restic`/`rclone` of the gzip objects with
+independent retention. `mc mirror` was chosen because it needs no second MinIO and
+reuses the image and credential conventions already in this file.
+
+### Point-in-time recovery (design)
+
+These logical dumps + the off-cluster mirror still only restore to a backup
+boundary (RPO <= 24h). Continuous WAL archiving for arbitrary-moment PITR — via a
+migration to CloudNativePG — is designed in `docs/ha-postgres-and-pitr.md`. It is
+design-only; the live DB is still the single StatefulSet in `apps/postgres`.
 
 ## Restore: Postgres
 
@@ -121,9 +153,12 @@ depends on what happened:
 - Overwrite: same as above — list versions, copy the good version-id back over
   the key.
 
-- Whole-bucket loss (node gone): only recoverable from the off-cluster copy once
-  that follow-up is implemented. Until then, this case is unrecoverable — call it
-  out honestly in any DR sign-off.
+- Whole-bucket loss (node gone): recover from the off-cluster mirror
+  (`offsite-backup-mirror`, above). Point `mc` at the external target and copy the
+  needed objects back into a rebuilt `factory-backups`, then follow the Postgres
+  restore. This path is only as good as the last mirror run (RPO <= ~24h + the
+  gap between dump and mirror); verify the external bucket has recent objects as
+  part of the periodic backup-verification below.
 
 ## Restore-verification checklist
 
@@ -148,5 +183,9 @@ Run after any Postgres restore, before returning the fleet to service:
       and recent `jobs`/`pods` show completions, not failures.
 - [ ] Today's object exists and is non-trivial in size:
       `mc ls fac/factory-backups/postgres/`.
+- [ ] The off-cluster mirror is succeeding:
+      `kubectl -n factory get cronjob offsite-backup-mirror` shows recent
+      completions, and the external bucket has today's object
+      (`mc ls offsite/<bucket>/postgres/` from a pod with `offsite-s3-creds`).
 - [ ] Restore drill on a scratch namespace/database at least quarterly — an
       untested backup is not a backup.
