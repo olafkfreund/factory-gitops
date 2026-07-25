@@ -41,6 +41,20 @@ spec:
             - { name: CFACTORY_TFACTORY_API_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }
             - { name: CFACTORY_SUBSCRIBE_UPSTREAMS, value: "true" }
             - { name: CFACTORY_LIVE_PROGRESS, value: "true" }
+            # RFC-0019 Phase 3: the AIFactory project a planning card is built
+            # into when it is promoted to `ready`. AIFactory's
+            # /api/tasks/from-issue needs a project_id and a card carries none
+            # (a card is planning-level), so it is deployment config.
+            # Only factory:low / factory:medium cards use it — they take the
+            # skip-planning fast path. `hard` cards route through PFactory
+            # first and need no project id.
+            # UNSET => low/medium cards are BLOCKED with that reason rather
+            # than silently accepted, so a card never sits in `ready`
+            # pretending it was dispatched.
+            # aifactory-demo is deliberate: the sacrificial demo repo, so a
+            # mis-planned card cannot damage real work. Point it at a real
+            # project when the board drives production work.
+            - { name: CFACTORY_INTAKE_PROJECT_ID, value: "5d78d4b9-35f9-4445-92c1-78f3ff60a494" }
             # Shared bearer token the adapters/WS send to the sibling factories.
             # Without it every upstream fetch is 401 and the cockpit shows nothing.
             - { name: CFACTORY_UPSTREAM_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
