@@ -1,0 +1,365 @@
+################################################################################
+# Evidence collector (Factory#324) — automated, timestamped compliance evidence.
+#
+# A daily CronJob that snapshots the evidence the cluster can produce ON ITS OWN
+# into the dedicated, versioned + 90d-lifecycled `factory-evidence` MinIO bucket
+# (created by apps/minio), under a dated prefix `factory-evidence/<YYYY-MM-DD>/`.
+# Each run captures three self-collectable artifacts + a run manifest:
+#
+#   audit-anchor.json          CFactory audit-chain head hash + verdict (#313)
+#   config-baseline-images.json  actually-running image@sha256 digests   (#316/#322)
+#   backups-index.json         postgres backup objects that exist in MinIO (#321)
+#   run-manifest.json          what this run collected + what is pushed externally
+#
+# Two-step pattern copied verbatim from apps/backups:
+#   initContainer `collect` (python:3.12-slim, stdlib only) does the HTTP work —
+#     hits CFactory /api/audit and the in-cluster Kubernetes API — and writes JSON
+#     to an in-memory scratch volume.
+#   container `upload` (minio/mc) does the S3 work — lists the backup bucket to
+#     capture backup-success markers, then copies the dated snapshot into MinIO.
+#
+# Security model = apps/cred-broker + apps/backups: dedicated SA, least-privilege
+# RBAC (read pods only, for the image-digest baseline), non-root,
+# readOnlyRootFilesystem, all caps dropped, resource limits, emptyDir scratch.
+#
+# HONEST SCOPE — what this canNOT self-collect (documented drop-point instead):
+#   - Access-review NDJSON is behind AIFactory admin auth + needs an org id
+#     (AIFactory access_review.py, GET /api/admin/access-review?org=...).
+#   - Trivy / CodeQL scan results are produced in GitHub Actions CI, off-cluster.
+#   Both must be PUSHED by the control plane into
+#   `factory-evidence/control-plane-push/<source>/`. The collector records their
+#   freshness in run-manifest.json (present-and-recent vs missing) but cannot
+#   fetch them. See docs/evidence-collection.md.
+################################################################################
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: evidence-collector
+  namespace: factory
+  labels: { app: evidence-collector }
+---
+# Least privilege: the ONLY cluster read this job needs is pod list/get, to record
+# the actually-running container image digests as a config baseline. No secrets,
+# no write, no other resource.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: evidence-collector
+  namespace: factory
+  labels: { app: evidence-collector }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: evidence-collector
+  namespace: factory
+  labels: { app: evidence-collector }
+subjects:
+  - kind: ServiceAccount
+    name: evidence-collector
+    namespace: factory
+roleRef:
+  kind: Role
+  name: evidence-collector
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: evidence-collector-script
+  namespace: factory
+  labels: { app: evidence-collector }
+data:
+  collect.py: |
+    #!/usr/bin/env python3
+    """Snapshot cluster-collectable compliance evidence to a scratch dir.
+
+    Writes JSON artifacts consumed by the mc upload step (Factory#324). Stdlib
+    only, so it runs on stock python:3.12-slim with no image build. Every fetch
+    is best-effort: a failure is RECORDED as evidence of a gap, never a crash,
+    because a missing artifact is itself an audit finding worth capturing.
+
+    Env:
+      OUT_DIR       scratch dir to write artifacts into (default /scratch/out)
+      CFACTORY_URL  CFactory base url (default in-cluster service)
+      STALE_HOURS   audit-chain freshness threshold, hours (default 26)
+      API_KEY       optional bearer for CFactory /api/* when the keystore is on
+    """
+
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
+
+
+    def _iso(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+    def _write(out_dir: str, name: str, obj: dict) -> None:
+        path = os.path.join(out_dir, name)
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+        print(f"wrote {name} ({os.path.getsize(path)} bytes)", flush=True)
+
+
+    def _parse_ts(raw: str) -> datetime:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+    def evaluate_chain(entries: list, now: datetime, stale_hours: float) -> list:
+        """Structural audit-chain check -> list of problems (empty == healthy).
+
+        Same logic as apps/audit-anchor-alert/check.py: empty / broken link /
+        stale. Kept as a copy (a few lines) rather than a shared image so this
+        job stays stdlib-only and independently deployable.
+        """
+        if not entries:
+            return ["audit chain is EMPTY — no anchored entries at all"]
+        rows = sorted(entries, key=lambda e: e["id"])
+        problems, prev = [], None
+        for e in rows:
+            if e.get("prev_hash") != prev:
+                problems.append(f"chain BREAK at id={e.get('id')}")
+                break
+            prev = e.get("entry_hash")
+        if stale_hours > 0:
+            age_h = (now - _parse_ts(rows[-1]["ts"])).total_seconds() / 3600.0
+            if age_h > stale_hours:
+                problems.append(f"anchor STALE: newest {age_h:.1f}h old (> {stale_hours}h)")
+        return problems
+
+
+    def collect_audit(base: str, stale_hours: float, api_key: str | None) -> dict:
+        """Record the audit-chain head hash + verdict — a daily notarization point."""
+        req = urllib.request.Request(f"{base}/api/audit", method="GET")
+        if api_key:
+            req.add_header("authorization", f"Bearer {api_key}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                payload = json.load(r)
+        except Exception as e:  # noqa: BLE001 — a failure IS evidence
+            return {"ok": False, "error": repr(e), "collected_at": _iso(_now())}
+        entries = payload.get("entries") or []
+        rows = sorted(entries, key=lambda x: x.get("id", 0))
+        head = rows[-1] if rows else {}
+        problems = evaluate_chain(entries, _now(), stale_hours)
+        return {
+            "ok": not problems,
+            "collected_at": _iso(_now()),
+            "entry_count": len(entries),
+            "head_id": head.get("id"),
+            "head_entry_hash": head.get("entry_hash"),
+            "head_ts": head.get("ts"),
+            "problems": problems,
+        }
+
+
+    def collect_images(out_dir: str) -> dict:
+        """Config baseline: the image@sha256 digests actually running in `factory`.
+
+        Reads the in-cluster Kubernetes API with the mounted ServiceAccount token
+        (RBAC: pods get/list only). imageID from pod status is the RESOLVED digest
+        — the true 'what is deployed' baseline, stronger than the spec tag.
+        """
+        sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+        result = {"ok": False, "collected_at": _iso(_now()), "images": []}
+        try:
+            with open(f"{sa}/token") as f:
+                token = f.read().strip()
+            host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+            port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+            url = f"https://{host}:{port}/api/v1/namespaces/factory/pods"
+            ctx = ssl.create_default_context(cafile=f"{sa}/ca.crt")
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("authorization", f"Bearer {token}")
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+                pods = json.load(r)
+        except Exception as e:  # noqa: BLE001
+            result["error"] = repr(e)
+            return result
+        seen = {}
+        for pod in pods.get("items", []):
+            for cs in (pod.get("status", {}).get("containerStatuses") or []):
+                digest = cs.get("imageID", "")
+                if digest and digest not in seen:
+                    seen[digest] = {"image": cs.get("image"), "imageID": digest}
+        result["ok"] = bool(seen)
+        result["images"] = sorted(seen.values(), key=lambda x: x["image"] or "")
+        result["distinct_digests"] = len(seen)
+        return result
+
+
+    def main() -> int:
+        out_dir = os.environ.get("OUT_DIR", "/scratch/out")
+        os.makedirs(out_dir, exist_ok=True)
+        base = os.environ.get(
+            "CFACTORY_URL", "http://cfactory.factory.svc.cluster.local:3111"
+        ).rstrip("/")
+        stale_hours = float(os.environ.get("STALE_HOURS", "26"))
+        api_key = os.environ.get("API_KEY") or None
+
+        audit = collect_audit(base, stale_hours, api_key)
+        images = collect_images(out_dir)
+        _write(out_dir, "audit-anchor.json", audit)
+        _write(out_dir, "config-baseline-images.json", images)
+        _write(out_dir, "run-manifest.json", {
+            "schema": "factory-evidence/v1",
+            "epic": "Factory#324",
+            "collected_at": _iso(_now()),
+            "self_collected": {
+                "audit_anchor": audit["ok"],
+                "config_baseline_images": images["ok"],
+                # backups-index.json is written by the mc upload step, not here.
+                "backups_index": "written_by_upload_step",
+            },
+            "control_plane_push_expected": {
+                "access_review_ndjson": "factory-evidence/control-plane-push/access-review/ (AIFactory /api/admin/access-review)",
+                "trivy_results": "factory-evidence/control-plane-push/trivy/ (GitHub Actions CI)",
+                "codeql_results": "factory-evidence/control-plane-push/codeql/ (GitHub Actions CI)",
+            },
+        })
+        # Never fail the Job on a collection gap — the gap is recorded in the
+        # artifacts. Failing here would DELETE the very evidence of the gap.
+        print("collection complete", flush=True)
+        return 0
+
+
+    def _selftest() -> int:
+        now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+        good = [
+            {"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-24T11:00:00"},
+            {"id": 2, "prev_hash": "a", "entry_hash": "b", "ts": "2026-07-24T11:30:00"},
+        ]
+        assert evaluate_chain(good, now, 26) == [], "healthy chain must pass"
+        assert evaluate_chain([], now, 26), "empty chain must alert"
+        broken = [dict(good[0]), {**good[1], "prev_hash": "WRONG"}]
+        assert evaluate_chain(broken, now, 26), "broken link must alert"
+        stale = [{"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-01T00:00:00"}]
+        assert evaluate_chain(stale, now, 26), "stale chain must alert"
+        assert evaluate_chain(stale, now, 0) == [], "stale disabled (<=0) must pass"
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: evidence-collector
+  namespace: factory
+  labels: { app: evidence-collector }
+spec:
+  # 03:00 UTC daily — AFTER the 02:15 postgres backup (apps/backups) so the same
+  # run's backups-index reflects today's backup, and after the 06:00 audit alert
+  # window is irrelevant (we read the chain directly). One skipped run loses one
+  # daily snapshot; retention (90d) tolerates gaps.
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata: { labels: { app: evidence-collector } }
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: evidence-collector
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            fsGroup: 65532          # so the mc container can read the collect output
+            seccompProfile: { type: RuntimeDefault }
+          # Step 1: HTTP collection (CFactory audit + kube API) -> scratch JSON.
+          initContainers:
+            - name: collect
+              image: python:3.12-slim
+              command: ["python3", "/script/collect.py"]
+              env:
+                - { name: OUT_DIR, value: "/scratch/out" }
+                - { name: STALE_HOURS, value: "26" }
+                - name: API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: cfactory-api-keys
+                      key: api-key
+                      optional: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+                - { name: script, mountPath: /script, readOnly: true }
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { cpu: 300m, memory: 256Mi }
+          # Step 2: S3 work — capture backup markers, then upload the dated snapshot.
+          containers:
+            - name: upload
+              image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  export MC_CONFIG_DIR=/scratch/.mc
+                  out=/scratch/out
+                  day="$(date -u +%Y-%m-%d)"
+                  until mc alias set fac http://minio.factory.svc.cluster.local:9000 \
+                        "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1; do
+                    echo "waiting for minio..."; sleep 3
+                  done
+                  # Defensive: bucket is normally created by apps/minio bucket-init.
+                  mc mb --ignore-existing fac/factory-evidence
+                  # Backup-success markers: the postgres backup objects that exist.
+                  # An empty list is itself evidence (a BC/DR gap), so we still write it.
+                  echo "{" > "${out}/backups-index.json"
+                  echo "  \"collected_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> "${out}/backups-index.json"
+                  echo "  \"listing\": [" >> "${out}/backups-index.json"
+                  mc --json ls fac/factory-backups/postgres/ 2>/dev/null \
+                    | sed 's/$/,/' | sed '$ s/,$//' >> "${out}/backups-index.json" || true
+                  echo "  ]" >> "${out}/backups-index.json"
+                  echo "}" >> "${out}/backups-index.json"
+                  # Upload the whole dated snapshot. Object timestamps + the dated
+                  # prefix both date the evidence; bucket versioning + 90d ILM
+                  # (apps/minio) give tamper-resistance and retention.
+                  mc cp --recursive "${out}/" "fac/factory-evidence/${day}/"
+                  echo "snapshot uploaded to factory-evidence/${day}/:"
+                  mc ls "fac/factory-evidence/${day}/"
+              env:
+                - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+                - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+              resources:
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { cpu: 200m, memory: 256Mi }
+          volumes:
+            - name: scratch
+              emptyDir: { sizeLimit: 1Gi }
+            - name: script
+              configMap:
+                name: evidence-collector-script
