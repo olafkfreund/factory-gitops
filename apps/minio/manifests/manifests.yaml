@@ -142,24 +142,34 @@ spec:
               # here so bucket lifecycle lives in one place; the backup CronJob also
               # `mc mb --ignore-existing` defensively.
               mc mb --ignore-existing fac/factory-backups
+              # Dedicated compliance-evidence bucket (apps/evidence-collector,
+              # Factory#324). Daily dated snapshots of audit-chain head, config
+              # baselines, backup markers + control-plane pushes (access-review,
+              # scans). Lifecycle set below alongside the others.
+              mc mb --ignore-existing fac/factory-evidence
               # Encryption at rest (Factory#314): auto-encrypt every new object
               # with SSE-S3. MinIO generates a per-object data key, wraps it with
               # the MINIO_KMS_SECRET_KEY KEK, and stores only the wrapped key +
               # ciphertext on the PVC. NOT `|| true`: if the KMS key is missing
               # this MUST fail loudly (unencrypted buckets are the bug we are
-              # fixing). Idempotent — re-running re-asserts the same policy.
+              # fixing). Idempotent - re-running re-asserts the same policy.
               # Applies only to objects PUT after this runs; pre-existing objects
               # stay as-is (a fresh cluster/bucket has none, so first sync covers
-              # everything). See docs/encryption-at-rest.md.
+              # everything). factory-evidence is included deliberately: it holds
+              # the compliance evidence trail, so it is the last bucket that
+              # should sit in clear. See docs/encryption-at-rest.md.
               mc encrypt set sse-s3 fac/factory-artifacts
               mc encrypt set sse-s3 fac/factory-backups
+              mc encrypt set sse-s3 fac/factory-evidence
               mc encrypt info fac/factory-artifacts
               mc encrypt info fac/factory-backups
+              mc encrypt info fac/factory-evidence
               # Durability: object versioning so an overwrite or delete is
               # recoverable (a prior version survives). Floor for DR alongside the
               # off-cluster copy tracked in docs/restore.md (#321). Idempotent.
               mc version enable fac/factory-artifacts 2>/dev/null || true
               mc version enable fac/factory-backups 2>/dev/null || true
+              mc version enable fac/factory-evidence 2>/dev/null || true
               # Backup retention = ~14 dailies. Lifecycle enforces it (no prune
               # step in the CronJob); noncurrent versions reaped a week later so
               # versioning does not grow storage unbounded.
@@ -176,6 +186,14 @@ spec:
               mc ilm rule add --expire-days 90 --prefix "pfactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
               mc ilm rule add --expire-days 90 --prefix "aifactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
               mc ilm rule add --expire-days 90 --prefix "tfactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
+              # Compliance-evidence bucket: everything in it IS evidence, so one
+              # bucket-wide 90d rule (matching the 90d evidence floor above; #313
+              # #321 #324). Noncurrent versions (from versioning) reaped 30d later
+              # so tamper-recovery is retained without unbounded growth.
+              # ponytail: 90d = the established floor; SOC2's 12-month observation
+              # window wants --expire-days 365 — one-line bump when an audit period
+              # is actually scoped.
+              mc ilm rule add --expire-days 90 --noncurrentversion-expiration-days 30 fac/factory-evidence 2>/dev/null || true
               echo "bucket ready:"; mc ls fac/
           env:
             - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }

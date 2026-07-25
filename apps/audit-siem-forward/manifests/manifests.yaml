@@ -1,0 +1,313 @@
+# Audit-chain -> OpenObserve SIEM forwarder (Factory#313).
+#
+# The tamper-evident audit rows (CFactory's HMAC hash chain, cfactory/audit.py)
+# live only in per-service Postgres. Nothing forwards them to the deployed
+# OpenObserve (apps/observe), so there is no central, cross-service, searchable
+# security view. This CronJob closes that gap: it reads the read-only /api/audit
+# surface (the SAME endpoint apps/audit-anchor-alert already consumes) and pushes
+# NEW records to a dedicated OpenObserve stream `audit_chain`.
+#
+# INCREMENTAL + IDEMPOTENT WITHOUT EXTRA STATE: the high-water mark is the sink
+# itself. Each run asks OpenObserve for max(id) already in `audit_chain` and only
+# forwards entries with a greater id. No PVC, no ConfigMap write-back, no separate
+# cursor store to drift — a re-run after a partial failure simply re-reads the
+# real max and continues. (ponytail: sink-as-cursor; add a durable cursor only if
+# OpenObserve retention ever ages out rows we still need to diff against.)
+#
+# CREDENTIALS ARE OUT-OF-BAND, reused from EXISTING Secrets — nothing new to
+# create, nothing hardcoded:
+#   - OpenObserve root:  observe-root/email,password  (apps/observe) -> HTTP Basic
+#   - CFactory /api key: cfactory-api-keys/api-key     (optional bearer, as the
+#                        anchor-alert job does; absent => no header, correct while
+#                        the /api keystore is open)
+#
+# Security model copied verbatim from apps/backups + apps/audit-anchor-alert: runs
+# non-root, readOnlyRootFilesystem, all capabilities dropped, resource limits,
+# stdlib-only python so no custom image.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: audit-siem-forward-script
+  namespace: factory
+  labels: { app: audit-siem-forward }
+data:
+  forward.py: |
+    #!/usr/bin/env python3
+    """Forward CFactory's tamper-evident audit chain to OpenObserve (Factory#313).
+
+    Reads the read-only GET /api/audit surface (entries carry id/prev_hash/
+    entry_hash/ts + the action detail), works out which rows OpenObserve has not
+    seen yet (max id already in the `audit_chain` stream = high-water mark), and
+    bulk-ingests only the newer rows via OpenObserve's native /_json API. The
+    audit entry's own timestamp becomes OpenObserve's `_timestamp`, so analysts
+    search by WHEN THE ACTION HAPPENED, not when it was shipped.
+
+    A non-zero exit (failed Job) is the alert, matching the fleet convention
+    (apps/audit-anchor-alert): if CFactory or OpenObserve is unreachable, or the
+    ingest is rejected, the forward run fails loudly instead of silently dropping
+    security telemetry.
+
+    Env:
+      CFACTORY_URL   audit source base url (default in-cluster service)
+      API_KEY        optional bearer for /api/* when the keystore is enforced
+      OBSERVE_URL    OpenObserve base url (default in-cluster service)
+      OO_ORG         OpenObserve organization (default "default")
+      OO_STREAM      target stream name (default "audit_chain")
+      OO_USER        OpenObserve login (from observe-root/email)
+      OO_PASS        OpenObserve password (from observe-root/password)
+    """
+
+    import base64
+    import json
+    import os
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def _parse_ts(raw: str) -> datetime:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+    def _micros(raw: str) -> int:
+        return int(_parse_ts(raw).timestamp() * 1_000_000)
+
+
+    def select_new(entries: list[dict], hwm: int) -> list[dict]:
+        """Pure: rows with id > hwm, in id order, stamped for OpenObserve.
+
+        Each forwarded record is the original audit row plus `_timestamp` (the
+        entry's own ts in microseconds, OpenObserve's event-time field). Keeping
+        every original field means the chain is fully reconstructable in the SIEM.
+        """
+        out = []
+        for e in sorted(entries, key=lambda x: x["id"]):
+            if int(e["id"]) <= hwm:
+                continue
+            rec = dict(e)
+            try:
+                rec["_timestamp"] = _micros(e["ts"])
+            except Exception:  # noqa: BLE001 — malformed ts must not drop the row
+                pass
+            out.append(rec)
+        return out
+
+
+    def _get_json(url: str, *, headers: dict, data: bytes | None = None):
+        req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+
+    def read_audit(base: str, api_key: str | None) -> list[dict]:
+        headers = {}
+        if api_key:
+            headers["authorization"] = f"Bearer {api_key}"
+        payload = _get_json(f"{base}/api/audit", headers=headers)
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            raise RuntimeError(f"/api/audit gave no entries list: keys={sorted(payload)}")
+        return entries
+
+
+    def high_water_mark(oo: str, org: str, stream: str, basic: str) -> int:
+        """max(id) already in the stream, or 0 (first run / empty stream)."""
+        now = datetime.now(timezone.utc)
+        body = json.dumps(
+            {
+                "query": {
+                    "sql": f'SELECT max(id) AS max_id FROM "{stream}"',
+                    # Wide window: cover the whole chain regardless of event
+                    # time. NOT 0 — OpenObserve rejects that as an invalid
+                    # range (HTTP 400/500), which sent this function down the
+                    # except branch and returned hwm=0 on every run, silently
+                    # re-forwarding the entire chain each time. 10y matches
+                    # ZO_INGEST_ALLOWED_UPTO on the observe deployment.
+                    "start_time": int(now.timestamp() * 1_000_000)
+                    - 10 * 365 * 24 * 3600 * 1_000_000,
+                    "end_time": int(now.timestamp() * 1_000_000) + 1_000_000,
+                    "size": 1,
+                }
+            }
+        ).encode()
+        headers = {"authorization": f"Basic {basic}", "content-type": "application/json"}
+        try:
+            res = _get_json(f"{oo}/api/{org}/_search?type=logs", headers=headers, data=body)
+        except urllib.error.HTTPError as e:
+            # 404 genuinely means "stream not created yet" -> empty, hwm=0.
+            # Anything else must NOT fall through to 0: that claims the stream
+            # is empty and re-forwards the whole chain, duplicating every
+            # record on every run. Fail loudly and let the CronJob alert.
+            if e.code == 404:
+                eprint("note: stream does not exist yet (hwm=0, first run)")
+                return 0
+            raise
+        hits = res.get("hits") or []
+        if hits and hits[0].get("max_id") is not None:
+            return int(hits[0]["max_id"])
+        return 0
+
+
+    def forward(oo: str, org: str, stream: str, basic: str, records: list[dict]) -> None:
+        body = json.dumps(records).encode()
+        headers = {"authorization": f"Basic {basic}", "content-type": "application/json"}
+        res = _get_json(f"{oo}/api/{org}/{stream}/_json", headers=headers, data=body)
+        # OpenObserve returns a per-request status summary; a non-zero failed count
+        # is a real problem worth failing on.
+        status = (res.get("status") or [{}])[0] if isinstance(res.get("status"), list) else res
+        failed = status.get("failed") if isinstance(status, dict) else None
+        if failed:
+            raise RuntimeError(f"OpenObserve rejected {failed} record(s): {res}")
+
+
+    def main() -> int:
+        cf = os.environ.get(
+            "CFACTORY_URL", "http://cfactory.factory.svc.cluster.local:3111"
+        ).rstrip("/")
+        oo = os.environ.get(
+            "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
+        ).rstrip("/")
+        org = os.environ.get("OO_ORG", "default")
+        stream = os.environ.get("OO_STREAM", "audit_chain")
+        user = os.environ.get("OO_USER", "")
+        pw = os.environ.get("OO_PASS", "")
+        if not user or not pw:
+            eprint("FATAL: OO_USER/OO_PASS not set (observe-root secret missing)")
+            return 2
+        basic = base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+        try:
+            entries = read_audit(cf, os.environ.get("API_KEY"))
+        except Exception as e:  # noqa: BLE001 — unreachable source is a real alert
+            eprint(f"ALERT: cannot read /api/audit: {e!r}")
+            return 3
+
+        try:
+            hwm = high_water_mark(oo, org, stream, basic)
+        except Exception as e:  # noqa: BLE001
+            eprint(f"ALERT: cannot query OpenObserve high-water mark: {e!r}")
+            return 4
+
+        new = select_new(entries, hwm)
+        if not new:
+            eprint(f"OK: nothing to forward (hwm id={hwm}, {len(entries)} entries total)")
+            return 0
+
+        try:
+            forward(oo, org, stream, basic, new)
+        except Exception as e:  # noqa: BLE001 — failed ingest must not be silent
+            eprint(f"ALERT: OpenObserve ingest failed: {e!r}")
+            return 5
+
+        eprint(
+            f"OK: forwarded {len(new)} record(s) to stream '{stream}' "
+            f"(id {new[0]['id']}..{new[-1]['id']}, prev hwm={hwm})"
+        )
+        return 0
+
+
+    def _selftest() -> int:
+        entries = [
+            {"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-24T11:00:00",
+             "action": "hitl.approve"},
+            {"id": 2, "prev_hash": "a", "entry_hash": "b", "ts": "2026-07-24T11:30:00Z",
+             "action": "gate.reject"},
+            {"id": 3, "prev_hash": "b", "entry_hash": "c", "ts": "2026-07-24T12:00:00",
+             "action": "auth.failure"},
+        ]
+        # First run (hwm=0): all rows, id-ordered, each stamped with _timestamp.
+        first = select_new(entries, 0)
+        assert [r["id"] for r in first] == [1, 2, 3], "hwm=0 must forward all in order"
+        assert first[0]["_timestamp"] == _micros("2026-07-24T11:00:00"), "event-time stamp"
+        assert first[0]["action"] == "hitl.approve", "original fields preserved"
+        # Incremental: only rows newer than the high-water mark.
+        inc = select_new(entries, 2)
+        assert [r["id"] for r in inc] == [3], "hwm=2 must forward only id>2"
+        # Caught up: nothing to do (idempotent).
+        assert select_new(entries, 3) == [], "hwm at tip must forward nothing"
+        # Unordered input is tolerated (sorted by id).
+        assert [r["id"] for r in select_new(list(reversed(entries)), 0)] == [1, 2, 3]
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-siem-forward
+  namespace: factory
+  labels: { app: audit-siem-forward }
+spec:
+  # Every 15 minutes: near-real-time central view without hammering a k3d box.
+  # concurrencyPolicy Forbid so two runs never race on the same high-water mark.
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # 7 kept a week of failures visible; with the ingest deadlock fixed a
+  # smaller window is enough and stops Error pods accumulating in the UI.
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata: { labels: { app: audit-siem-forward } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: forward
+              # Stock python; the script is stdlib-only so no custom image.
+              image: python:3.12-slim
+              command: ["python3", "/script/forward.py"]
+              env:
+                - { name: OO_STREAM, value: "audit_chain" }
+                - { name: OO_ORG, value: "default" }
+                # OpenObserve HTTP Basic creds — REUSED from the existing
+                # observe-root secret (apps/observe). No new operator secret.
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+                # Optional bearer for /api/* if the CFactory keystore is enforced.
+                # Same secret + optional semantics as apps/audit-anchor-alert.
+                - name: API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: cfactory-api-keys
+                      key: api-key
+                      optional: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: audit-siem-forward-script

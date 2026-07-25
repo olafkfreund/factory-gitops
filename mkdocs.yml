@@ -56,6 +56,7 @@ nav:
   - Build & Deploy: build-and-deploy.md
   - Keycloak SSO: keycloak-sso.md
   - Multi-tenancy: multi-tenancy.md
+  - Egress Allowlist (design): egress-allowlist.md
   - Apps:
       - SkillAI: apps-skillai.md
       - RoleHunter: apps-rolehunter.md
