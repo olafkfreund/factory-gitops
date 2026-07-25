@@ -58,6 +58,14 @@ spec:
             - { name: ZO_DATA_DIR, value: "/data" }
             - { name: ZO_HTTP_PORT, value: "5080" }
             - { name: ZO_GRPC_PORT, value: "5081" }
+            # Audit records are stamped with their ORIGINAL event time by
+            # audit-siem-forward, not ingest time. OpenObserve defaults to
+            # rejecting anything older than 5h, which deadlocked the forwarder:
+            # every run replayed the same historical backlog, every record was
+            # refused, so the high-water mark never advanced and the CronJob
+            # failed every 15 minutes indefinitely. 10 years lets the immutable
+            # audit chain backfill in full.
+            - { name: ZO_INGEST_ALLOWED_UPTO, value: "87600" }
             # Bootstrap root user. Credentials are NEVER inlined here — they come
             # from a Secret the operator creates out-of-band (see README.md):
             #   kubectl -n factory create secret generic observe-root \
