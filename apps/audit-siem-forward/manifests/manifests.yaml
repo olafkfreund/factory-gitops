@@ -126,8 +126,14 @@ data:
             {
                 "query": {
                     "sql": f'SELECT max(id) AS max_id FROM "{stream}"',
-                    # Wide window: cover the whole chain regardless of event time.
-                    "start_time": 0,
+                    # Wide window: cover the whole chain regardless of event
+                    # time. NOT 0 — OpenObserve rejects that as an invalid
+                    # range (HTTP 400/500), which sent this function down the
+                    # except branch and returned hwm=0 on every run, silently
+                    # re-forwarding the entire chain each time. 10y matches
+                    # ZO_INGEST_ALLOWED_UPTO on the observe deployment.
+                    "start_time": int(now.timestamp() * 1_000_000)
+                    - 10 * 365 * 24 * 3600 * 1_000_000,
                     "end_time": int(now.timestamp() * 1_000_000) + 1_000_000,
                     "size": 1,
                 }
@@ -137,9 +143,14 @@ data:
         try:
             res = _get_json(f"{oo}/api/{org}/_search?type=logs", headers=headers, data=body)
         except urllib.error.HTTPError as e:
-            # First run: the stream does not exist yet -> treat as empty.
-            eprint(f"note: search returned HTTP {e.code} (assuming empty stream, hwm=0)")
-            return 0
+            # 404 genuinely means "stream not created yet" -> empty, hwm=0.
+            # Anything else must NOT fall through to 0: that claims the stream
+            # is empty and re-forwards the whole chain, duplicating every
+            # record on every run. Fail loudly and let the CronJob alert.
+            if e.code == 404:
+                eprint("note: stream does not exist yet (hwm=0, first run)")
+                return 0
+            raise
         hits = res.get("hits") or []
         if hits and hits[0].get("max_id") is not None:
             return int(hits[0]["max_id"])
