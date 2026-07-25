@@ -1,0 +1,38 @@
+# Evidence collector — daily compliance-evidence snapshot into MinIO (Factory#324).
+#
+# Auditors need automated, timestamped evidence, not on-demand collection. This
+# app runs a daily CronJob that SNAPSHOTS the evidence the cluster can produce by
+# itself — backup-success markers (apps/backups), the CFactory audit-chain head
+# and verdict (apps/audit-anchor-alert), and a config baseline of the actually-
+# running image digests — into a dedicated, versioned+lifecycled `factory-evidence`
+# MinIO bucket (created by apps/minio), one dated prefix per run. Control-plane
+# exports (access-review NDJSON, Trivy/CodeQL) are PUSHED to a documented drop
+# path; see docs/evidence-collection.md.
+#
+# Security model copied from apps/cred-broker + apps/backups: dedicated SA with
+# least-privilege RBAC (read pods only), non-root, readOnlyRootFilesystem, all
+# capabilities dropped, resource limits, in-memory scratch.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: evidence-collector
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/evidence-collector/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
