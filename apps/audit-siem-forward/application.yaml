@@ -1,0 +1,33 @@
+# Audit-SIEM-forward — ship the tamper-evident audit chain to OpenObserve (Factory#313).
+#
+# The per-service audit rows (CFactory's HMAC chain, cfactory/audit.py) live only
+# in Postgres and are never centralised, so there is no cross-service security
+# view for an assessor. This CronJob periodically reads the read-only /api/audit
+# surface (the same one apps/audit-anchor-alert verifies) and forwards NEW records
+# to a dedicated OpenObserve stream `audit_chain`, incrementally + idempotently.
+# That gives the fleet one central, searchable SIEM view of the audit trail.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
+# the manifests/ kustomization into the `factory` namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: audit-siem-forward
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/audit-siem-forward/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
