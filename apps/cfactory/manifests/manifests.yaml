@@ -63,6 +63,22 @@ spec:
             # (default) until explicitly switched via CFACTORY_COPILOT_PROVIDER.
             - { name: OLLAMA_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OLLAMA_API_KEY } } }
             - { name: CFACTORY_AUDIT_HMAC_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_AUDIT_HMAC_SECRET } } }
+            # RFC-0020 Phase 3 (#364): key-encryption key for the per-tenant git
+            # credential store. Envelope encryption — this KEK wraps a per-record
+            # data key and the credential is sealed with AES-256-GCM, so the
+            # token a tenant pastes in Settings > Git integration is never at
+            # rest in plaintext.
+            # Format: "<key-id>:<base64 of 32 random bytes>", e.g. v1:<...>.
+            # Rotate by prepending the new key: "v2:<new>,v1:<old>" — the first
+            # entry seals new writes, the older ones stay only to unseal records
+            # not yet re-wrapped.
+            # UNSET => storing a credential is REFUSED with a clear error rather
+            # than silently written in plaintext, and the board keeps serving
+            # reads with status `credential_missing`.
+            # LOSING IT makes every stored credential undecryptable; they must
+            # be re-entered. It is backed up in agenix
+            # (secrets/factory-secret-factory-secrets.age).
+            - { name: CFACTORY_CREDENTIAL_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_CREDENTIAL_KEY } } }
             # Bearer secret guarding the read-only MCP server at POST /mcp (#71).
             # Reuses the shared APP_API_TOKEN so the conductor authenticates with
             # the same token it uses for the other factories. Unset => /mcp open.
