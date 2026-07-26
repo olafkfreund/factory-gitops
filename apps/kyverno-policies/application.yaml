@@ -1,0 +1,34 @@
+# Kyverno policies — the cosign signature-verification ClusterPolicy.
+#
+# Split from the kyverno engine Application so the reviewable policy is not
+# buried in the engine's CRDs (same split KEDA uses for operator vs
+# scaledobjects). This app depends on the Kyverno CRDs; until the kyverno
+# Application has installed them, ArgoCD will report ComparisonError here and
+# auto-retry — that resolves itself once Kyverno is up.
+#
+# AUDIT MODE ONLY. See apps/kyverno-policies/manifests/ and
+# docs/image-signature-admission.md.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno-policies
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/kyverno-policies/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kyverno
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
