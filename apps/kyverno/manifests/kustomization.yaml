@@ -5,13 +5,30 @@
 # remote-resource pattern bootstrap/kustomization.yaml uses for argo-cd.
 # Bump deliberately: change the release tag below, never track `latest`.
 #
-# Footprint (v1.12.6): admission-controller + background-controller +
+# Footprint (v1.18.2): admission-controller + background-controller +
 # cleanup-controller + reports-controller Deployments in the `kyverno`
-# namespace, plus Kyverno CRDs (ClusterPolicy, Policy, PolicyReport, ...)
-# and one ValidatingWebhookConfiguration. Its webhook failurePolicy for our
-# policy is pinned to Ignore (see the ClusterPolicy) so a Kyverno outage can
-# never block Pod admission fleet-wide.
+# namespace, plus 22 Kyverno CRDs (ClusterPolicy, Policy, PolicyReport, ...)
+# and 9 webhook configurations. Our policy pins failurePolicy: Ignore and
+# validationFailureAction: Audit (see the ClusterPolicy), so a Kyverno outage
+# can never block Pod admission fleet-wide.
+#
+# Was v1.12.6 until 2026-07-26. That release shipped four cleanup CronJobs
+# running `bitnami/kubectl:1.28.5`, which stopped resolving when Bitnami
+# retired their public Docker Hub catalogue:
+#
+#   Failed to pull "bitnami/kubectl:1.28.5":
+#   docker.io/bitnami/kubectl:1.28.5: not found
+#
+# leaving four pods in ImagePullBackOff on every schedule. Upstream removed
+# those CronJobs entirely — the cleanup-controller handles report pruning
+# natively — so bumping deletes the broken component rather than pinning a
+# replacement image. It also stops running a 1.28-era kubectl against this
+# v1.31.5 cluster.
+#
+# Verified before the bump: v1.18.2 still serves ClusterPolicy v1/v2beta1, and
+# verifyImages / attestors / keyless / mutateDigest remain in the CRD schema,
+# so the policy manifest needed no changes.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - https://github.com/kyverno/kyverno/releases/download/v1.12.6/install.yaml
+  - https://github.com/kyverno/kyverno/releases/download/v1.18.2/install.yaml
