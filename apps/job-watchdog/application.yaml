@@ -1,0 +1,33 @@
+# Job-watchdog — CronJob failure and staleness detection (Factory#381).
+#
+# A CronJob in this namespace could fail every run for weeks with nobody told:
+# cred-broker did exactly that for ~7 weeks. This watchdog reads every CronJob
+# and its Jobs every 30 minutes and writes a durable health record per CronJob
+# into the OpenObserve stream `job_health`, so both explicit failure AND silence
+# (stale, unscheduled, never-succeeded, Jobs garbage collected) are queryable
+# instead of waiting for someone to run `kubectl get jobs`.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
+# the manifests/ kustomization into the `factory` namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: job-watchdog
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/job-watchdog/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

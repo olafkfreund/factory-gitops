@@ -255,14 +255,19 @@ spec:
   schedule: "*/15 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
-  # 7 kept a week of failures visible; with the ingest deadlock fixed a
-  # smaller window is enough and stops Error pods accumulating in the UI.
-  failedJobsHistoryLimit: 2
+  # Was 2, to stop Error pods accumulating in the UI. Factory#381 puts evidence
+  # ahead of tidiness: at four runs an hour, 10 is only ~2.5h of failures, and
+  # this is the job that carries every other job's security telemetry. Its
+  # longer-horizon record is now `job_health` in OpenObserve (apps/job-watchdog),
+  # so this limit only has to cover reading the actual pod logs.
+  failedJobsHistoryLimit: 10
   startingDeadlineSeconds: 300
   jobTemplate:
     spec:
       backoffLimit: 1
-      ttlSecondsAfterFinished: 3600
+      # ttlSecondsAfterFinished REMOVED (Factory#381) — it reaped finished Jobs
+      # after an hour regardless of outcome, silently overriding
+      # failedJobsHistoryLimit. The per-outcome history limits reap instead.
       template:
         metadata: { labels: { app: audit-siem-forward } }
         spec:

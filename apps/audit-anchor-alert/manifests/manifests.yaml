@@ -1,14 +1,22 @@
-# Audit-anchor freshness/integrity alert (Factory#313, #319).
+# Audit-anchor freshness/integrity alert (Factory#313, #319, #381).
 #
 # There is NO Prometheus/Alertmanager/kube-state-metrics in this cluster —
-# OpenObserve (apps/observe) is the only telemetry backend and it is a log/metric
-# sink, not an alerting engine. So the smallest thing that actually ALERTS on a
-# broken tamper-evident audit chain is a daily CronJob that verifies the chain and
-# exits non-zero when it is stale or broken. A failed Job is the alert: it is
-# visible in `kubectl get jobs`, in ArgoCD, and in the OpenObserve pod-log stream.
+# OpenObserve (apps/observe) is the only telemetry backend. This CronJob verifies
+# CFactory's tamper-evident audit chain daily and fails when it is stale or broken.
 #
-# ponytail: failed-Job IS the notification because no Slack/Alertmanager path
-# exists yet. Wire failed-Job -> notifier when that plumbing lands (see README).
+# Factory#381 FIXED THE ALERT ITSELF. Until then its only alerting mechanism was
+# `eprint("ALERT: ...")` plus a non-zero exit: it wrote to stderr and died. The
+# single outbound request it made FETCHED /api/audit; it notified nobody. An alert
+# job whose alert is "the job failed", in a cluster where nothing watched job
+# failures, was a no-op — and that is how cred-broker failed silently for seven
+# weeks. It now EMITS a durable record to the OpenObserve `job_health` stream on
+# every run, over the exact path apps/audit-siem-forward already uses. The
+# non-zero exit is kept as well, so nothing that depended on it regresses.
+#
+# It reports on the healthy path too. Silence is not health: a record with
+# status=ok every day is what makes "this check stopped running" a query rather
+# than a thing somebody has to happen to notice. apps/job-watchdog watches the
+# schedule side of the same job.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -27,18 +35,30 @@ data:
     store dies, the chain stops being written and its external attestation
     silently lapses — exactly the failure Factory#313/#319 has no alert for.
 
-    This checker reads the read-only /api/audit surface and fails (non-zero exit
-    -> failed CronJob = the alert) when the chain is unreachable, empty, broken
-    (a prev_hash link does not match), or STALE (newest entry older than
-    STALE_HOURS). Stdlib only; no HMAC secret needed — link integrity is checked
-    structurally, full HMAC re-verification stays CFactory's job.
+    This checker reads the read-only /api/audit surface and alerts when the chain
+    is unreachable, empty, broken (a prev_hash link does not match), or STALE
+    (newest entry older than STALE_HOURS). Stdlib only; no HMAC secret needed —
+    link integrity is checked structurally, full HMAC re-verification stays
+    CFactory's job.
+
+    ALERTING (Factory#381): every run POSTs a record to the OpenObserve
+    `job_health` stream — status `ok` or `alert`, with the problem text — and
+    THEN exits non-zero if there were problems. The emit is the notification; the
+    exit code is kept for anything that reads it. If the emit itself fails that is
+    printed loudly, and the check's own exit code still wins, because a delivery
+    failure must never downgrade a real audit-chain alert to silence.
 
     Env:
       CFACTORY_URL   base url (default in-cluster service)
       STALE_HOURS    max age of the newest entry, hours (default 26; <=0 disables)
       API_KEY        optional bearer for /api/* when the keystore is enforced
+      OBSERVE_URL    OpenObserve base url (default in-cluster service)
+      OO_ORG         OpenObserve organization (default "default")
+      OO_STREAM      target stream (default "job_health")
+      OO_USER/OO_PASS OpenObserve login (from the observe-root secret)
     """
 
+    import base64
     import json
     import os
     import sys
@@ -49,6 +69,55 @@ data:
 
     def eprint(*a):
         print(*a, file=sys.stderr, flush=True)
+
+
+    def notify(status: str, problems: list[str], entries: int | None = None) -> None:
+        """Best-effort durable alert record into OpenObserve.
+
+        Same stream, same credentials and same /_json ingest as
+        apps/audit-siem-forward and apps/job-watchdog — one delivery path for the
+        whole namespace, not a second one to rot in parallel. Never raises: the
+        caller's exit code is the authority on whether the CHAIN is healthy, and
+        a broken sink must not mask that.
+        """
+        user, pw = os.environ.get("OO_USER", ""), os.environ.get("OO_PASS", "")
+        if not user or not pw:
+            eprint("WARN: OO_USER/OO_PASS unset — alert NOT delivered to OpenObserve")
+            return
+        oo = os.environ.get(
+            "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
+        ).rstrip("/")
+        org = os.environ.get("OO_ORG", "default")
+        stream = os.environ.get("OO_STREAM", "job_health")
+        rec = {
+            "_timestamp": int(datetime.now(timezone.utc).timestamp() * 1_000_000),
+            "source": "audit-anchor-alert",
+            "namespace": os.environ.get("NAMESPACE", "factory"),
+            "cronjob": "audit-anchor-alert",
+            "status": status,
+            "problems": problems,
+            "entries": entries,
+        }
+        try:
+            req = urllib.request.Request(
+                f"{oo}/api/{org}/{stream}/_json",
+                data=json.dumps([rec]).encode(),
+                headers={
+                    "authorization": f"Basic {base64.b64encode(f'{user}:{pw}'.encode()).decode()}",
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.load(r)
+        except Exception as e:  # noqa: BLE001 — delivery failure must not mask the alert
+            eprint(f"WARN: could not deliver alert to OpenObserve: {e!r}")
+            return
+        st = (res.get("status") or [{}])[0] if isinstance(res.get("status"), list) else res
+        if isinstance(st, dict) and st.get("failed"):
+            eprint(f"WARN: OpenObserve rejected the alert record: {res}")
+            return
+        eprint(f"delivered status={status} to OpenObserve stream '{stream}'")
 
 
     def _parse_ts(raw: str) -> datetime:
@@ -63,7 +132,22 @@ data:
         if not entries:
             return ["audit chain is EMPTY — no anchored entries at all"]
         rows = sorted(entries, key=lambda e: e["id"])
-        prev = None
+        # Link the window to ITSELF, not to genesis. /api/audit returns at most
+        # 100 entries. While the chain was shorter than that the first row was
+        # always the genesis entry (prev_hash None) and seeding `prev = None`
+        # worked. The moment the chain crossed 100 entries the window started
+        # mid-chain — live right now at id=3..102 — and the first row's
+        # prev_hash became legitimately non-None, so this check reported a FALSE
+        # "chain BREAK at id=3" on EVERY run (Factory#381).
+        #
+        # That matters more than it looks: #381 exists because nobody noticed a
+        # real failure, and nothing trains people to ignore an alert faster than
+        # one that cries wolf daily. A windowed endpoint can only attest to
+        # linkage WITHIN the window it returns; genesis is not observable from
+        # here and full HMAC re-verification remains CFactory's job (as the
+        # docstring already says). Deletion, reorder and tamper inside the
+        # window are still caught.
+        prev = rows[0].get("prev_hash")
         for e in rows:
             if e.get("prev_hash") != prev:
                 problems.append(
@@ -95,24 +179,30 @@ data:
             with urllib.request.urlopen(req, timeout=30) as r:
                 payload = json.load(r)
         except urllib.error.HTTPError as e:
-            eprint(f"ALERT: /api/audit HTTP {e.code} — audit surface unreachable")
-            return 3
+            return alert(3, [f"/api/audit HTTP {e.code} — audit surface unreachable"])
         except Exception as e:  # noqa: BLE001 — any failure is a real alert
-            eprint(f"ALERT: cannot reach /api/audit: {e!r}")
-            return 3
+            return alert(3, [f"cannot reach /api/audit: {e!r}"])
 
         entries = payload.get("entries")
         if not isinstance(entries, list):
-            eprint(f"ALERT: /api/audit gave no entries list: keys={sorted(payload)}")
-            return 4
+            return alert(4, [f"/api/audit gave no entries list: keys={sorted(payload)}"])
 
         problems = evaluate(entries, datetime.now(timezone.utc), stale_hours)
         if problems:
-            for p in problems:
-                eprint(f"ALERT: {p}")
-            return 5
+            return alert(5, problems, len(entries))
         eprint(f"OK: audit chain intact, {len(entries)} entries, fresh (<{stale_hours}h)")
+        # Emit on the healthy path too: a daily status=ok record is what turns
+        # "this check silently stopped running" into a query instead of a hope.
+        notify("ok", [], len(entries))
         return 0
+
+
+    def alert(code: int, problems: list[str], entries: int | None = None) -> int:
+        """Print, DELIVER, then still fail. All three, in that order."""
+        for p in problems:
+            eprint(f"ALERT: {p}")
+        notify("alert", problems, entries)
+        return code
 
 
     def _selftest() -> int:
@@ -125,6 +215,19 @@ data:
         assert evaluate([], now, 26), "empty chain must alert"
         broken = [dict(good[0]), {**good[1], "prev_hash": "WRONG"}]
         assert evaluate(broken, now, 26), "broken link must alert"
+        # REGRESSION (Factory#381): /api/audit caps at 100 rows, so a healthy
+        # chain longer than that arrives as a window starting mid-chain with a
+        # non-None first prev_hash. That must NOT read as tampering — it did,
+        # on every run, once the live chain passed 100 entries.
+        windowed = [
+            {"id": 3, "prev_hash": "c9e6", "entry_hash": "d1", "ts": "2026-07-24T11:00:00"},
+            {"id": 4, "prev_hash": "d1", "entry_hash": "d2", "ts": "2026-07-24T11:30:00"},
+        ]
+        assert evaluate(windowed, now, 26) == [], "mid-chain window is not a break"
+        # ...but a real break INSIDE the window is still caught.
+        assert evaluate(
+            [windowed[0], {**windowed[1], "prev_hash": "WRONG"}], now, 26
+        ), "tamper inside the window must still alert"
         stale = [{"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-01T00:00:00"}]
         assert evaluate(stale, now, 26), "stale chain must alert"
         assert evaluate(stale, now, 0) == [], "stale disabled (<=0) must pass"
@@ -146,7 +249,10 @@ spec:
   schedule: "0 6 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 7
+  # Factory#381: keep enough failed runs to reconstruct what happened. At one run
+  # a day this is ten days of evidence; the #378 post-mortem had none, because
+  # the failed Jobs were GC'd before anyone looked.
+  failedJobsHistoryLimit: 10
   startingDeadlineSeconds: 600
   jobTemplate:
     spec:
@@ -167,6 +273,15 @@ spec:
               command: ["python3", "/script/check.py"]
               env:
                 - { name: STALE_HOURS, value: "26" }
+                - { name: OO_STREAM, value: "job_health" }
+                - { name: OO_ORG, value: "default" }
+                # Factory#381: the alert now has somewhere to GO. Same
+                # observe-root secret apps/audit-siem-forward already uses — one
+                # delivery path for the namespace, not a second one to rot.
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
                 # Optional bearer for /api/* if the keystore is enforced. The
                 # frontend uses the same bare key; absent secret => no header,
                 # which is correct while the keystore is open.

@@ -57,6 +57,7 @@ nav:
   - Keycloak SSO: keycloak-sso.md
   - Multi-tenancy: multi-tenancy.md
   - Egress Allowlist (design): egress-allowlist.md
+  - CronJob Health Watchdog: job-health-watchdog.md
   - Apps:
       - SkillAI: apps-skillai.md
       - RoleHunter: apps-rolehunter.md

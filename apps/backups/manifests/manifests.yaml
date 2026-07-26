@@ -35,13 +35,22 @@ spec:
   schedule: "15 2 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
+  # Factory#381: ten failed runs kept, so a failure that has been recurring for
+  # days is reconstructable. The #378 post-mortem had nothing to read — the
+  # evidence had already been garbage collected.
+  failedJobsHistoryLimit: 10
   startingDeadlineSeconds: 600
   jobTemplate:
     spec:
       backoffLimit: 2
-      # Reap the Job (and its pod) an hour after it finishes.
-      ttlSecondsAfterFinished: 3600
+      # ttlSecondsAfterFinished REMOVED (Factory#381). It reaped every finished
+      # Job after an hour regardless of outcome, which silently overrode
+      # failedJobsHistoryLimit: raising that limit does nothing while the TTL
+      # controller deletes the evidence an hour after it is produced. The history
+      # limits are the right reaper because they are per-outcome — successes stay
+      # capped at 3, failures survive long enough to read. Worst case is 13
+      # finished Job objects for this CronJob, which cost nothing but a line in
+      # `kubectl get pods`.
       template:
         metadata: { labels: { app: postgres-backup } }
         spec:

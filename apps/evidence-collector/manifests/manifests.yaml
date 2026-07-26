@@ -272,12 +272,15 @@ spec:
   schedule: "0 3 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
+  # Factory#381: keep ten failed runs so a recurring failure is reconstructable.
+  failedJobsHistoryLimit: 10
   startingDeadlineSeconds: 600
   jobTemplate:
     spec:
       backoffLimit: 2
-      ttlSecondsAfterFinished: 3600
+      # ttlSecondsAfterFinished REMOVED (Factory#381) — it reaped finished Jobs
+      # after an hour regardless of outcome, silently overriding
+      # failedJobsHistoryLimit. The per-outcome history limits reap instead.
       template:
         metadata: { labels: { app: evidence-collector } }
         spec:

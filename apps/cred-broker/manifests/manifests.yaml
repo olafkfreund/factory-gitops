@@ -166,7 +166,11 @@ spec:
   schedule: "0 */4 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
+  # Factory#381: this is the job whose seven-week failure went unnoticed, and the
+  # window was unreconstructable because only ~9h of failed Jobs survived. At six
+  # runs a day, 10 keeps not quite two days — enough for a post-mortem. The long
+  # horizon is `job_health` in OpenObserve (apps/job-watchdog).
+  failedJobsHistoryLimit: 10
   startingDeadlineSeconds: 600
   jobTemplate:
     spec:

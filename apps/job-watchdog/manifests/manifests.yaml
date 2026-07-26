@@ -1,0 +1,623 @@
+# CronJob health watchdog -> OpenObserve (Factory#381).
+#
+# THE DEFECT THIS CLOSES: cred-broker's stored credential expired 2026-06-07 and
+# its 4-hourly rotation failed for ~7 weeks. Nothing noticed. It surfaced only
+# because a human happened to run `kubectl get jobs`. Failed Jobs are GC'd
+# (failedJobsHistoryLimit), so by the time anyone looked the evidence was gone.
+#
+# The existing "alert" jobs in this namespace alert by exiting non-zero. That is
+# not an alert: an alert job whose alert is "the job failed", in a cluster where
+# nothing watches job failures, is a no-op. This watchdog is the thing that
+# actually watches, and it EMITS — a durable, queryable record per CronJob per
+# run into the OpenObserve stream `job_health`.
+#
+# TWO SIGNALS, BECAUSE ONE IS NOT ENOUGH:
+#   1. consecutive failures  — read from the Jobs the CronJob owns. Bounded by
+#      failedJobsHistoryLimit: once Jobs are GC'd this signal goes blind.
+#   2. STALENESS             — read from CronJob.status.lastSuccessfulTime /
+#      lastScheduleTime, which live on the CronJob OBJECT and therefore SURVIVE
+#      Job garbage collection entirely.
+#   Signal 2 is the important one. "No news" must never read as OK — that is
+#   exactly how seven weeks passed unnoticed. A CronJob whose Jobs have all been
+#   GC'd, or that stopped being scheduled, or that has never once succeeded,
+#   reports a problem, not silence.
+#
+# NO NEW DELIVERY PATH: OpenObserve (apps/observe) is already the SIEM and
+# apps/audit-siem-forward already ships to it every 15 minutes and succeeds. This
+# reuses that exact path and its exact credential pattern (observe-root secret,
+# HTTP Basic, /api/{org}/{stream}/_json). No Prometheus, no Alertmanager — adding
+# a metrics stack to fix a notification gap is the wrong trade.
+#
+# WHY IT EXITS 0 EVEN WHEN IT FINDS PROBLEMS: a watchdog that goes red on its
+# findings is indistinguishable from a watchdog that is itself broken, and it
+# would be repeating the very mistake this issue is about (using job failure as
+# the alert channel). Non-zero here means ONLY "the watchdog could not do its
+# job" — unreachable API server, or OpenObserve refused the record. The findings
+# live in the stream.
+#
+# WHO WATCHES THE WATCHDOG: it is a CronJob in this namespace, so it reports on
+# itself like any other. If it stops running entirely, its own absence is
+# visible as `job_health` having no records at all for a window — a stacked
+# second watchdog would just move the same question one level up.
+#
+# PAGING A HUMAN (not done here, deliberately, and NOT invented): OpenObserve has
+# an Alerts + Destinations + Templates feature. Turning these records into a page
+# needs, in the OpenObserve UI or API: (a) a Destination holding a real webhook
+# URL and its auth header — that URL does not exist yet and is not guessed here;
+# (b) a Template rendering the record; (c) a scheduled Alert on stream
+# `job_health` with a condition such as `status != 'ok'` over a 30m window. This
+# PR's job is the durable record and the query surface; wiring the destination is
+# a follow-up that requires a real endpoint from a human. See
+# docs/job-health-watchdog.md.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: job-watchdog
+  namespace: factory
+  labels: { app: job-watchdog }
+---
+# Least privilege, following the apps/cred-broker precedent: namespaced Role, no
+# ClusterRole, read-only, and only the two resource kinds the watchdog reads.
+# It never needs to create, patch or delete anything.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: job-watchdog
+  namespace: factory
+  labels: { app: job-watchdog }
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: job-watchdog
+  namespace: factory
+  labels: { app: job-watchdog }
+subjects:
+  - kind: ServiceAccount
+    name: job-watchdog
+    namespace: factory
+roleRef:
+  kind: Role
+  name: job-watchdog
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: job-watchdog-script
+  namespace: factory
+  labels: { app: job-watchdog }
+data:
+  watchdog.py: |
+    #!/usr/bin/env python3
+    """Report the health of every CronJob in the namespace to OpenObserve (#381).
+
+    For each CronJob it emits one record to the `job_health` stream carrying:
+    consecutive failure count, age of the last SUCCESS, age of the last SCHEDULE,
+    the expected period derived from the cron schedule, and a status.
+
+    Staleness is the load-bearing signal. Consecutive-failure counting can only
+    see Jobs that still exist, and failed Jobs are garbage collected — that is
+    how cred-broker failed for seven weeks undetected. The last-success and
+    last-schedule timestamps live on the CronJob's own status subresource, so
+    they remain true long after every Job has been reaped. A CronJob with no
+    surviving Jobs is therefore NOT reported healthy: it is reported stale.
+
+    Exit codes: 0 = reported (whatever the findings), 2 = no OpenObserve
+    credentials, 3 = kubernetes API unreachable, 4 = OpenObserve ingest failed.
+    A non-zero exit means THIS JOB is broken, never that a watched job is.
+
+    Env:
+      NAMESPACE        namespace to watch (default "factory")
+      FAIL_THRESHOLD   consecutive failures before status=failing (default 2)
+      OBSERVE_URL      OpenObserve base url (default in-cluster service)
+      OO_ORG           OpenObserve organization (default "default")
+      OO_STREAM        target stream (default "job_health")
+      OO_USER/OO_PASS  OpenObserve login (from the observe-root secret)
+    """
+
+    import base64
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+    # A CronJob is judged against its OWN cadence: tolerance = 2 periods + grace.
+    # Two periods means one entirely missed run is forgiven (a k3d box reboots,
+    # a node is briefly gone) but two are not.
+    #
+    # The grace absorbs scheduler jitter, startingDeadlineSeconds and image pull,
+    # and is CAPPED AT ONE PERIOD. It used to be a flat 900s, which the induced
+    # failure test caught: on a 1-minute CronJob that produced a 17-MINUTE blind
+    # window, and a canary with zero surviving Jobs and no recorded success ever
+    # was cheerfully reported "ok" for 17 straight runs. A fixed grace is only
+    # small relative to slow jobs; against fast ones it IS the blind spot this
+    # whole app exists to remove.
+    PERIOD_MULTIPLIER = 2
+    GRACE_SECONDS = 900
+
+
+    def tolerance_for(period: int) -> int:
+        return PERIOD_MULTIPLIER * period + min(GRACE_SECONDS, period)
+
+    # Escape hatch for schedules the estimator below reads wrongly (exotic cron
+    # with ranges/lists). Set it on the CronJob and the estimate is ignored.
+    # ponytail: none of the current five need it; it is the calibration knob for
+    # the one that eventually will, because real schedules are messier than a
+    # parser.
+    PERIOD_ANNOTATION = "factory.dev/expected-period-seconds"
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def _parse_ts(raw: str) -> datetime:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+    def _dur(seconds: float) -> str:
+        """Human duration. Hours-with-one-decimal alone renders short windows as
+        the useless '0.1h old (> 0.1h tolerance)' — an alert a reader learns
+        nothing from."""
+        s = int(seconds)
+        if s < 120:
+            return f"{s}s"
+        if s < 7200:
+            return f"{s // 60}m"
+        if s < 172800:
+            return f"{s / 3600:.1f}h"
+        return f"{s / 86400:.1f}d"
+
+
+    def estimate_period_seconds(schedule: str) -> int:
+        """Rough upper bound on the gap between two runs of a cron schedule.
+
+        Deliberately coarse: it only has to be right enough to set a tolerance
+        window, and it errs toward SHORTER periods (tighter tolerance, louder)
+        rather than longer, because the failure mode this exists to prevent is
+        silence. Unparseable => daily.
+        """
+        parts = str(schedule).split()
+        if len(parts) != 5:
+            return 24 * 3600
+        minute, hour, dom, mon, dow = parts
+
+        def step(field: str):
+            if field.startswith("*/"):
+                return int(field[2:])
+            if field == "*":
+                return 1
+            return None
+
+        if "," in minute or "-" in minute:
+            return 3600  # several times an hour at worst
+        ms = step(minute)
+        if ms is not None:
+            return ms * 60
+        # Fixed minute: the hour field sets the cadence.
+        if "," in hour or "-" in hour:
+            return 24 * 3600
+        hs = step(hour)
+        if hs is not None:
+            return hs * 3600
+        # Fixed hour too: daily, unless a day-of-week/month field stretches it.
+        if dow != "*":
+            return 7 * 24 * 3600
+        if dom != "*":
+            return 31 * 24 * 3600
+        return 24 * 3600
+
+
+    def job_state(job: dict) -> str:
+        """succeeded | failed | active. Unfinished Jobs count as neither."""
+        st = job.get("status") or {}
+        for c in st.get("conditions") or []:
+            if c.get("status") != "True":
+                continue
+            if c.get("type") == "Failed":
+                return "failed"
+            if c.get("type") in ("Complete", "SuccessCriteriaMet"):
+                return "succeeded"
+        if st.get("active"):
+            return "active"
+        if st.get("succeeded"):
+            return "succeeded"
+        if st.get("failed"):
+            return "failed"
+        return "active"
+
+
+    def consecutive_failures(jobs: list[dict]) -> int:
+        """Failures at the head of the run history, newest first.
+
+        Running Jobs are skipped rather than breaking the streak — a retry that
+        is still in flight does not clear a run of failures. NOTE this can only
+        count Jobs that still EXIST; once they are GC'd it silently returns 0,
+        which is exactly why assess() does not rely on it alone.
+        """
+        ordered = sorted(
+            jobs, key=lambda j: str(j["metadata"].get("creationTimestamp", "")), reverse=True
+        )
+        n = 0
+        for j in ordered:
+            s = job_state(j)
+            if s == "active":
+                continue
+            if s == "succeeded":
+                break
+            n += 1
+        return n
+
+
+    def assess(cj: dict, jobs: list[dict], now: datetime, fail_threshold: int) -> dict:
+        """Pure: one CronJob + the Jobs it owns -> one health record."""
+        meta = cj.get("metadata") or {}
+        spec = cj.get("spec") or {}
+        status = cj.get("status") or {}
+        name = meta.get("name", "?")
+        schedule = spec.get("schedule", "")
+        created = _parse_ts(meta["creationTimestamp"])
+
+        override = (meta.get("annotations") or {}).get(PERIOD_ANNOTATION)
+        period = int(override) if override else estimate_period_seconds(schedule)
+        tolerance = tolerance_for(period)
+
+        def age(field):
+            raw = status.get(field)
+            return None if not raw else (now - _parse_ts(raw)).total_seconds()
+
+        success_age = age("lastSuccessfulTime")
+        schedule_age = age("lastScheduleTime")
+        # Never-run CronJobs are measured from creation, so a brand new one gets
+        # a full tolerance window of grace and an abandoned one does not hide.
+        since_created = (now - created).total_seconds()
+
+        fails = consecutive_failures(jobs)
+        problems: list[tuple[str, str]] = []
+
+        if spec.get("suspend"):
+            problems.append(("suspended", "CronJob is SUSPENDED — it will never run"))
+
+        sched_ref = schedule_age if schedule_age is not None else since_created
+        if not spec.get("suspend") and sched_ref > tolerance:
+            problems.append(
+                (
+                    "not_scheduled",
+                    f"NOT SCHEDULED for {_dur(sched_ref)} "
+                    f"(> {_dur(tolerance)} tolerance) — the controller has "
+                    "stopped creating Jobs for it",
+                )
+            )
+
+        if fails >= fail_threshold:
+            problems.append(
+                ("failing", f"{fails} CONSECUTIVE FAILED runs (threshold {fail_threshold})")
+            )
+
+        if success_age is None:
+            if since_created > tolerance:
+                problems.append(
+                    (
+                        "never_succeeded",
+                        f"has NEVER succeeded in {_dur(since_created)} since "
+                        "creation — no recorded successful run at all",
+                    )
+                )
+        elif success_age > tolerance:
+            problems.append(
+                (
+                    "stale",
+                    f"STALE: last success was {_dur(success_age)} ago "
+                    f"(> {_dur(tolerance)} tolerance). Surviving Jobs: "
+                    f"{len(jobs)} — absence of failed Jobs is NOT health, they "
+                    "are garbage collected",
+                )
+            )
+
+        return {
+            "_timestamp": int(now.timestamp() * 1_000_000),
+            "source": "job-watchdog",
+            "namespace": meta.get("namespace", ""),
+            "cronjob": name,
+            "schedule": schedule,
+            "suspended": bool(spec.get("suspend")),
+            "status": problems[0][0] if problems else "ok",
+            "problems": [p[1] for p in problems],
+            "consecutive_failures": fails,
+            "surviving_jobs": len(jobs),
+            "last_success_age_seconds": None if success_age is None else int(success_age),
+            "last_schedule_age_seconds": None if schedule_age is None else int(schedule_age),
+            "expected_period_seconds": period,
+            "tolerance_seconds": tolerance,
+        }
+
+
+    def group_jobs(cronjobs: list[dict], jobs: list[dict]) -> dict:
+        """uid -> Jobs owned by that CronJob (ownerReferences, not name guessing)."""
+        uids = {(c.get("metadata") or {}).get("uid") for c in cronjobs}
+        out: dict = {u: [] for u in uids}
+        for j in jobs:
+            for ref in (j.get("metadata") or {}).get("ownerReferences") or []:
+                if ref.get("kind") == "CronJob" and ref.get("uid") in out:
+                    out[ref["uid"]].append(j)
+                    break
+        return out
+
+
+    def k8s_get(path: str):
+        with open(f"{SA}/token") as f:
+            token = f.read().strip()
+        req = urllib.request.Request(
+            f"https://kubernetes.default.svc{path}",
+            headers={"authorization": f"Bearer {token}", "accept": "application/json"},
+            method="GET",
+        )
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            return json.load(r)
+
+
+    def emit(oo: str, org: str, stream: str, basic: str, records: list[dict]) -> None:
+        req = urllib.request.Request(
+            f"{oo}/api/{org}/{stream}/_json",
+            data=json.dumps(records).encode(),
+            headers={
+                "authorization": f"Basic {basic}",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.load(r)
+        st = (res.get("status") or [{}])[0] if isinstance(res.get("status"), list) else res
+        if isinstance(st, dict) and st.get("failed"):
+            raise RuntimeError(f"OpenObserve rejected {st['failed']} record(s): {res}")
+
+
+    def main() -> int:
+        ns = os.environ.get("NAMESPACE", "factory")
+        threshold = int(os.environ.get("FAIL_THRESHOLD", "2"))
+        oo = os.environ.get(
+            "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
+        ).rstrip("/")
+        org = os.environ.get("OO_ORG", "default")
+        stream = os.environ.get("OO_STREAM", "job_health")
+        user, pw = os.environ.get("OO_USER", ""), os.environ.get("OO_PASS", "")
+        if not user or not pw:
+            eprint("FATAL: OO_USER/OO_PASS not set (observe-root secret missing)")
+            return 2
+        basic = base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+        try:
+            cronjobs = k8s_get(f"/apis/batch/v1/namespaces/{ns}/cronjobs")["items"]
+            jobs = k8s_get(f"/apis/batch/v1/namespaces/{ns}/jobs")["items"]
+        except Exception as e:  # noqa: BLE001 — cannot see == cannot report
+            eprint(f"FATAL: kubernetes API unreachable: {e!r}")
+            return 3
+
+        now = datetime.now(timezone.utc)
+        owned = group_jobs(cronjobs, jobs)
+        records = [
+            assess(c, owned.get((c.get("metadata") or {}).get("uid"), []), now, threshold)
+            for c in sorted(cronjobs, key=lambda c: c["metadata"]["name"])
+        ]
+
+        for r in records:
+            if r["status"] == "ok":
+                eprint(f"ok       {r['cronjob']}")
+            else:
+                eprint(f"UNHEALTHY {r['cronjob']} [{r['status']}]")
+                for p in r["problems"]:
+                    eprint(f"          - {p}")
+
+        try:
+            emit(oo, org, stream, basic, records)
+        except Exception as e:  # noqa: BLE001 — a dropped record is a blind spot
+            eprint(f"FATAL: cannot emit to OpenObserve stream '{stream}': {e!r}")
+            return 4
+
+        bad = [r["cronjob"] for r in records if r["status"] != "ok"]
+        eprint(
+            f"reported {len(records)} CronJob(s) to '{stream}': "
+            f"{len(records) - len(bad)} ok, {len(bad)} unhealthy"
+            + (f" ({', '.join(bad)})" if bad else "")
+        )
+        # Exit 0 on findings BY DESIGN: see the manifest header. A red watchdog
+        # must mean the watchdog is broken, not that a watched job is.
+        return 0
+
+
+    def _selftest() -> int:
+        now = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+
+        assert estimate_period_seconds("*/15 * * * *") == 900
+        assert estimate_period_seconds("0 */4 * * *") == 4 * 3600
+        assert estimate_period_seconds("0 6 * * *") == 24 * 3600
+        assert estimate_period_seconds("* * * * *") == 60
+        assert estimate_period_seconds("0 6 * * 1") == 7 * 24 * 3600
+        assert estimate_period_seconds("garbage") == 24 * 3600
+
+        def cj(name, schedule, *, last_ok=None, last_sched=None, created="2026-06-01T00:00:00Z",
+               suspend=False, ann=None):
+            return {
+                "metadata": {
+                    "name": name, "namespace": "factory", "uid": name,
+                    "creationTimestamp": created,
+                    **({"annotations": ann} if ann else {}),
+                },
+                "spec": {"schedule": schedule, **({"suspend": True} if suspend else {})},
+                "status": {
+                    **({"lastSuccessfulTime": last_ok} if last_ok else {}),
+                    **({"lastScheduleTime": last_sched} if last_sched else {}),
+                },
+            }
+
+        def job(owner, when, state):
+            st = {"succeeded": 1} if state == "succeeded" else (
+                {"failed": 1} if state == "failed" else {"active": 1})
+            return {
+                "metadata": {
+                    "name": f"{owner}-{when}", "creationTimestamp": when,
+                    "ownerReferences": [{"kind": "CronJob", "uid": owner}],
+                },
+                "status": st,
+            }
+
+        # Healthy 4-hourly job: recent success, recent schedule, no failures.
+        healthy = assess(
+            cj("cred-broker", "0 */4 * * *", last_ok="2026-07-26T11:00:00Z",
+               last_sched="2026-07-26T11:00:00Z"), [], now, 2)
+        assert healthy["status"] == "ok", healthy
+        assert healthy["tolerance_seconds"] == 2 * 4 * 3600 + 900
+
+        # REGRESSION (found by the induced-failure test, not by this selftest):
+        # the grace must never dwarf the period. A flat 900s grace gave a
+        # 1-minute CronJob a 17-minute window in which it could have zero Jobs
+        # and zero successes and still report "ok".
+        assert tolerance_for(60) == 180, "fast schedules must not inherit a 15m grace"
+        assert tolerance_for(4 * 3600) == 2 * 4 * 3600 + 900, "slow schedules keep it"
+        minutely = assess(cj("fast", "* * * * *", last_sched="2026-07-26T11:59:30Z",
+                             created="2026-07-26T11:50:00Z"), [], now, 2)
+        assert minutely["status"] == "never_succeeded", minutely
+        assert minutely["surviving_jobs"] == 0
+
+        # THE #381 SCENARIO, still with Jobs present: two consecutive failures.
+        failing = assess(
+            cj("cred-broker", "0 */4 * * *", last_ok="2026-06-07T00:00:00Z",
+               last_sched="2026-07-26T11:00:00Z"),
+            [job("cred-broker", "2026-07-26T08:00:00Z", "failed"),
+             job("cred-broker", "2026-07-26T11:00:00Z", "failed")],
+            now, 2)
+        assert failing["status"] == "failing", failing
+        assert failing["consecutive_failures"] == 2
+
+        # THE SAME SCENARIO AFTER GC — zero surviving Jobs. This is the case that
+        # went unnoticed for seven weeks and it MUST NOT read as ok.
+        gcd = assess(
+            cj("cred-broker", "0 */4 * * *", last_ok="2026-06-07T00:00:00Z",
+               last_sched="2026-07-26T11:00:00Z"), [], now, 2)
+        assert gcd["consecutive_failures"] == 0, "no Jobs left to count"
+        assert gcd["status"] == "stale", gcd
+        assert gcd["surviving_jobs"] == 0
+
+        # Stopped being scheduled at all (controller wedged / schedule removed).
+        assert assess(cj("x", "0 */4 * * *", last_ok="2026-07-26T11:00:00Z",
+                         last_sched="2026-07-20T00:00:00Z"), [], now, 2
+                      )["status"] == "not_scheduled"
+
+        # Never succeeded even once — postgres-backup's live shape today.
+        never = assess(cj("postgres-backup", "15 2 * * *",
+                          last_sched="2026-07-26T02:15:00Z"), [], now, 2)
+        assert never["status"] == "never_succeeded", never
+
+        # A CronJob created moments ago must not be flagged before it can run.
+        assert assess(cj("fresh", "0 */4 * * *", created="2026-07-26T11:59:00Z"),
+                      [], now, 2)["status"] == "ok"
+
+        # Suspended is a finding, not silence.
+        assert assess(cj("s", "0 */4 * * *", last_ok="2026-07-26T11:00:00Z",
+                         last_sched="2026-07-26T11:00:00Z", suspend=True), [], now, 2
+                      )["status"] == "suspended"
+
+        # A success clears the streak; an in-flight run does not.
+        assert consecutive_failures([
+            job("a", "2026-07-26T09:00:00Z", "failed"),
+            job("a", "2026-07-26T10:00:00Z", "succeeded"),
+            job("a", "2026-07-26T11:00:00Z", "failed"),
+            job("a", "2026-07-26T11:30:00Z", "active"),
+        ]) == 1
+
+        # Annotation overrides the estimate: read as daily this is healthy, but
+        # pinned to a 60s period the 3h-old success is stale.
+        pinned = cj("o", "0 6 * * *", last_ok="2026-07-26T09:00:00Z",
+                    last_sched="2026-07-26T11:59:00Z")
+        assert assess(pinned, [], now, 2)["status"] == "ok"
+        pinned["metadata"]["annotations"] = {PERIOD_ANNOTATION: "60"}
+        assert assess(pinned, [], now, 2)["status"] == "stale"
+
+        # Ownership grouping ignores Jobs owned by nobody we track.
+        grouped = group_jobs([cj("a", "* * * * *")],
+                             [job("a", "2026-07-26T11:00:00Z", "failed"),
+                              job("b", "2026-07-26T11:00:00Z", "failed")])
+        assert len(grouped["a"]) == 1 and "b" not in grouped
+
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: job-watchdog
+  namespace: factory
+  labels: { app: job-watchdog }
+spec:
+  # Every 30 minutes. The tightest thing it guards is cred-broker at 4-hourly, so
+  # a broken rotation is recorded within half an hour of its second failed run
+  # rather than seven weeks later. It emits to a stream, not a pager, so this
+  # cadence costs ~300 small records a day and wakes nobody.
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: { labels: { app: job-watchdog } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          serviceAccountName: job-watchdog
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: watchdog
+              # Stock python; the script is stdlib-only so no custom image.
+              image: python:3.12-slim
+              command: ["python3", "/script/watchdog.py"]
+              env:
+                - { name: NAMESPACE, value: "factory" }
+                - { name: FAIL_THRESHOLD, value: "2" }
+                - { name: OO_STREAM, value: "job_health" }
+                - { name: OO_ORG, value: "default" }
+                # Same observe-root secret apps/audit-siem-forward already uses.
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: job-watchdog-script
