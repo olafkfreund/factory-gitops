@@ -224,6 +224,22 @@ spec:
             # being in the path. GITHUB_TOKEN (factory-secrets) is the fetch/label
             # credential.
             - { name: AIFACTORY_INTAKE_POLLER, value: "false" }
+            # AIFactory#1064 orphaned-task reaper. A task's status is written
+            # by the worker running it, so when that worker dies nothing writes
+            # the terminal status and the card shows as active forever --
+            # 089-memory-chain-probe-three sat at in_progress for 36 hours.
+            #
+            # REPORT-ONLY. It logs one JSON line per sweep naming every task it
+            # WOULD cancel and changes nothing. Flip REAPER_DRY_RUN to "false"
+            # only after reading those reports and confirming it names real
+            # orphans -- enabling the loop and enabling writes are deliberately
+            # two separate decisions.
+            #
+            # Runs in this pod rather than a CronJob because the spec tree is on
+            # a ReadWriteOnce PVC: a separate pod scheduled onto another node
+            # reads an empty directory, reports zero orphans and exits 0.
+            - { name: AIFACTORY_STALE_REAPER, value: "true" }
+            - { name: REAPER_DRY_RUN, value: "true" }
             - { name: AIFACTORY_INTAKE_INTERVAL_S, value: "30" }
             - { name: AIFACTORY_URL, value: "http://localhost:3101" }
             # The poller calls its OWN /api/tasks/from-issue and authenticates
