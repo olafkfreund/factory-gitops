@@ -27,10 +27,45 @@ spec:
     metadata: { labels: { app: keycloak } }
     spec:
       enableServiceLinks: false
-      securityContext: { fsGroup: 1000 }
+      # Factory#521. This pod had `fsGroup: 1000` and nothing else — no
+      # runAsNonRoot, no seccompProfile, and the container had no
+      # securityContext at all. Keycloak is the IdP for the whole suite: if it
+      # is compromised, so is every oauth2-proxy in front of the cockpit, Odin
+      # and OpenObserve, plus the native OIDC on aifactory/pfactory/tfactory.
+      #
+      # uid 1000 is NUMERIC and is what the image already declares (measured:
+      # `docker image inspect --format '{{.Config.User}}'` -> `1000`). It also
+      # matches the existing fsGroup, which is what owns the keycloak-data PVC —
+      # a different uid here comes up unable to read its own realm database.
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: keycloak
           image: quay.io/keycloak/keycloak:26.1
+          # readOnlyRootFilesystem is DELIBERATELY ABSENT, and this is measured,
+          # not assumed. `start-dev` re-runs the Quarkus augmentation on every
+          # boot and REWRITES the runner jar under /opt/keycloak/lib/quarkus,
+          # which is on the root filesystem, not the data PVC. Run read-only as
+          # uid 1000 with cap-drop ALL against this exact tag and it dies before
+          # ever listening:
+          #
+          #   ERROR: Build failure: Build failed due to errors
+          #     [error]: Build step ...JarResultBuildStep#buildRunnerJar threw an
+          #     exception: java.nio.file.ReadOnlyFileSystemException
+          #
+          # exit 1, CrashLoopBackOff. An emptyDir over /opt/keycloak/lib/quarkus
+          # would MASK the baked augmentation output and force a full rebuild on
+          # every start — the 600s startupProbe budget below exists because that
+          # build is already the slow part. Closing this properly means moving
+          # off `start-dev` to a pre-augmented `start --optimized` image, which
+          # is a Keycloak deployment change, not a manifest one.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           args: ["start-dev"]
           env:
             - { name: KC_BOOTSTRAP_ADMIN_USERNAME, value: "admin" }

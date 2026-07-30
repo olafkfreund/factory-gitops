@@ -35,9 +35,25 @@ spec:
         app: oauth2-proxy-odin
     spec:
       enableServiceLinks: false
+      # Factory#521. Same set, same reasoning, same image as
+      # apps/cfactory-auth/ and apps/observe-auth/ — see the comment there.
+      # 65532 is NUMERIC and is what the image already declares.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: oauth2-proxy
           image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0
+          # readOnlyRootFilesystem measured: read-only + uid 65532 + cap-drop ALL
+          # answers GET /ping -> 200, which is the probe path below. Every input
+          # here is an env var from a Secret; cookie-backed sessions, no disk.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             - --provider=keycloak-oidc
             - --oidc-issuer-url=https://keycloak.freundcloud.org.uk/realms/factory
