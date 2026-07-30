@@ -82,7 +82,7 @@ jobs:
           python3 .github/scripts/check_cli_pins.py \
             AIFactory="$RUNNER_TEMP/dockerfiles/AIFactory" \
             PFactory="$RUNNER_TEMP/dockerfiles/PFactory" \
-            TFactory="$RUNNER_TEMP/dockerfiles/TFactory" \
+            TFactory="apps/tfactory/manifests/manifests.yaml" \
             > "$RUNNER_TEMP/pins.txt"
           echo "Fleet-agreed pins:"; cat "$RUNNER_TEMP/pins.txt"
 
