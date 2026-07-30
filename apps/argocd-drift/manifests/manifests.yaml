@@ -1,0 +1,725 @@
+# ArgoCD sync-honesty watchdog -> OpenObserve (Factory#425).
+#
+# THE DEFECT THIS CLOSES: ArgoCD reports `Synced` against the revision it last
+# FETCHED, not against gitops HEAD. Three times across 2026-07-28/29 a service
+# ran a stale image while `kubectl get application` said Synced/Healthy, the
+# deploy workflow said success, and `kubectl rollout status` said successfully
+# rolled out. Every signal in the normal check sequence was green.
+#
+# WHY IT IS WORSE THAN A DELAY: twice the stranded commit was the fix the
+# author had just merged and was about to verify. Verification would have run
+# against the OLD code and reported the fix as not working, sending the next
+# investigation after a change that was never deployed. `Synced` does not just
+# fail to inform here, it actively misdirects.
+#
+# ROOT CAUSE, MEASURED NOT ASSUMED (see docs/argocd-sync-honesty.md):
+#   - factory-gitops has NO webhook, so ArgoCD only learns about commits by
+#     polling (`timeout.reconciliation`, default 180s).
+#   - the repo-server caches its `ls-remote` result in Redis under
+#     `git-refs|<repoURL>` with an INDEPENDENT 180s TTL. Observed live cycling
+#     180 -> 0 -> 180.
+#   - so the controller can reconcile an app AFTER a commit lands, get the
+#     cached pre-commit sha back, and record Synced against it. The issue
+#     comments show exactly that: reconciledAt 10:13:40Z, AFTER the push, still
+#     on the previous commit.
+#   - the two stack to ~360s of legitimate blindness. A controlled push
+#     measured on this cluster took 5m43s (343s) to reach all 27 apps, with 25
+#     of them reporting `Synced` against the previous commit for the first
+#     2m35s.
+#
+# THE TRAP THIS AVOIDS: lowering `timeout.reconciliation` alone fixes NOTHING,
+# because the repo-server keeps handing back the same 180s-cached sha -- the
+# app is "refreshed" three times against a stale answer and reports Synced each
+# time. A number lowered without checking is the same class of bug as the one
+# being fixed.
+#
+# TWO SIGNALS, BECAUSE ONE IS NOT ENOUGH:
+#   1. REVISION BEHIND -- reported revision != the branch tip read from git.
+#      Catches the #425 incident. Gated on the tip being older than the
+#      tolerance, because a commit pushed seconds ago is legitimately not
+#      deployed yet.
+#   2. RECONCILE STALE -- status.reconciledAt older than tolerance. Signal 1
+#      goes blind whenever git happens not to have moved, so a controller that
+#      wedged during a quiet hour looks perfect to it. Signal 2 reads the
+#      timestamp of the last LOOK and is the only one that survives a quiet
+#      repo. "No news" must never read as OK.
+#
+# NO NEW DELIVERY PATH: reuses apps/job-watchdog's exact pattern -- stock
+# python image, stdlib-only script in a ConfigMap, the observe-root secret, and
+# the OpenObserve ingest path apps/audit-siem-forward already proves works.
+#
+# WHY IT EXITS 0 EVEN WHEN IT FINDS DRIFT: identical contract to
+# apps/job-watchdog. A watchdog that goes red on its findings is
+# indistinguishable from a watchdog that is itself broken. Non-zero here means
+# ONLY that this job could not do its work.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-drift
+  namespace: factory
+  labels: { app: argocd-drift }
+---
+# Least privilege, following the apps/cred-broker and apps/job-watchdog
+# precedent: a namespaced Role, no ClusterRole, read-only, and only the one
+# resource kind it reads. The `default` AppProject would permit a ClusterRole
+# (clusterResourceWhitelist is `*`), which is exactly why it is not used.
+#
+# This Role lives in `argocd` -- where Applications are -- and is bound to a
+# ServiceAccount in `factory`. That cross-namespace binding is the whole reason
+# manifests/kustomization.yaml has no `namespace:` transformer.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-drift
+  namespace: argocd
+  labels: { app: argocd-drift }
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-drift
+  namespace: argocd
+  labels: { app: argocd-drift }
+subjects:
+  - kind: ServiceAccount
+    name: argocd-drift
+    namespace: factory
+roleRef:
+  kind: Role
+  name: argocd-drift
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-drift-script
+  namespace: factory
+  labels: { app: argocd-drift }
+data:
+  drift.py: |
+    #!/usr/bin/env python3
+    """Check every ArgoCD Application against the real HEAD of its git branch (#425).
+
+    THE DEFECT THIS CLOSES: ArgoCD's `Synced` means "synced to the revision I last
+    FETCHED", not "running what git says". On 2026-07-28 a tfactory image bump
+    landed in factory-gitops at 22:32:31Z; ArgoCD still reported
+    `sync=Synced health=Healthy revision=ce00dd49` -- the PREVIOUS commit -- while
+    the pod ran a 68-minute-old image. Nothing anywhere said otherwise.
+
+    Every other verification in this fleet rests on "what is deployed is what is in
+    git". ArgoCD's status is the only thing asserting that, and it asserts it
+    without re-checking. This job re-checks it, from outside ArgoCD, against the
+    git remote itself.
+
+    WHY NOT JUST TRUST A SHORTER POLL: because the poll interval is not the whole
+    story and lowering it alone changes nothing. Measured on this cluster: the
+    repo-server caches its `ls-remote` result in Redis under
+    `git-refs|<repoURL>` with an INDEPENDENT 180s TTL. The controller's
+    `timeout.reconciliation` is also 180s. Dropping the controller timeout to 60s
+    leaves the repo-server handing back the same 180s-stale sha, so the app is
+    "refreshed" three times against a cached answer and reports Synced each time.
+    A number lowered without checking is exactly the class of bug this file exists
+    to catch.
+
+    TWO SIGNALS, BECAUSE ONE IS NOT ENOUGH:
+      1. REVISION BEHIND -- app.status.sync.revision != the branch tip in git.
+         Gated on the tip being older than DRIFT_TOLERANCE_SECONDS, because a
+         commit pushed 20 seconds ago is legitimately not deployed yet. This is
+         the signal that catches the #425 incident.
+      2. RECONCILE STALE -- now - app.status.reconciledAt > RECONCILE_TOLERANCE.
+         Signal 1 goes blind if the controller wedges while git happens not to
+         have moved: revision == HEAD, everything green, nothing looking. Signal 2
+         reads the timestamp of the last LOOK, so a controller that stopped
+         reconciling is visible even when no commit has landed to expose it.
+      Signal 2 is the one that survives a quiet repo. "No news" must never read
+      as OK.
+
+    A sync status this job cannot evaluate (Unknown, missing revision) is reported
+    as a finding, never skipped. rolehunter sits in exactly that state today: its
+    kustomization fails to build, ArgoCD reports sync=Unknown, and until now
+    nothing said so.
+
+    Exit codes: 0 = reported (whatever the findings), 2 = no OpenObserve
+    credentials, 3 = kubernetes API unreachable, 4 = OpenObserve ingest failed,
+    5 = could not reach ANY git remote. Non-zero means THIS JOB is broken, never
+    that a watched Application is -- same contract as apps/job-watchdog.
+
+    Env:
+      DRIFT_TOLERANCE_SECONDS     grace after a commit lands (default 600)
+      RECONCILE_TOLERANCE_SECONDS max age of status.reconciledAt (default 900)
+      OBSERVE_URL / OO_ORG / OO_STREAM / OO_USER / OO_PASS  as job-watchdog
+      GITHUB_API                  override for the commit-date lookup
+    """
+
+    import base64
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+    # Grace between a commit landing and every app being expected to carry it.
+    # Floor is set by the two independent 180s timers measured on this cluster
+    # (controller reconciliation + repo-server git-refs cache) which can stack to
+    # ~360s, plus manifest generation and rollout. 600s leaves headroom without
+    # hiding a real stall. Tighten this only after tightening BOTH timers.
+    DEFAULT_DRIFT_TOLERANCE = 600
+
+    # How long ArgoCD may go without LOOKING at an app before that is itself the
+    # finding. 5x the 180s reconciliation timeout: tolerant of one skipped burst
+    # and a slow repo-server, intolerant of a wedged controller.
+    DEFAULT_RECONCILE_TOLERANCE = 900
+
+    # ponytail: read the branch tip straight off git's smart-HTTP endpoint rather
+    # than the GitHub REST API. Same thing ArgoCD's repo-server does, needs no
+    # token, and -- the reason it matters -- is not subject to the 60 req/hr
+    # unauthenticated REST limit that this cluster's single egress IP shares with
+    # every other job. The REST API is used for ONE thing (the tip's commit date)
+    # and only when a mismatch has already been found, so a quiet cluster makes
+    # zero API calls.
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def _parse_ts(raw: str) -> datetime:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+    def _dur(seconds: float) -> str:
+        s = int(seconds)
+        if s < 120:
+            return f"{s}s"
+        if s < 7200:
+            return f"{s // 60}m"
+        if s < 172800:
+            return f"{s / 3600:.1f}h"
+        return f"{s / 86400:.1f}d"
+
+
+    def parse_pkt_refs(body: bytes) -> dict:
+        """git smart-HTTP /info/refs pkt-line stream -> {refname: sha}.
+
+        Each record is a 4-hex length prefix (counting itself) followed by the
+        payload; '0000' is a flush packet. The first ref line carries a NUL and
+        the server capability list, which is discarded.
+        """
+        refs: dict = {}
+        i = 0
+        while i + 4 <= len(body):
+            try:
+                n = int(body[i : i + 4], 16)
+            except ValueError:
+                break
+            if n == 0:  # flush
+                i += 4
+                continue
+            if n < 4 or i + n > len(body):
+                break
+            line = body[i + 4 : i + n]
+            i += n
+            line = line.split(b"\x00", 1)[0].strip()
+            if line.startswith(b"#"):  # "# service=git-upload-pack"
+                continue
+            parts = line.split(b" ", 1)
+            if len(parts) == 2 and len(parts[0]) == 40:
+                refs[parts[1].decode(errors="replace")] = parts[0].decode()
+        return refs
+
+
+    def resolve_tip(repo_url: str, target_revision: str, timeout: int = 30) -> str:
+        """Branch/tag tip sha for a repo, straight from the git remote.
+
+        A targetRevision that is already a 40-char sha is returned unchanged -- an
+        app pinned to a sha cannot drift from its branch by definition.
+        """
+        rev = (target_revision or "HEAD").strip()
+        if len(rev) == 40 and all(c in "0123456789abcdef" for c in rev.lower()):
+            return rev.lower()
+        url = repo_url.rstrip("/").removesuffix(".git") + "/info/refs?service=git-upload-pack"
+        req = urllib.request.Request(url, headers={"user-agent": "git/2.43.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            refs = parse_pkt_refs(r.read())
+        for candidate in (
+            f"refs/heads/{rev}",
+            f"refs/tags/{rev}^{{}}",
+            f"refs/tags/{rev}",
+            rev,
+        ):
+            if candidate in refs:
+                return refs[candidate]
+        if rev in ("HEAD", ""):
+            for name, sha in refs.items():
+                if name in ("refs/heads/main", "refs/heads/master"):
+                    return sha
+        raise KeyError(f"{rev} not found in {repo_url} ({len(refs)} refs)")
+
+
+    def head_commit_age(repo_url: str, sha: str, now: datetime, api: str) -> float | None:
+        """Seconds since `sha` was committed, or None if it cannot be determined.
+
+        None means UNKNOWN, and assess() treats unknown as "old enough to judge" --
+        failing closed. A drift check that goes quiet because it could not read a
+        timestamp would be the same lie in a new place.
+        """
+        slug = repo_url.rstrip("/").removesuffix(".git").split("github.com/")[-1]
+        try:
+            req = urllib.request.Request(
+                f"{api}/repos/{slug}/commits/{sha}",
+                headers={"accept": "application/vnd.github+json", "user-agent": "argocd-drift"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = json.load(r)
+            return (now - _parse_ts(body["commit"]["committer"]["date"])).total_seconds()
+        except Exception as e:  # noqa: BLE001
+            eprint(f"warn: commit date for {slug}@{sha[:10]} unavailable: {e!r}")
+            return None
+
+
+    def assess(app: dict, tip: str | None, tip_age: float | None, now: datetime,
+               drift_tol: int, reconcile_tol: int) -> dict:
+        """Pure: one Application + the true branch tip -> one drift record."""
+        meta = app.get("metadata") or {}
+        spec = app.get("spec") or {}
+        status = app.get("status") or {}
+        src = spec.get("source") or {}
+        sync = status.get("sync") or {}
+
+        reported = sync.get("revision") or ""
+        sync_status = sync.get("status") or "Unknown"
+        health = (status.get("health") or {}).get("status") or "Unknown"
+
+        reconciled_raw = status.get("reconciledAt")
+        reconciled_age = (
+            None if not reconciled_raw else (now - _parse_ts(reconciled_raw)).total_seconds()
+        )
+
+        problems: list[tuple[str, str]] = []
+
+        if tip is None:
+            problems.append(
+                ("tip_unknown",
+                 "CANNOT VERIFY: the git remote could not be reached, so this "
+                 f"app's reported revision {reported[:10] or '(none)'} is "
+                 "unchecked. Its sync status is not evidence of anything")
+            )
+        elif not reported:
+            problems.append(
+                ("no_revision",
+                 f"ArgoCD reports NO revision at all (sync={sync_status}). "
+                 f"Branch tip is {tip[:10]}. Nothing to compare -- the app has "
+                 "never been successfully compared against git")
+            )
+        elif reported != tip:
+            # A commit that landed seconds ago is legitimately not deployed yet.
+            # Unknown age fails CLOSED: unverifiable is not the same as fine.
+            if tip_age is None or tip_age > drift_tol:
+                age_txt = "age unknown" if tip_age is None else f"{_dur(tip_age)} old"
+                problems.append(
+                    ("revision_behind",
+                     f"BEHIND GIT: reports revision {reported[:10]} but "
+                     f"{src.get('targetRevision', '?')} is at {tip[:10]} "
+                     f"({age_txt} > {_dur(drift_tol)} tolerance). "
+                     f"sync={sync_status} health={health} -- that green status "
+                     "describes the OLD revision")
+                )
+
+        if sync_status not in ("Synced", "OutOfSync"):
+            problems.append(
+                ("sync_unevaluated",
+                 f"sync status is {sync_status} -- ArgoCD could not compare this "
+                 "app against git at all, so neither Synced nor OutOfSync is "
+                 "being claimed and nothing else reports it")
+            )
+
+        if reconciled_age is None:
+            problems.append(
+                ("never_reconciled",
+                 "has NO reconciledAt timestamp -- ArgoCD has never completed a "
+                 "comparison for this app")
+            )
+        elif reconciled_age > reconcile_tol:
+            problems.append(
+                ("reconcile_stale",
+                 f"NOT RECONCILED for {_dur(reconciled_age)} "
+                 f"(> {_dur(reconcile_tol)} tolerance). Its sync status is a "
+                 "cached opinion from that long ago, whatever it says")
+            )
+
+        return {
+            "_timestamp": int(now.timestamp() * 1_000_000),
+            "source": "argocd-drift",
+            "application": meta.get("name", "?"),
+            "repo_url": src.get("repoURL", ""),
+            "target_revision": src.get("targetRevision", ""),
+            "reported_revision": reported,
+            "git_tip_revision": tip or "",
+            "sync_status": sync_status,
+            "health_status": health,
+            "status": problems[0][0] if problems else "ok",
+            "problems": [p[1] for p in problems],
+            "revision_matches_git": bool(tip and reported == tip),
+            "git_tip_age_seconds": None if tip_age is None else int(tip_age),
+            "reconciled_age_seconds": None if reconciled_age is None else int(reconciled_age),
+            "drift_tolerance_seconds": drift_tol,
+            "reconcile_tolerance_seconds": reconcile_tol,
+        }
+
+
+    def k8s_get(path: str):
+        with open(f"{SA}/token") as f:
+            token = f.read().strip()
+        req = urllib.request.Request(
+            f"https://kubernetes.default.svc{path}",
+            headers={"authorization": f"Bearer {token}", "accept": "application/json"},
+            method="GET",
+        )
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            return json.load(r)
+
+
+    def emit(oo: str, org: str, stream: str, basic: str, records: list[dict]) -> None:
+        req = urllib.request.Request(
+            f"{oo}/api/{org}/{stream}/_json",
+            data=json.dumps(records).encode(),
+            headers={"authorization": f"Basic {basic}", "content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.load(r)
+        st = (res.get("status") or [{}])[0] if isinstance(res.get("status"), list) else res
+        if isinstance(st, dict) and st.get("failed"):
+            raise RuntimeError(f"OpenObserve rejected {st['failed']} record(s): {res}")
+
+
+    def build_records(apps: list[dict], now: datetime, drift_tol: int, reconcile_tol: int,
+                      api: str) -> tuple[list[dict], int]:
+        """Resolve each distinct (repo, revision) once, then assess every app.
+
+        Returns (records, reachable_remote_count). Apps sharing a repo share one
+        ls-remote, which is why 29 apps cost one request, not 29.
+        """
+        sources = {
+            ((a.get("spec") or {}).get("source") or {}).get("repoURL", ""):
+                ((a.get("spec") or {}).get("source") or {}).get("targetRevision", "")
+            for a in apps
+        }
+        pairs = {
+            (((a.get("spec") or {}).get("source") or {}).get("repoURL", ""),
+             ((a.get("spec") or {}).get("source") or {}).get("targetRevision", ""))
+            for a in apps
+        }
+        del sources
+        tips: dict = {}
+        for repo, rev in sorted(pairs):
+            if not repo:
+                continue
+            try:
+                tips[(repo, rev)] = resolve_tip(repo, rev)
+            except Exception as e:  # noqa: BLE001
+                eprint(f"warn: cannot resolve {repo}@{rev or 'HEAD'}: {e!r}")
+                tips[(repo, rev)] = None
+
+        # Commit dates cost a REST call, so only look them up for pairs that
+        # actually mismatch somewhere.
+        ages: dict = {}
+        for key, tip in tips.items():
+            if not tip:
+                continue
+            if any(
+                ((a.get("status") or {}).get("sync") or {}).get("revision") not in (tip, None, "")
+                for a in apps
+                if (((a.get("spec") or {}).get("source") or {}).get("repoURL", ""),
+                    ((a.get("spec") or {}).get("source") or {}).get("targetRevision", "")) == key
+            ):
+                ages[key] = head_commit_age(key[0], tip, now, api)
+
+        records = []
+        for a in sorted(apps, key=lambda a: a["metadata"]["name"]):
+            src = (a.get("spec") or {}).get("source") or {}
+            key = (src.get("repoURL", ""), src.get("targetRevision", ""))
+            records.append(
+                assess(a, tips.get(key), ages.get(key), now, drift_tol, reconcile_tol)
+            )
+        return records, sum(1 for t in tips.values() if t)
+
+
+    def main() -> int:
+        drift_tol = int(os.environ.get("DRIFT_TOLERANCE_SECONDS", DEFAULT_DRIFT_TOLERANCE))
+        reconcile_tol = int(
+            os.environ.get("RECONCILE_TOLERANCE_SECONDS", DEFAULT_RECONCILE_TOLERANCE)
+        )
+        api = os.environ.get("GITHUB_API", "https://api.github.com").rstrip("/")
+        oo = os.environ.get(
+            "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
+        ).rstrip("/")
+        org = os.environ.get("OO_ORG", "default")
+        stream = os.environ.get("OO_STREAM", "argocd_drift")
+        user, pw = os.environ.get("OO_USER", ""), os.environ.get("OO_PASS", "")
+        if not user or not pw:
+            eprint("FATAL: OO_USER/OO_PASS not set (observe-root secret missing)")
+            return 2
+        basic = base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+        try:
+            apps = k8s_get(
+                "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications"
+            )["items"]
+        except Exception as e:  # noqa: BLE001 -- cannot see == cannot report
+            eprint(f"FATAL: kubernetes API unreachable: {e!r}")
+            return 3
+
+        now = datetime.now(timezone.utc)
+        records, reachable = build_records(apps, now, drift_tol, reconcile_tol, api)
+
+        if apps and reachable == 0:
+            # Every record would read "tip_unknown". Emitting a wall of
+            # unverifiable is worse than admitting the job could not run.
+            eprint("FATAL: no git remote was reachable -- nothing could be verified")
+            return 5
+
+        for r in records:
+            if r["status"] == "ok":
+                eprint(f"ok       {r['application']}  @{r['reported_revision'][:10]}")
+            else:
+                eprint(f"DRIFTED  {r['application']} [{r['status']}]")
+                for p in r["problems"]:
+                    eprint(f"         - {p}")
+
+        try:
+            emit(oo, org, stream, basic, records)
+        except Exception as e:  # noqa: BLE001 -- a dropped record is a blind spot
+            eprint(f"FATAL: cannot emit to OpenObserve stream '{stream}': {e!r}")
+            return 4
+
+        bad = [r["application"] for r in records if r["status"] != "ok"]
+        eprint(
+            f"reported {len(records)} Application(s) to '{stream}': "
+            f"{len(records) - len(bad)} ok, {len(bad)} drifted"
+            + (f" ({', '.join(bad)})" if bad else "")
+        )
+        # Exit 0 on findings BY DESIGN, as apps/job-watchdog: a red job must mean
+        # the watchdog is broken, not that a watched Application is.
+        return 0
+
+
+    def _selftest() -> int:
+        now = datetime(2026, 7, 28, 22, 40, tzinfo=timezone.utc)
+        TIP = "4774777c1e" + "0" * 30
+        OLD = "ce00dd49c4" + "0" * 30
+
+        # pkt-line parsing, including the capability NUL on the first ref line.
+        def pkt(payload: bytes) -> bytes:
+            return f"{len(payload) + 4:04x}".encode() + payload
+
+        body = (
+            pkt(b"# service=git-upload-pack\n")
+            + b"0000"
+            + pkt(b"a" * 40 + b" refs/heads/main\x00symref=HEAD:refs/heads/main\n")
+            + pkt(b"b" * 40 + b" refs/heads/core-mvp-foundation\n")
+            + b"0000"
+        )
+        refs = parse_pkt_refs(body)
+        assert refs["refs/heads/main"] == "a" * 40, refs
+        assert refs["refs/heads/core-mvp-foundation"] == "b" * 40, refs
+        assert parse_pkt_refs(b"") == {}
+        assert parse_pkt_refs(b"garbage") == {}
+
+        def app(name, rev, sync="Synced", health="Healthy",
+                reconciled="2026-07-28T22:39:00Z", target="main",
+                repo="https://github.com/olafkfreund/factory-gitops"):
+            return {
+                "metadata": {"name": name},
+                "spec": {"source": {"repoURL": repo, "targetRevision": target}},
+                "status": {
+                    "sync": {"revision": rev, "status": sync},
+                    "health": {"status": health},
+                    **({"reconciledAt": reconciled} if reconciled else {}),
+                },
+            }
+
+        # THE #425 INCIDENT, as it actually was: the tfactory app sat on the
+        # previous commit and never moved until a human forced a hard refresh.
+        # ArgoCD said Synced/Healthy the whole time.
+        incident = assess(app("tfactory", OLD), TIP, 20 * 60, now, 600, 900)
+        assert incident["status"] == "revision_behind", incident
+        assert incident["revision_matches_git"] is False
+        assert "Synced" in incident["problems"][0], incident
+
+        # HONEST LIMIT, recorded so nobody assumes otherwise: the incident was
+        # REPORTED 7m47s after the commit landed (22:32:31Z commit, 22:40:18Z
+        # issue), and at that instant this check is deliberately still quiet.
+        # The floor is physical -- reconciliation 180s + git-refs cache 180s can
+        # stack to 360s of legitimate blindness -- so a tolerance below that
+        # cries wolf on every normal deploy. This check catches a stall that
+        # PERSISTS, which is the one nobody is standing there watching.
+        # DEFAULT_DRIFT_TOLERANCE can drop once the webhook removes the poll.
+        assert assess(app("tfactory", OLD), TIP, 467, now, 600, 900)["status"] == "ok"
+
+        # THE OTHER DIRECTION: an app genuinely at the tip must stay ok, or the
+        # fix has just painted everything red and taught everyone to ignore it.
+        fine = assess(app("pfactory", TIP), TIP, 20 * 60, now, 600, 900)
+        assert fine["status"] == "ok", fine
+        assert fine["revision_matches_git"] is True
+        assert fine["problems"] == []
+
+        # A commit that landed 30 seconds ago is legitimately not deployed yet.
+        fresh = assess(app("tfactory", OLD), TIP, 30, now, 600, 900)
+        assert fresh["status"] == "ok", fresh
+
+        # ...but the SAME mismatch one second past tolerance is a finding. This
+        # pair is the mutation check: a tolerance that swallowed everything, or a
+        # comparison stuck on True, passes one line and fails the other.
+        assert assess(app("tfactory", OLD), TIP, 601, now, 600, 900)[
+            "status"] == "revision_behind"
+
+        # Unknown commit age fails CLOSED. Unverifiable must not read as fine.
+        assert assess(app("tfactory", OLD), TIP, None, now, 600, 900)[
+            "status"] == "revision_behind"
+
+        # Unreachable remote: the app is not "ok", it is unverified.
+        unver = assess(app("tfactory", TIP), None, None, now, 600, 900)
+        assert unver["status"] == "tip_unknown", unver
+
+        # rolehunter's live shape today: kustomize build fails, sync=Unknown.
+        # Right revision, green health, and still a finding.
+        rh = assess(app("rolehunter", TIP, sync="Unknown"), TIP, 8 * 60, now, 600, 900)
+        assert rh["status"] == "sync_unevaluated", rh
+
+        # OutOfSync is NOT a drift finding -- ArgoCD is telling the truth there,
+        # and duplicating its own signal is noise.
+        assert assess(app("kyverno", TIP, sync="OutOfSync"), TIP, 8 * 60, now, 600, 900)[
+            "status"] == "ok"
+
+        # THE QUIET-REPO CASE: revision == tip, everything green, but the
+        # controller stopped looking 40 minutes ago. Signal 1 sees nothing here;
+        # signal 2 is the only thing that catches a wedged controller.
+        wedged = assess(
+            app("aifactory", TIP, reconciled="2026-07-28T22:00:00Z"), TIP, 8 * 60, now, 600, 900)
+        assert wedged["status"] == "reconcile_stale", wedged
+        assert assess(app("aifactory", TIP, reconciled=None), TIP, 8 * 60, now, 600, 900)[
+            "status"] == "never_reconciled"
+
+        # No revision at all is a finding, not a silent skip.
+        assert assess(app("x", ""), TIP, 8 * 60, now, 600, 900)["status"] == "no_revision"
+
+        # An app pinned to a sha cannot drift from a branch; resolve_tip short
+        # -circuits without touching the network.
+        assert resolve_tip("https://example.invalid/x", "C" * 40) == "c" * 40
+
+        # build_records must resolve each (repo, revision) ONCE, not once per app.
+        calls: list = []
+        real_tip, real_age = globals()["resolve_tip"], globals()["head_commit_age"]
+        globals()["resolve_tip"] = lambda r, v, **k: (calls.append((r, v)), TIP)[1]
+        globals()["head_commit_age"] = lambda *a, **k: 20 * 60
+        try:
+            recs, reachable = build_records(
+                [app("a", TIP), app("b", OLD), app("c", TIP),
+                 app("s", TIP, repo="https://github.com/olafkfreund/SkillAi",
+                     target="core-mvp-foundation")],
+                now, 600, 900, "https://api.github.com")
+        finally:
+            globals()["resolve_tip"], globals()["head_commit_age"] = real_tip, real_age
+        assert len(calls) == 2, calls  # two distinct (repo, revision) pairs, four apps
+        assert reachable == 2
+        assert [r["status"] for r in recs] == [
+            "ok", "revision_behind", "ok", "ok"], [r["status"] for r in recs]
+
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: argocd-drift
+  namespace: factory
+  labels: { app: argocd-drift }
+spec:
+  # Every 5 minutes. The window this guards is ~360s wide by construction
+  # (180s reconciliation + 180s git-refs cache), so a cadence longer than that
+  # could step over a whole stall between runs. It emits to a stream, not a
+  # pager: ~29 small records per run, ~8k records a day, and wakes nobody.
+  #
+  # Cost of the cadence, stated rather than hidden: one `ls-remote` per
+  # DISTINCT (repo, branch) per run -- currently 3, not 29, because apps
+  # sharing a repo share the lookup. That is ~36 unauthenticated git requests
+  # an hour to github.com, against no published rate limit for the smart-HTTP
+  # info/refs endpoint. The GitHub REST API is touched at most once per run and
+  # only when a mismatch already exists, keeping a quiet cluster at zero REST
+  # calls and well clear of the 60/hr unauthenticated limit this cluster's
+  # single egress IP shares with everything else.
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: { labels: { app: argocd-drift } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          serviceAccountName: argocd-drift
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: drift
+              # Stock python; the script is stdlib-only so no custom image and
+              # nothing to rebuild when it changes.
+              image: python:3.12-slim
+              command: ["python3", "/script/drift.py"]
+              env:
+                - { name: OO_STREAM, value: "argocd_drift" }
+                - { name: OO_ORG, value: "default" }
+                # 600s. The floor is the ~360s of legitimate blindness above;
+                # this leaves headroom so a normal deploy never cries wolf.
+                # LOWER IT once the GitHub webhook is live -- with the webhook
+                # the measured convergence was 37s, so 180s would be generous.
+                # Do not lower it before then: see docs/argocd-sync-honesty.md.
+                - { name: DRIFT_TOLERANCE_SECONDS, value: "600" }
+                # 5x the 180s reconciliation timeout: tolerant of one skipped
+                # burst and a slow repo-server, intolerant of a wedged
+                # controller.
+                - { name: RECONCILE_TOLERANCE_SECONDS, value: "900" }
+                # Same observe-root secret apps/job-watchdog already uses.
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: argocd-drift-script
