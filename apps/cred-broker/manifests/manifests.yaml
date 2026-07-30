@@ -50,10 +50,18 @@ data:
     Stdlib only. Never prints a token value. Exits non-zero on any failure so a
     broken broker is visible as CronJob failures rather than silently letting the
     credential lapse.
+
+    Every exit also states how much life the CURRENT access token has left, and
+    is recorded as annotations on the Secret. Factory#437: this job failed 18
+    times over three days and the diagnosis had to be reproduced by hand,
+    because the pod carrying the fatal message is deleted (Factory#438) and
+    because "refresh failed" alone does not say whether the fleet has minutes or
+    a year of runway. It had a year, and was triaged as an outage.
     """
 
     import base64
     import json
+    import re
     import ssl
     import sys
     import time
@@ -71,10 +79,27 @@ data:
     SECRET = "factory-cli-creds"
     KEY = "claude-credentials.json"
     SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    ANN = "cred-broker.factory.dev"
+
+    # A refresh token this grant can use lives ~30d. Anything claiming months of
+    # access is a long-lived `claude setup-token`, which this broker cannot
+    # refresh at all — worth saying out loud rather than reporting it as an
+    # imminent outage.
+    LONG_LIVED_DAYS = 30
 
 
     def eprint(*a):
         print(*a, file=sys.stderr, flush=True)
+
+
+    def redact(s):
+        # The provider has no reason to echo the token back, but a log line is
+        # forever. Cheap to make that structurally impossible.
+        return re.sub(r"sk-ant-[A-Za-z0-9_-]+", "sk-ant-<redacted>", s)
+
+
+    def iso(ms):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000))
 
 
     def k8s(method, path, body=None, content_type="application/json"):
@@ -92,14 +117,56 @@ data:
             return json.load(r)
 
 
+    def record(outcome, detail, expires_at_ms=None):
+        """Write this run's outcome onto the Secret as annotations.
+
+        The pod does not survive the failure (Factory#438), so stderr is not a
+        durable channel. The Secret is: the broker already holds `patch` on it,
+        it outlives every Job, and `kubectl get secret factory-cli-creds
+        -o jsonpath='{.metadata.annotations}'` answers "what happened and how
+        urgent is it" without needing a live pod.
+
+        Best-effort — diagnostics must never mask or alter the real failure, and
+        never carry token material (the outcome is a fixed code, not the body).
+        """
+        ann = {
+            f"{ANN}/last-run": iso(time.time() * 1000),
+            f"{ANN}/last-outcome": outcome,
+            f"{ANN}/last-detail": detail[:120],
+        }
+        if expires_at_ms:
+            ann[f"{ANN}/access-expires-at"] = iso(expires_at_ms)
+        try:
+            k8s(
+                "PATCH",
+                f"/api/v1/namespaces/{NS}/secrets/{SECRET}",
+                {"metadata": {"annotations": ann}},
+                content_type="application/merge-patch+json",
+            )
+        except Exception as e:  # noqa: BLE001
+            eprint(f"warn: could not record outcome on the Secret: {type(e).__name__}")
+
+
     def main() -> int:
         # 1. Read the current credential out of the Secret.
         sec = k8s("GET", f"/api/v1/namespaces/{NS}/secrets/{SECRET}")
         raw = json.loads(base64.b64decode(sec["data"][KEY]).decode())
         oauth = raw.get("claudeAiOauth", raw)
+
+        # Runway of the credential as it stands. Reported on every exit: a
+        # failed refresh with a year of access left and one with an hour left
+        # are the same log line today, and they are not the same incident.
+        exp_ms = oauth.get("expiresAt")
+        if exp_ms:
+            days_left = (exp_ms / 1000 - time.time()) / 86400
+            runway = f"access token valid until {iso(exp_ms)} ({days_left:.1f}d left)"
+        else:
+            days_left, runway = None, "access token expiry UNKNOWN (no expiresAt)"
+
         rt = oauth.get("refreshToken")
         if not rt:
-            eprint("FATAL: no refreshToken in the Secret — needs a human re-seed")
+            eprint(f"FATAL: no refreshToken in the Secret — needs a human re-seed. {runway}")
+            record("no-refresh-token", "Secret has no refreshToken", exp_ms)
             return 2
 
         # 2. Refresh (rotates both tokens).
@@ -120,19 +187,34 @@ data:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 tok = json.load(resp)
         except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:300]
+            detail = redact(e.read().decode(errors="replace")[:300])
             eprint(f"FATAL: refresh HTTP {e.code}: {detail}")
-            if e.code == 400 and "invalid_grant" in detail:
+            eprint(runway)
+            bad_grant = e.code == 400 and "invalid_grant" in detail
+            if bad_grant:
                 eprint(
                     "the refresh token was consumed elsewhere or expired — a human "
                     "must re-seed the Secret from a fresh `claude auth login`"
                 )
+                if days_left is not None and days_left > LONG_LIVED_DAYS:
+                    eprint(
+                        f"NOTE: the access token still has {days_left:.0f} days left, so "
+                        "this is a BROKEN ROTATION, not an imminent outage. A credential "
+                        "with this much runway came from `claude setup-token`, whose "
+                        "refresh token this grant cannot use — the 4h refresh cycle does "
+                        "not apply to it and never will. Re-seed with `claude auth login` "
+                        "(8h token + usable refresh token) or retire the broker for this "
+                        "credential. See Factory#437."
+                    )
+            code = "invalid_grant" if bad_grant else f"http_{e.code}"
+            record(f"refresh-rejected:{code}", f"HTTP {e.code} {code}", exp_ms)
             return 3
 
         at = tok.get("access_token")
         expires_in = tok.get("expires_in")
         if not at or expires_in is None:
-            eprint(f"FATAL: unexpected refresh response keys: {sorted(tok)}")
+            eprint(f"FATAL: unexpected refresh response keys: {sorted(tok)}. {runway}")
+            record("bad-refresh-response", f"keys={sorted(tok)}"[:120], exp_ms)
             return 4
 
         oauth["accessToken"] = at
@@ -148,7 +230,9 @@ data:
             {"data": {KEY: payload}},
             content_type="application/merge-patch+json",
         )
-        eprint(f"OK: credential refreshed, access TTL {int(expires_in) / 3600:.1f}h")
+        ttl_h = int(expires_in) / 3600
+        eprint(f"OK: credential refreshed, access TTL {ttl_h:.1f}h")
+        record("ok", f"access TTL {ttl_h:.1f}h", oauth["expiresAt"])
         return 0
 
 

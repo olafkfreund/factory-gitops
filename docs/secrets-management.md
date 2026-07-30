@@ -109,11 +109,101 @@ General shape for the manual (agenix) secrets:
   objects is required. See `docs/encryption-at-rest.md` "Rotating the KEK".
 
 - **factory-cli-creds** (Claude OAuth): normally hands-off (cred-broker). Only
-  needs a human when the refresh token is consumed/expired — re-seed from a
-  fresh `claude auth login` per the cred-broker script's fatal-path message.
+  needs a human when the refresh token is consumed/expired. Full procedure in
+  [Re-seeding the Claude OAuth credential](#re-seeding-the-claude-oauth-credential).
 
 - **oauth2-proxy-\*** cookie-secret: must be a 16/24/32-byte value; regenerate
   with `openssl rand -base64 32 | head -c 32`, then restart the proxy.
+
+## Re-seeding the Claude OAuth credential
+
+### First: read what the broker already told you
+
+Since Factory#437 the broker records every run on the Secret itself, so this
+works with no surviving pod:
+
+```sh
+kubectl --context factory -n factory get secret factory-cli-creds \
+  -o jsonpath='{.metadata.annotations.cred-broker\.factory\.dev/last-outcome}{"\n"}{.metadata.annotations.cred-broker\.factory\.dev/access-expires-at}{"\n"}'
+```
+
+- `access-expires-at` is the **access token** expiry, and it decides urgency.
+  A failing broker with months left on that date is a broken rotation, not an
+  outage — do not treat it as one.
+- `last-outcome` of `refresh-rejected:invalid_grant` is the case this section
+  covers.
+
+### Which login flow — this is the part that bites
+
+Two different Claude credentials can land in this Secret and only one of them
+works with the broker.
+
+| Flow | Access TTL | Refresh token usable by cred-broker? |
+|---|---|---|
+| `claude auth login` | ~8h | **Yes** — this is what the broker is built for |
+| `claude setup-token` | ~1 year | **No** — the broker fails `invalid_grant` forever |
+
+Factory#437 was a `setup-token` credential: the fleet was fine (364 days of
+access left) but every 4h refresh failed and would have kept failing after any
+number of re-seeds using the same flow. If you re-seed, use `claude auth login`.
+
+If you deliberately want the long-lived `setup-token` instead, then cred-broker
+is the wrong control for this credential — suspend it and monitor the expiry
+date rather than leaving a job to fail six times a day.
+
+### Procedure
+
+Rotate **both** Secrets. `factory-secrets/CLAUDE_CODE_OAUTH_TOKEN` and
+`factory-cli-creds/claude-credentials.json` must carry the same access token —
+the Claude SDK reads the mounted **file**, so fixing only the env var looks like
+it worked and does not.
+
+1. On a machine with the CLI, `claude auth login`. This writes
+   `~/.claude/.credentials.json`.
+
+2. Patch the file into `factory-cli-creds` without clobbering the sibling
+   codex/copilot/gemini keys. Keep the value off the command line:
+
+   ```sh
+   kubectl --context factory -n factory patch secret factory-cli-creds \
+     --type merge --patch-file /dev/stdin <<EOF
+   {"data":{"claude-credentials.json":"$(base64 -w0 ~/.claude/.credentials.json)"}}
+   EOF
+   ```
+
+3. Patch the matching access token into `factory-secrets`:
+
+   ```sh
+   kubectl --context factory -n factory patch secret factory-secrets \
+     --type merge --patch-file /dev/stdin <<EOF
+   {"data":{"CLAUDE_CODE_OAUTH_TOKEN":"$(python3 -c 'import json,base64,os;print(base64.b64encode(json.load(open(os.path.expanduser("~/.claude/.credentials.json")))["claudeAiOauth"]["accessToken"].encode()).decode())')"}}
+   EOF
+   ```
+
+4. Confirm the broker before waiting 4h for the schedule:
+
+   ```sh
+   kubectl --context factory -n factory create job cred-broker-verify --from=cronjob/cred-broker
+   kubectl --context factory -n factory get secret factory-cli-creds \
+     -o jsonpath='{.metadata.annotations.cred-broker\.factory\.dev/last-outcome}{"\n"}'
+   ```
+
+   Expect `ok`. The annotation is the check that works even though the pod is
+   deleted on failure (Factory#438).
+
+5. Bounce the consumers so they re-seed from the mount:
+
+   ```sh
+   kubectl --context factory -n factory rollout restart deploy/pfactory deploy/tfactory deploy/aifactory
+   ```
+
+### Do not share this credential with a workstation
+
+The broker's whole design is that the Secret is the *single* refresher, because
+Anthropic rotates the refresh token on every grant and the loser of that race
+gets `invalid_grant`. A laptop running `claude` against the same credential
+lineage is another refresher and will break the broker within one access TTL.
+Seed the cluster from its own login.
 
 ## Recommendation: encrypt secrets in git (adopt SOPS or ESO)
 

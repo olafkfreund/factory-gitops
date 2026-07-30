@@ -12,6 +12,13 @@
 # access token services seed is always valid and they never need to refresh —
 # no rotation race. Each refresh also rolls the refresh token forward, well
 # inside its ~30d TTL, so no human re-login is needed while the broker runs.
+#
+# This assumes a `claude auth login` credential (8h access, refreshable). A
+# `claude setup-token` credential (~1y access) has no refresh token this grant
+# can use, so the broker fails invalid_grant on every run forever — see
+# Factory#437 and docs/secrets-management.md "Re-seeding the Claude OAuth
+# credential". The broker now says which case it is in, and records the outcome
+# on the Secret so the diagnosis survives the pod.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
