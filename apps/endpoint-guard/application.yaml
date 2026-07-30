@@ -1,0 +1,42 @@
+# endpoint-guard — is every pod behind a Service actually able to serve it?
+#
+# The question none of the existing watchdogs answer. apps/job-watchdog asks
+# whether CronJobs are running; apps/argocd-drift asks whether ArgoCD's claimed
+# revision matches gitops HEAD; apps/fleet-match asks whether each service runs
+# the code on its repo's main. All three can be perfectly green while a Job pod
+# sits in a live Service answering real traffic with connection refused, because
+# nothing in that chain looks at Service membership at all.
+#
+# That gap cost this fleet five separate incidents in one day, filed by different
+# people as four unrelated flakes (TFactory#885, AIFactory#1107, Factory#456,
+# Factory#458) plus one found only by going looking (apps/minio). One line in the
+# hub's shared scripts/job_dispatch.py caused four of them.
+#
+# Findings go to a human as a GitHub issue on ALERT_REPO, reusing the delivery path
+# apps/job-watchdog already proves works. A healthy fleet produces nothing at all.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). Everything it
+# creates lives in `factory`, so the kustomization keeps its `namespace:`
+# transformer.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: endpoint-guard
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/endpoint-guard/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

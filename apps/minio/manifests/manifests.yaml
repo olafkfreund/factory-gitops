@@ -121,7 +121,29 @@ spec:
   backoffLimit: 6
   ttlSecondsAfterFinished: 600
   template:
-    metadata: { labels: { app: minio } }
+    # NOT app=minio. The `minio` Service selects exactly {app: minio}, and a
+    # Service selector is a SUBSET match, so this pod joined the Service as an
+    # endpoint. It runs `mc` and listens on nothing, so for as long as it was
+    # Running kube-proxy handed it a share of real traffic to minio:9000/9001
+    # and it answered with connection refused — roughly half of it, since the
+    # Service then had two endpoints and one real backend.
+    #
+    # What a human sees: artifact push/pull from AIFactory and TFactory failing
+    # intermittently right after an ArgoCD sync of this app, with MinIO Healthy,
+    # the Service present and both pods Running. It reads as flakiness. This Job
+    # is a PostSync hook, so it fires on every sync of apps/minio.
+    #
+    # Worse, it could stall its own startup: the container loops
+    # `until mc alias set fac http://minio.factory.svc...` and that loop can be
+    # dialled straight back to itself.
+    #
+    # Same defect as TFactory#885 (a browser-test Job took the portal it was
+    # testing offline) and AIFactory#1107 (task Jobs joined the aifactory API
+    # Service). Nothing selects on this pod's labels: there are no
+    # NetworkPolicies in this namespace, no ServiceMonitors, and the Job's OWN
+    # metadata.labels above keep app=minio, so `kubectl get jobs -l app=minio`
+    # is unaffected. Only pods route traffic.
+    metadata: { labels: { app: minio-create-bucket } }
     spec:
       restartPolicy: OnFailure
       enableServiceLinks: false
