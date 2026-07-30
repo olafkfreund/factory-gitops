@@ -1,0 +1,93 @@
+# Validate every manifest this repo hands to ArgoCD.
+#
+# Until this existed, factory-gitops had exactly one workflow (cli-canary.yml),
+# which runs weekly and on its own files. Nothing checked the manifests. This is
+# the repo ArgoCD syncs to the live cluster, so a kustomization that fails to
+# build or a manifest with a bad schema reached the cluster with nothing in the
+# way -- the failure surfaced as an ArgoCD sync error after the fact, on the
+# only branch that matters.
+#
+# Deliberately NO `paths:` filter. A required status check that does not run on
+# a given PR leaves that PR blocked forever, so this must report on every PR.
+# The whole job takes about 20 seconds.
+#
+# Rule 4.7 (Factory standards): a gate that cannot run must FAIL, not pass. Every
+# way this job can fail to do its work is an explicit exit 1 below -- missing
+# tools, zero kustomizations discovered, a build that produces no output.
+name: manifest validation (blocking)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: kustomize build + schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kustomize and kubeconform
+        run: |
+          set -euo pipefail
+          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kustomize
+          curl -sfL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+          # Rule 4.7: prove the tools are usable before claiming anything passed.
+          # A download that 404s into a 0-byte file still leaves a file behind.
+          kustomize version
+          kubeconform -v
+
+      - name: Build and validate every kustomization
+        run: |
+          set -uo pipefail
+
+          mapfile -t DIRS < <(find . -name kustomization.yaml -not -path './.git/*' -printf '%h\n' | sort)
+
+          # The cli-canary bug this repo just fixed (#90/#92) was a gate that
+          # compared three greps without checking any had MATCHED. Same trap
+          # here: if a reorganisation moves the manifests, an unguarded loop
+          # iterates zero times and the job reports success having validated
+          # nothing. Absence is a failure, not a pass.
+          if [ "${#DIRS[@]}" -eq 0 ]; then
+            echo "::error::no kustomization.yaml found anywhere -- this gate validated nothing"
+            exit 1
+          fi
+          echo "discovered ${#DIRS[@]} kustomizations"
+
+          fail=0
+          for d in "${DIRS[@]}"; do
+            if ! built=$(kustomize build "$d" 2>&1); then
+              echo "::error file=$d/kustomization.yaml::kustomize build failed: $(printf '%s' "$built" | head -1)"
+              fail=1
+              continue
+            fi
+            # An empty build is not a passing build. kustomize exits 0 for a
+            # kustomization that resources its way to nothing, which would then
+            # sail through kubeconform as zero documents.
+            if [ -z "$(printf '%s' "$built" | tr -d '[:space:]')" ]; then
+              echo "::error file=$d/kustomization.yaml::kustomize build produced no output"
+              fail=1
+              continue
+            fi
+            # -ignore-missing-schemas: ArgoCD Application, Kyverno ClusterPolicy
+            # and KEDA ScaledObject are CRDs whose schemas are not in the
+            # upstream set. Their KINDS are skipped; every core kind is still
+            # checked strictly, and -strict rejects unknown fields, which is
+            # what catches a typo'd key that Kubernetes would silently drop.
+            if ! out=$(printf '%s' "$built" | kubeconform -strict -ignore-missing-schemas -summary - 2>&1); then
+              echo "::error file=$d/kustomization.yaml::schema validation failed"
+              printf '%s\n' "$out" | head -20
+              fail=1
+              continue
+            fi
+            echo "ok  $d"
+          done
+
+          exit "$fail"
