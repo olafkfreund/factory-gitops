@@ -1,0 +1,39 @@
+# fleet-match — is every Factory service running the code on its repo's `main`?
+#
+# The question apps/argocd-drift does NOT answer. That app checks ArgoCD's
+# claimed revision against factory-gitops HEAD, which can be perfectly in sync
+# while gitops holds a stale image tag because a deploy never ran. This one
+# covers the other half of the chain: repo main HEAD -> image built -> gitops
+# bumped -> ArgoCD synced -> pods actually running it, asserted as one
+# invariant so that a break at any link surfaces instead of hiding behind the
+# four links that are still green.
+#
+# Findings go to a human as a GitHub issue on ALERT_REPO, reusing the delivery
+# path apps/job-watchdog already proves works. A matching fleet, a deploy in
+# flight and a docs-only commit all produce nothing at all.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). Everything
+# it creates lives in `factory`, so unlike apps/argocd-drift the kustomization
+# keeps its `namespace:` transformer.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fleet-match
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/fleet-match/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

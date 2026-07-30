@@ -1,0 +1,1327 @@
+# fleet-match — is every service running the code on its repo's `main`?
+#
+# THE DEFECT THIS CLOSES: nothing in this fleet asserts, continuously, that a
+# running service corresponds to its repo. Every existing check covers one link
+# of the chain and trusts the rest:
+#   - the deploy workflow proves an image was built and a tag was bumped, then
+#     stops looking;
+#   - apps/argocd-drift proves ArgoCD's `Synced` is honest against GITOPS HEAD
+#     — which can be perfectly true while gitops holds a stale tag because a
+#     deploy never ran at all;
+#   - `kubectl rollout status` proves the pods carry the manifest, and says
+#     nothing about whether the manifest carries main.
+# So a break at any single link is invisible: every other signal stays green
+# and the service quietly serves old code. postgres-backup ran broken for 5.6
+# days and rolehunter for 47 before a human happened to look.
+#
+# THE INVARIANT, asserted end to end rather than link by link:
+#     the image running in the cluster corresponds to that repo's main HEAD,
+#     OR a deploy for that HEAD is legitimately still in flight
+# main HEAD -> image built and pushed -> gitops `newTag` bumped -> ArgoCD
+# synced -> pods actually running it. One assertion covers all five links,
+# because a break at any of them surfaces as the same mismatch.
+#
+# TWO SIGNALS, BECAUSE ONE IS NOT ENOUGH:
+#   A. DELIVERY — the last sha the deploy workflow successfully built is not
+#      what the Deployment asks for, or not what any READY pod is running.
+#      Reads both, because they break separately: a gitops bump that never
+#      synced leaves the manifest stale, an ImagePullBackOff leaves the
+#      manifest perfect and every serving pod on the old image.
+#   B. BUILD — main HEAD never became a successful deploy run. Signal A is
+#      blind here by construction: a commit that never built leaves the
+#      previous build delivered flawlessly, so every downstream link is green
+#      while main has moved on. This is the live `paths-ignore` hazard —
+#      agent prompts live in `apps/backend/prompts/*.md`, are baked into the
+#      runtime image, and match deploy.yml's `**/*.md` ignore rule.
+#
+# IN FLIGHT IS A FACT, NOT A GUESS. Requirement one of not crying wolf is
+# telling a deploy in progress from a deploy that never happened, so this asks
+# the GitHub Actions API whether a run for that sha is queued or running and
+# stays silent while one is. Elapsed time is only the fallback for the window
+# AFTER a run completes — the ArgoCD blind window, ~360s wide by construction
+# (two independent 180s timers: `timeout.reconciliation` and the repo-server's
+# Redis `git-refs` cache) with one live convergence measured at 5m43s. The 900s
+# tolerance is timed from the deploy run's COMPLETION, so it does not also have
+# to cover a ~6 minute build, and two services that were mismatched at 09:50 on
+# 2026-07-30 and converged by 09:59 sit comfortably inside it.
+#
+# UNEVALUABLE IS A FINDING, NEVER A SKIP. If the GitHub API or the cluster
+# cannot be read for a service, that service is reported as `unevaluable` and
+# routed to a human, and it escalates to critical if it stays that way. "I
+# could not check" must never render as "everything matches": rolehunter hid
+# for 47 days behind an ArgoCD status of `Unknown` that nothing treated as a
+# problem.
+#
+# AND IT SHUTS UP. A fleet that matches produces zero GitHub traffic. So does a
+# deploy in flight, and so does a docs-only commit that deploy.yml skipped on
+# purpose — all four repos publish a Jekyll blog from `docs/` on main, so
+# alerting on those would make this noise within a day, and a muted alarm is
+# the same silence this exists to end.
+#
+# NO NEW DELIVERY PATH: the notification is a GitHub issue on ALERT_REPO, the
+# same channel apps/job-watchdog already proves delivers, with the same
+# marker-in-body dedup, the same two severities, the same 24h re-notify on
+# critical and the same auto-close on recovery. There is still no Slack
+# webhook, SMTP relay or pager anywhere in this fleet, and inventing one to fix
+# a notification gap is the wrong trade.
+#
+# WHY IT EXITS 0 EVEN WHEN IT FINDS PROBLEMS: identical contract to
+# apps/job-watchdog and apps/argocd-drift. A watchdog that goes red on its
+# findings is indistinguishable from a watchdog that is itself broken. Non-zero
+# means ONLY that this job could not do its work — including a notification it
+# could not deliver, which is the same bug one layer up.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-match
+  namespace: factory
+  labels: { app: fleet-match }
+---
+# Least privilege, following the apps/cred-broker, apps/job-watchdog and
+# apps/argocd-drift precedent: a namespaced Role, no ClusterRole, read-only,
+# and only the two resource kinds it reads. Pods as well as Deployments,
+# because "the manifest asks for it" and "a pod is running it" are different
+# claims and this app exists precisely because such gaps go unnoticed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fleet-match
+  namespace: factory
+  labels: { app: fleet-match }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-match
+  namespace: factory
+  labels: { app: fleet-match }
+subjects:
+  - kind: ServiceAccount
+    name: fleet-match
+    namespace: factory
+roleRef:
+  kind: Role
+  name: fleet-match
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-match-script
+  namespace: factory
+  labels: { app: fleet-match }
+data:
+  match.py: |
+    #!/usr/bin/env python3
+    """Is every Factory service running the code that is on its repo's `main`? (#N)
+
+    THE INVARIANT, asserted end to end rather than link by link:
+
+        the image running in the cluster corresponds to that repo's main HEAD,
+        OR a deploy for that HEAD is legitimately still in flight
+
+    The chain behind it is: main HEAD -> deploy workflow builds and pushes an
+    image -> the workflow bumps `newTag` in factory-gitops -> ArgoCD syncs it ->
+    pods actually run it. A break at ANY link surfaces as the same mismatch, which
+    is why this asserts the whole chain once instead of checking five links.
+
+    TWO SIGNALS, BECAUSE ONE IS NOT ENOUGH:
+      A. DELIVERY  -- the last sha the deploy workflow successfully built is not
+         what the Deployment asks for (`spec_behind`) or not what any ready pod is
+         running (`rollout_behind`). This is the gitops/ArgoCD/rollout half.
+      B. BUILD     -- main HEAD never became a successful deploy run at all
+         (`build_missing`) or its run failed (`build_failed`). Signal A is blind
+         here by construction: if a commit never built, the last successful build
+         is delivered perfectly and everything downstream is green while main has
+         moved on. That is exactly how a prompt-only commit under `paths-ignore`
+         goes live nowhere and nothing says so.
+
+    IN FLIGHT IS A FACT, NOT A GUESS. A mismatch during a running deploy is normal,
+    so this asks the GitHub Actions API whether a run for that sha is queued or in
+    progress and stays silent if one is. Elapsed time is only the fallback for the
+    window AFTER a run has completed -- the ArgoCD blind window, measured on this
+    cluster at ~360s by construction (two independent 180s timers: the controller's
+    `timeout.reconciliation` and the repo-server's Redis `git-refs` cache) with one
+    convergence observed at 5m43s. TOLERANCE_SECONDS defaults to 900s: 2.5x the
+    measured convergence, timed from the moment the deploy run COMPLETED rather
+    than from the commit, so it does not have to also cover a ~6 minute build.
+
+    UNEVALUABLE IS A FINDING, NEVER A SKIP. If the GitHub API, the registry state
+    or the cluster cannot be read, that is reported as `unevaluable`. "I could not
+    check" must never render as "everything matches": rolehunter sat broken for 47
+    days behind an ArgoCD status of `Unknown` that nothing treated as a problem.
+
+    Exit codes: 0 = reported (whatever the findings), 2 = missing credentials,
+    3 = kubernetes API unreachable, 4 = OpenObserve ingest failed, 5 = the
+    notification could not be delivered. Non-zero means THIS JOB is broken, never
+    that a watched service is -- the same contract as apps/job-watchdog and
+    apps/argocd-drift. 5 counts as much as the rest: an alert path that is not
+    proven to deliver is the same bug one layer up.
+
+    Env:
+      NAMESPACE                 namespace holding the Deployments (default factory)
+      TARGETS_JSON              override the service/repo/Deployment map
+      TOLERANCE_SECONDS         silence window after a deploy run completes (900)
+      CRITICAL_AFTER_SECONDS    a mismatch older than this is critical (3600)
+      DEPLOY_WORKFLOW           workflow file name (deploy.yml)
+      OBSERVE_URL/OO_ORG/OO_STREAM/OO_USER/OO_PASS   as apps/job-watchdog
+      ALERT_REPO                owner/repo to raise issues on
+      ALERT_RENOTIFY_HOURS      re-comment cadence for critical (24)
+      GITHUB_TOKEN              token with `repo` + `actions:read` on the above
+    """
+
+    import base64
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+    # Window in which a mismatch is normal, timed from the deploy run's COMPLETION.
+    # Floor is the ~360s of ArgoCD blindness measured on this cluster (two stacked
+    # 180s timers) plus rollout and image pull; one live convergence took 5m43s.
+    # 900s leaves headroom so a routine deploy never cries wolf, and is still three
+    # orders of magnitude under the failures this exists to catch (postgres-backup
+    # broken 5.6 days, rolehunter 47 days). Lower it once the ArgoCD webhook is
+    # installed -- with the webhook the measured convergence was 37s -- and not
+    # before: see docs/argocd-sync-honesty.md.
+    DEFAULT_TOLERANCE = 900
+
+    # Beyond this a mismatch stops being a slow deploy and becomes a stranded one.
+    # 4x the tolerance, and ~6x the slowest convergence ever measured here.
+    DEFAULT_CRITICAL_AFTER = 3600
+
+    # service -> repo -> the Deployments that must carry its image. One record per
+    # SERVICE, not per Deployment: cfactory ships two images from one repo, and a
+    # build that never happened is one fault, not two issues in the same inbox.
+    DEFAULT_TARGETS = [
+        {"service": "aifactory", "repo": "olafkfreund/AIFactory",
+         "deployments": [["aifactory", "ghcr.io/olafkfreund/aifactory"]]},
+        {"service": "pfactory", "repo": "olafkfreund/PFactory",
+         "deployments": [["pfactory", "ghcr.io/olafkfreund/pfactory"]]},
+        {"service": "tfactory", "repo": "olafkfreund/TFactory",
+         "deployments": [["tfactory", "ghcr.io/olafkfreund/tfactory"]]},
+        # cfactory-frontend is covered here rather than skipped: it is a separate
+        # image and a separate Deployment, so it can be left behind on its own
+        # while the backend is current, and the cockpit is the one surface a human
+        # actually looks at.
+        {"service": "cfactory", "repo": "olafkfreund/CFactory",
+         "deployments": [["cfactory", "ghcr.io/olafkfreund/cfactory"],
+                         ["cfactory-frontend", "ghcr.io/olafkfreund/cfactory-frontend"]]},
+    ]
+
+
+    def deployment_relevant(filename: str) -> bool:
+        """Would this changed file have changed the runtime image?
+
+        deploy.yml carries `paths-ignore: ['docs/**', '**/*.md']`, so a docs-only
+        push deliberately produces no deploy run and main legitimately sits ahead
+        of what is deployed. Forgiving that is what keeps this quiet at rest -- all
+        four repos publish a Jekyll blog from `docs/_posts` on main.
+
+        The exception is the reason this function exists at all rather than being a
+        two-line filter: agent prompts live in `apps/backend/prompts/*.md` and ARE
+        baked into the runtime image, so `**/*.md` silently drops a change that
+        alters what the service does. A prompt-only commit merges, deploys nowhere,
+        and every status stays green. This calls that out instead of forgiving it.
+        ponytail: one substring, not a manifest of baked paths -- add to the tuple
+        when a second ignored-but-baked directory appears.
+        """
+        if "prompts/" in filename:
+            return True
+        if filename.startswith("docs/"):
+            return False
+        return not filename.endswith(".md")
+
+
+    def carries(tag: str, sha: str) -> bool:
+        """Does image tag `sha-abc1234` correspond to full commit sha `sha`?
+
+        Tag length is whatever `git rev-parse --short` produced, so compare by
+        prefix -- but require at least 7 hex chars, or a truncated/garbage tag
+        would match everything and this whole app would report success forever.
+        """
+        if not tag or not sha or not tag.startswith("sha-"):
+            return False
+        short = tag[4:]
+        return len(short) >= 7 and sha.lower().startswith(short.lower())
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def _parse_ts(raw: str) -> datetime:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+    def _dur(seconds) -> str:
+        if seconds is None:
+            return "unknown"
+        s = int(seconds)
+        if s < 120:
+            return f"{s}s"
+        if s < 7200:
+            return f"{s // 60}m"
+        if s < 172800:
+            return f"{s / 3600:.1f}h"
+        return f"{s / 86400:.1f}d"
+
+
+    def latest_success(runs: list) -> dict | None:
+        """Newest deploy run that actually succeeded -- what SHOULD be live.
+
+        Not `runs[0]`: `cancel-in-progress: true` means every burst of pushes
+        leaves a trail of `cancelled` runs, and three of AIFactory's five most
+        recent runs are cancelled right now. Reading the newest run instead of the
+        newest SUCCESSFUL one would compare pods against a sha that was never built.
+        """
+        for r in runs:
+            if r.get("conclusion") == "success":
+                return r
+        return None
+
+
+    def assess(target: dict, head: str | None, head_age: float | None,
+               runs: list | None, deps: list, change_class: str | None,
+               now: datetime, tol: int, crit: int) -> dict:
+        """Pure: one service's git, CI and cluster state -> one match record."""
+        service, repo = target["service"], target["repo"]
+        problems: list[tuple[str, str]] = []
+        notes: list[str] = []
+        ages: list[float] = []
+
+        exp_run = latest_success(runs) if runs is not None else None
+        expected = exp_run["sha"] if exp_run else None
+        exp_age = exp_run["age"] if exp_run else None
+
+        if runs is None:
+            problems.append(
+                ("unevaluable",
+                 f"CANNOT VERIFY: the deploy-run history for {repo} could not be "
+                 "read, so nothing can be said about what should be running. This "
+                 "is a blind spot, not a pass")
+            )
+        elif expected is None:
+            problems.append(
+                ("unevaluable",
+                 f"CANNOT VERIFY: {repo} has no successful deploy run on main at "
+                 "all, so there is no sha to hold the cluster to")
+            )
+
+        # ---- Signal A: DELIVERY. built sha -> gitops -> ArgoCD -> running pod.
+        for d in deps:
+            name = d["name"]
+            if not d["exists"]:
+                problems.append(
+                    ("deployment_missing",
+                     f"Deployment `{name}` does not exist in the namespace at all "
+                     "-- the service is not running, never mind running main")
+                )
+                continue
+            if expected is None:
+                continue
+            if not carries(d["spec_sha"] or "", expected):
+                if exp_age is not None and exp_age <= tol:
+                    notes.append("deploying")
+                    continue
+                ages.append(exp_age if exp_age is not None else 0)
+                problems.append(
+                    ("spec_behind",
+                     f"BEHIND MAIN: Deployment `{name}` asks for "
+                     f"`{d['spec_sha'] or '(no matching image)'}` but the image "
+                     f"built from main is `sha-{expected[:7]}`, whose deploy "
+                     f"succeeded {_dur(exp_age)} ago (> {_dur(tol)} tolerance). "
+                     "The gitops bump or the ArgoCD sync did not land")
+                )
+            elif not any(carries(t, expected) for t in d["running"]):
+                if exp_age is not None and exp_age <= tol:
+                    notes.append("deploying")
+                    continue
+                ages.append(exp_age if exp_age is not None else 0)
+                problems.append(
+                    ("rollout_behind",
+                     f"NOT ROLLED OUT: Deployment `{name}` asks for "
+                     f"`sha-{expected[:7]}` but no ready pod is running it "
+                     f"(ready pods: {', '.join(d['running']) or 'none'}). The "
+                     f"manifest landed {_dur(exp_age)} ago and the rollout did not"
+                     " complete -- image pull, crash loop or unschedulable")
+                )
+
+        # ---- Signal B: BUILD. main HEAD -> a successful deploy run.
+        # Blind spot of signal A by construction: a commit that never built leaves
+        # the previous build delivered perfectly, so every downstream link is green
+        # while main has moved on.
+        if head is None:
+            problems.append(
+                ("unevaluable",
+                 f"CANNOT VERIFY: main HEAD of {repo} could not be read, so the "
+                 "running image is unchecked against anything")
+            )
+        elif runs is not None and expected is not None and expected != head:
+            for_head = [r for r in runs if r["sha"] == head]
+            if any(r.get("status") != "completed" for r in for_head):
+                notes.append("deploying")  # in flight: a fact from the API
+            elif for_head:
+                if head_age is None or head_age > tol:
+                    ages.append(head_age or 0)
+                    concl = for_head[0].get("conclusion") or "?"
+                    problems.append(
+                        ("build_failed",
+                         f"STRANDED ON MAIN: commit `{head[:7]}` landed "
+                         f"{_dur(head_age)} ago and its deploy run concluded "
+                         f"`{concl}`. Nothing built from it, so nothing can be "
+                         "running it however green the cluster looks")
+                    )
+            elif change_class == "ignorable":
+                notes.append("docs_only")
+            elif head_age is not None and head_age <= tol:
+                notes.append("deploying")
+            elif change_class == "relevant":
+                ages.append(head_age or 0)
+                problems.append(
+                    ("build_missing",
+                     f"NEVER DEPLOYED: commit `{head[:7]}` landed "
+                     f"{_dur(head_age)} ago and triggered NO deploy run, but it "
+                     "changes files that are baked into the runtime image. "
+                     "deploy.yml's `paths-ignore` skipped a change that matters "
+                     "(agent prompts under `prompts/` are `*.md` and ARE shipped)")
+                )
+            else:
+                problems.append(
+                    ("unevaluable",
+                     f"CANNOT VERIFY: commit `{head[:7]}` triggered no deploy run "
+                     "and its changed files could not be read, so whether it "
+                     "needed deploying is unknown. Unknown is not fine")
+                )
+
+        status = problems[0][0] if problems else (notes[0] if notes else "ok")
+        return {
+            "_timestamp": int(now.timestamp() * 1_000_000),
+            "source": "fleet-match",
+            "service": service,
+            "repo": repo,
+            "head_sha": head or "",
+            "head_age_seconds": None if head_age is None else int(head_age),
+            "expected_sha": expected or "",
+            "expected_age_seconds": None if exp_age is None else int(exp_age),
+            "deployments": [
+                {"name": d["name"], "exists": d["exists"],
+                 "spec_tag": d["spec_sha"] or "", "running_tags": d["running"]}
+                for d in deps
+            ],
+            "status": status,
+            # ALL codes, not just the leading one, so severity grades the whole
+            # finding. A service that is both build_failed and spec_behind must not
+            # be graded off whichever happened to be found first.
+            "codes": [p[0] for p in problems],
+            "problems": [p[1] for p in problems],
+            "matches_main": not problems and status == "ok",
+            "behind_seconds": int(max(ages)) if ages else None,
+            "tolerance_seconds": tol,
+            "critical_after_seconds": crit,
+        }
+
+
+    # --------------------------------------------------------------------------
+    # Notification. Same path, same discipline and same state machine as
+    # apps/job-watchdog: GitHub issues on ALERT_REPO, dedup on a marker in the
+    # BODY (so the title may change severity wording without orphaning the issue
+    # and filing a rival beside it), open once, escalate on severity change,
+    # re-comment only on critical and only every ALERT_RENOTIFY_HOURS, close on
+    # recovery, close orphans out loud. No second delivery path is invented here:
+    # there is still no Slack webhook, SMTP relay or pager anywhere in this fleet,
+    # and a GitHub issue reaches the maintainer without them going looking.
+    #
+    # It is a separate implementation rather than an import of job-watchdog's
+    # ConfigMap ON PURPOSE: mounting another ArgoCD Application's ConfigMap makes
+    # this job crash-loop if that app is ever renamed or removed, which is a worse
+    # failure than the sixty lines below. If a third consumer appears, extract a
+    # shared module then -- two is not a library.
+    #
+    # One deliberate difference: issues are matched by marker across ALL open
+    # issues, not only those carrying the label. A human who strips the label must
+    # not cause a rival issue to be filed next to the one they are already working.
+    # --------------------------------------------------------------------------
+
+    ISSUE_LABEL = "fleet-match"
+    SEVERITY_LABELS = {"critical": "severity:critical", "warning": "severity:warning"}
+    MARKER = "<!-- fleet-match:{service} -->"
+
+    # Worst-first. The title is the notification email's subject line, read in a
+    # list on a phone, so it must name the reason that DROVE the severity rather
+    # than the first problem found.
+    TITLE_PHRASE = [
+        ("deployment_missing", "is not deployed at all"),
+        ("spec_behind", "is running an image older than main"),
+        ("rollout_behind", "has not rolled out the image built from main"),
+        ("build_failed", "has a commit on main that failed to build"),
+        ("build_missing", "has a commit on main that never deployed"),
+        ("unevaluable", "cannot be verified against main"),
+    ]
+
+
+    def issue_title(record: dict, sev: str) -> str:
+        codes = record.get("codes") or []
+        for code, phrase in TITLE_PHRASE:
+            if code in codes:
+                return f"[{sev}] {record['service']} {phrase}"
+        return f"[{sev}] {record['service']} does not match main"
+
+
+    def severity_of(record: dict, issue: dict | None, now: datetime) -> str | None:
+        """critical | warning | None. None means matching -- say nothing.
+
+        Graded on DURATION, not on which code fired: a mismatch that is minutes old
+        is a slow deploy and at most a warning, one that is an hour old is stranded.
+
+        `unevaluable` and `deployment_missing` have no measurable age of their own,
+        so they escalate off the age of the issue already raised for them. Without
+        that, a permanent blind spot would sit at warning forever, which is how
+        rolehunter hid for 47 days behind `Unknown`.
+        """
+        if not record.get("codes"):
+            return None
+        age = record.get("behind_seconds")
+        if age is None:
+            age = 0 if issue is None else (
+                now - _parse_ts(issue["created_at"])).total_seconds()
+        return "critical" if age >= record["critical_after_seconds"] else "warning"
+
+
+    def issue_severity(issue: dict) -> str | None:
+        names = {l.get("name") for l in (issue.get("labels") or [])}
+        for sev, label in SEVERITY_LABELS.items():
+            if label in names:
+                return sev
+        return None
+
+
+    def notify_action(record: dict, issue: dict | None, now: datetime,
+                      renotify_hours: float) -> str | None:
+        """Pure. (record, its open issue or None) -> what to do. None = stay quiet.
+
+        Both halves matter equally. A service genuinely behind main with no issue
+        MUST produce one. A fleet that matches, and an already-reported mismatch,
+        MUST produce nothing at all -- an alert that repeats every ten minutes is
+        muted inside a week, and a muted alarm is the silence this exists to end.
+        """
+        sev = severity_of(record, issue, now)
+        if sev is None:
+            return "close" if issue else None
+        if issue is None:
+            return "open"
+        if sev != issue_severity(issue):
+            return "escalate"
+        if sev == "critical":
+            age = (now - _parse_ts(issue["updated_at"])).total_seconds()
+            if age >= renotify_hours * 3600:
+                return "renotify"
+        return None
+
+
+    def issue_body(record: dict, sev: str) -> str:
+        svc = record["service"]
+        lines = [
+            MARKER.format(service=svc),
+            f"**Severity: {sev.upper()}** — `{svc}` is not running the code on "
+            f"`{record['repo']}` main.",
+            "",
+            f"- main HEAD: `{record['head_sha'][:7] or 'unknown'}` "
+            f"({_dur(record['head_age_seconds'])} old)",
+            f"- last image built from main: `sha-{record['expected_sha'][:7]}` "
+            f"(deploy run completed {_dur(record['expected_age_seconds'])} ago)"
+            if record["expected_sha"] else "- last image built from main: none",
+        ]
+        for d in record["deployments"]:
+            if not d["exists"]:
+                lines.append(f"- `{d['name']}`: MISSING from the cluster")
+                continue
+            lines.append(
+                f"- `{d['name']}`: manifest `{d['spec_tag'] or '?'}`, ready pods "
+                f"running `{', '.join(d['running_tags']) or 'none'}`"
+            )
+        lines += ["", "What the check found:", ""]
+        lines += [f"- {p}" for p in record["problems"]]
+        lines += [
+            "",
+            f"Mismatch age {_dur(record['behind_seconds'])}; tolerance "
+            f"{_dur(record['tolerance_seconds'])}, critical past "
+            f"{_dur(record['critical_after_seconds'])}. In-flight deploys are read "
+            "from the GitHub Actions API, so a running deploy is never reported "
+            "here.",
+            "",
+            "Every record, including the matching ones, is in the OpenObserve "
+            f"stream `{os.environ.get('OO_STREAM', 'fleet_match')}`:",
+            "",
+            "```sql",
+            f"SELECT * FROM \"fleet_match\" WHERE service = '{svc}' "
+            "ORDER BY _timestamp DESC",
+            "```",
+            "",
+            "Raised automatically by the `fleet-match` CronJob, and it will be "
+            "closed automatically when the service matches main again. Closing it "
+            "by hand while the mismatch persists just opens a fresh one on the "
+            "next run.",
+        ]
+        return "\n".join(lines)
+
+
+    def gh(token: str, method: str, path: str, body: dict | None = None):
+        req = urllib.request.Request(
+            f"https://api.github.com{path}",
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "authorization": f"Bearer {token}",
+                "accept": "application/vnd.github+json",
+                "content-type": "application/json",
+                "user-agent": "factory-fleet-match",
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+    def ensure_labels(token: str, repo: str) -> None:
+        """Idempotent. A missing label would make issue creation 422 and the whole
+        notification fail -- the alarm silenced by its own first run."""
+        for name, color, desc in (
+            (ISSUE_LABEL, "0e8a16", "Raised by the fleet-match watchdog"),
+            (SEVERITY_LABELS["critical"], "b60205", "The service is stranded behind main"),
+            (SEVERITY_LABELS["warning"], "fbca04", "Behind main, may still be converging"),
+        ):
+            try:
+                gh(token, "POST", f"/repos/{repo}/labels",
+                   {"name": name, "color": color, "description": desc})
+            except urllib.error.HTTPError as e:
+                if e.code != 422:  # 422 = already exists
+                    raise
+
+
+    def open_match_issues(token: str, repo: str) -> dict:
+        """marker -> issue, over every OPEN issue on the repo.
+
+        Deliberately not filtered by label: an issue a human has taken over and
+        relabelled is still the issue for this finding, and filing a rival beside
+        it is how an alert channel loses its credibility.
+        """
+        out: dict = {}
+        for page in (1, 2, 3):
+            issues = gh(token, "GET",
+                        f"/repos/{repo}/issues?state=open&per_page=100&page={page}") or []
+            for i in issues:
+                for line in (i.get("body") or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("<!-- fleet-match:"):
+                        out.setdefault(line, i)
+                        break
+            if len(issues) < 100:
+                break
+        return out
+
+
+    def notify(token: str, repo: str, records: list, now: datetime,
+               renotify_hours: float) -> int:
+        """Route findings to a human. Returns the number of notifications sent."""
+        ensure_labels(token, repo)
+        existing = open_match_issues(token, repo)
+        sent = 0
+        for r in records:
+            key = MARKER.format(service=r["service"])
+            issue = existing.get(key)
+            action = notify_action(r, issue, now, renotify_hours)
+            if action is None:
+                continue
+            sev = severity_of(r, issue, now)
+            svc = r["service"]
+            if action == "open":
+                new = gh(token, "POST", f"/repos/{repo}/issues", {
+                    "title": issue_title(r, sev),
+                    "body": issue_body(r, sev),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                eprint(f"NOTIFIED  {svc} [{sev}] -> opened {repo}#{new['number']}")
+            elif action == "escalate":
+                was = issue_severity(issue)
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}", {
+                    "title": issue_title(r, sev),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Severity changed: **{was} -> {sev}**.\n\n"
+                            + issue_body(r, sev)})
+                eprint(f"NOTIFIED  {svc} [{was} -> {sev}] -> {repo}#{issue['number']}")
+            elif action == "renotify":
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Still `{r['status']}` after {renotify_hours:g}h with "
+                            f"no change.\n\n" + issue_body(r, sev)})
+                eprint(f"NOTIFIED  {svc} [still {sev}] -> {repo}#{issue['number']}")
+            elif action == "close":
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"MATCHED. `{svc}` now runs the image built from main "
+                            f"(`sha-{r['expected_sha'][:7]}`). Closing "
+                            "automatically."})
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+                   {"state": "closed", "state_reason": "completed"})
+                eprint(f"MATCHED   {svc} -> closed {repo}#{issue['number']}")
+            sent += 1
+
+        # ORPHANS: an open issue for a service that is no longer in the target map.
+        # Nothing else will ever close it, because closing is driven by a record and
+        # there is no longer a record. A permanent unactionable critical is what
+        # trains people to ignore the label. Said out loud, never closed silently.
+        seen = {MARKER.format(service=r["service"]) for r in records}
+        for key, issue in existing.items():
+            if key in seen:
+                continue
+            gone = key.split(":", 1)[1].rsplit(" ", 1)[0]
+            gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+               {"body": f"`{gone}` is no longer a watched service, so this finding "
+                        "can no longer be evaluated. Closing.\n\nIf it was not "
+                        "retired deliberately then its disappearance from the "
+                        "watch list is itself the problem, not the fix - an "
+                        "unwatched service produces no findings, only silence."})
+            gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+               {"state": "closed", "state_reason": "not_planned"})
+            eprint(f"UNWATCHED {gone} -> closed {repo}#{issue['number']}")
+            sent += 1
+        return sent
+
+
+    # --------------------------------------------------------------------------
+    # I/O
+    # --------------------------------------------------------------------------
+
+    def k8s_get(path: str):
+        with open(f"{SA}/token") as f:
+            token = f.read().strip()
+        req = urllib.request.Request(
+            f"https://kubernetes.default.svc{path}",
+            headers={"authorization": f"Bearer {token}", "accept": "application/json"},
+            method="GET",
+        )
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            return json.load(r)
+
+
+    def emit(oo: str, org: str, stream: str, basic: str, records: list) -> None:
+        req = urllib.request.Request(
+            f"{oo}/api/{org}/{stream}/_json",
+            data=json.dumps(records).encode(),
+            headers={"authorization": f"Basic {basic}", "content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.load(r)
+        st = (res.get("status") or [{}])[0] if isinstance(res.get("status"), list) else res
+        if isinstance(st, dict) and st.get("failed"):
+            raise RuntimeError(f"OpenObserve rejected {st['failed']} record(s): {res}")
+
+
+    def tag_of(image: str, image_repo: str) -> str | None:
+        """`ghcr.io/o/x:sha-abc1234` -> `sha-abc1234`, only for the wanted repo.
+
+        Matching on the image repo, not on container name or position: every
+        Factory Deployment also runs a `python:3.12-slim` cred-sync sidecar, and
+        reading containers[0] would compare the sidecar's tag against main.
+        """
+        if ":" not in image:
+            return None
+        name, _, tag = image.rpartition(":")
+        return tag if name == image_repo else None
+
+
+    def pod_ready(pod: dict) -> bool:
+        st = pod.get("status") or {}
+        if st.get("phase") != "Running":
+            return False
+        statuses = st.get("containerStatuses") or []
+        return bool(statuses) and all(c.get("ready") for c in statuses)
+
+
+    def deployment_state(name: str, image_repo: str, deployments: dict,
+                         pods: list) -> dict:
+        """What this Deployment ASKS for, and what its ready pods actually RUN.
+
+        Both, because they break separately: a gitops bump that never synced leaves
+        the manifest stale, while an ImagePullBackOff leaves the manifest correct
+        and every pod still serving the old image. Checking only one of them makes
+        the other invisible.
+        """
+        dep = deployments.get(name)
+        if dep is None:
+            return {"name": name, "exists": False, "spec_sha": None, "running": []}
+        spec = (dep.get("spec") or {})
+        containers = ((spec.get("template") or {}).get("spec") or {}).get("containers") or []
+        spec_tag = next(
+            (t for t in (tag_of(c.get("image", ""), image_repo) for c in containers) if t),
+            None,
+        )
+        selector = (spec.get("selector") or {}).get("matchLabels") or {}
+        running = []
+        for p in pods:
+            labels = (p.get("metadata") or {}).get("labels") or {}
+            if not selector or any(labels.get(k) != v for k, v in selector.items()):
+                continue
+            if not pod_ready(p):
+                continue
+            for c in (p.get("spec") or {}).get("containers") or []:
+                t = tag_of(c.get("image", ""), image_repo)
+                if t and t not in running:
+                    running.append(t)
+        return {"name": name, "exists": True, "spec_sha": spec_tag, "running": running}
+
+
+    def repo_state(token: str, repo: str, workflow: str, now: datetime):
+        """(head_sha, head_age, runs|None). None for runs means UNEVALUABLE."""
+        head, head_age = None, None
+        try:
+            c = gh(token, "GET", f"/repos/{repo}/commits/main")
+            head = c["sha"]
+            head_age = (now - _parse_ts(c["commit"]["committer"]["date"])).total_seconds()
+        except Exception as e:  # noqa: BLE001
+            eprint(f"warn: cannot read main HEAD of {repo}: {e!r}")
+        try:
+            raw = gh(token, "GET",
+                     f"/repos/{repo}/actions/workflows/{workflow}/runs"
+                     "?branch=main&per_page=30")
+            runs = [
+                {
+                    "sha": r["head_sha"],
+                    "status": r["status"],
+                    "conclusion": r.get("conclusion"),
+                    "age": (now - _parse_ts(r["updated_at"])).total_seconds(),
+                }
+                for r in (raw or {}).get("workflow_runs", [])
+            ]
+        except Exception as e:  # noqa: BLE001
+            eprint(f"warn: cannot read deploy runs of {repo}: {e!r}")
+            runs = None
+        return head, head_age, runs
+
+
+    def classify_change(token: str, repo: str, base: str, head: str) -> str | None:
+        """"relevant" | "ignorable" | None(unknown) for the commits base..head.
+
+        Fails CLOSED in two ways: an error returns None (reported as unevaluable,
+        never as fine), and a truncated file list is treated as relevant, because
+        "there might be a source file in the 301st entry" is not a pass.
+        """
+        try:
+            cmp = gh(token, "GET", f"/repos/{repo}/compare/{base}...{head}")
+        except Exception as e:  # noqa: BLE001
+            eprint(f"warn: cannot compare {repo} {base[:7]}...{head[:7]}: {e!r}")
+            return None
+        files = cmp.get("files") or []
+        if len(files) >= 300:
+            return "relevant"
+        return ("relevant"
+                if any(deployment_relevant(f.get("filename", "")) for f in files)
+                else "ignorable")
+
+
+    def build_records(token: str, targets: list, ns: str, workflow: str,
+                      now: datetime, tol: int, crit: int) -> list:
+        deployments = {
+            (d.get("metadata") or {}).get("name"): d
+            for d in k8s_get(f"/apis/apps/v1/namespaces/{ns}/deployments")["items"]
+        }
+        pods = k8s_get(f"/api/v1/namespaces/{ns}/pods")["items"]
+
+        records = []
+        for t in targets:
+            head, head_age, runs = repo_state(token, t["repo"], workflow, now)
+            deps = [deployment_state(name, image, deployments, pods)
+                    for name, image in t["deployments"]]
+            exp = latest_success(runs) if runs is not None else None
+            # One compare call, and only when HEAD is ahead of the last build --
+            # a fleet at rest makes none.
+            change = None
+            if exp and head and exp["sha"] != head:
+                change = classify_change(token, t["repo"], exp["sha"], head)
+            records.append(
+                assess(t, head, head_age, runs, deps, change, now, tol, crit))
+        return records
+
+
+    def main() -> int:
+        ns = os.environ.get("NAMESPACE", "factory")
+        tol = int(os.environ.get("TOLERANCE_SECONDS", DEFAULT_TOLERANCE))
+        crit = int(os.environ.get("CRITICAL_AFTER_SECONDS", DEFAULT_CRITICAL_AFTER))
+        workflow = os.environ.get("DEPLOY_WORKFLOW", "deploy.yml")
+        targets = json.loads(os.environ["TARGETS_JSON"]) if os.environ.get(
+            "TARGETS_JSON") else DEFAULT_TARGETS
+        oo = os.environ.get(
+            "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080").rstrip("/")
+        org = os.environ.get("OO_ORG", "default")
+        stream = os.environ.get("OO_STREAM", "fleet_match")
+        user, pw = os.environ.get("OO_USER", ""), os.environ.get("OO_PASS", "")
+        if not user or not pw:
+            eprint("FATAL: OO_USER/OO_PASS not set (observe-root secret missing)")
+            return 2
+        basic = base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+        repo = os.environ.get("ALERT_REPO", "")
+        token = os.environ.get("GITHUB_TOKEN", "")
+        renotify = float(os.environ.get("ALERT_RENOTIFY_HOURS", "24"))
+        # Checked up front and fatal. Without a token this job cannot read GitHub at
+        # ALL -- every service would report `unevaluable` and the notification that
+        # says so could not be delivered either. Running on anyway would be a green
+        # job that told nobody anything, which is the defect, not a degraded mode.
+        if not repo or not token:
+            eprint("FATAL: ALERT_REPO/GITHUB_TOKEN not set — there would be no path "
+                   "to a human, which is the defect this app exists to fix")
+            return 2
+
+        now = datetime.now(timezone.utc)
+        try:
+            records = build_records(token, targets, ns, workflow, now, tol, crit)
+        except Exception as e:  # noqa: BLE001 — cannot see == cannot report
+            eprint(f"FATAL: kubernetes API unreachable: {e!r}")
+            return 3
+
+        for r in records:
+            if not r["codes"]:
+                eprint(f"ok       {r['service']} [{r['status']}] "
+                       f"@sha-{r['expected_sha'][:7]}")
+            else:
+                eprint(f"MISMATCH {r['service']} [{r['status']}]")
+                for p in r["problems"]:
+                    eprint(f"         - {p}")
+
+        try:
+            emit(oo, org, stream, basic, records)
+        except Exception as e:  # noqa: BLE001 — a dropped record is a blind spot
+            eprint(f"FATAL: cannot emit to OpenObserve stream '{stream}': {e!r}")
+            return 4
+
+        bad = [r["service"] for r in records if r["codes"]]
+        eprint(f"reported {len(records)} service(s) to '{stream}': "
+               f"{len(records) - len(bad)} matching, {len(bad)} not"
+               + (f" ({', '.join(bad)})" if bad else ""))
+
+        # Emit FIRST, notify second: if GitHub is down the durable record still
+        # lands and the delivery failure below is visible in the stream.
+        try:
+            sent = notify(token, repo, records, now, renotify)
+        except Exception as e:  # noqa: BLE001 — an undelivered alert is the bug
+            eprint(f"FATAL: cannot notify via {repo}: {e!r}")
+            return 5
+        eprint(f"notifications sent: {sent} (silence when matching and when "
+               "already reported)")
+
+        # Exit 0 on findings BY DESIGN: a red job must mean this watchdog is
+        # broken, not that a watched service is.
+        return 0
+
+
+    def _selftest() -> int:
+        now = datetime(2026, 7, 30, 10, 6, tzinfo=timezone.utc)
+        HEAD = "306349329df1207bbfec5f5c7c4d8f351858deb8"
+        PREV = "0bfadd9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        T = {"service": "aifactory", "repo": "olafkfreund/AIFactory",
+             "deployments": [["aifactory", "ghcr.io/olafkfreund/aifactory"]]}
+
+        # ---- tag matching --------------------------------------------------
+        assert carries("sha-3063493", HEAD)
+        assert not carries("sha-0bfadd9", HEAD)
+        # A truncated tag must NOT match by prefix, or every service would report
+        # a match forever and this app would be worse than nothing.
+        assert not carries("sha-306", HEAD)
+        assert not carries("", HEAD) and not carries("latest", HEAD)
+        assert tag_of("ghcr.io/olafkfreund/aifactory:sha-306", "ghcr.io/olafkfreund/aifactory") == "sha-306"
+        # The cred-sync sidecar must never be mistaken for the service image.
+        assert tag_of("python:3.12-slim", "ghcr.io/olafkfreund/aifactory") is None
+
+        # ---- what deploy.yml's paths-ignore forgives, and what it must not --
+        assert deployment_relevant("src/app/main.py")
+        assert not deployment_relevant("docs/_posts/2026-07-30-thing.md")
+        assert not deployment_relevant("README.md")
+        # THE HAZARD: agent prompts are *.md and ARE baked into the image, so
+        # paths-ignore drops a change that alters what the service does.
+        assert deployment_relevant("apps/backend/prompts/coder.md")
+
+        def dep(name="aifactory", spec="sha-3063493", running=("sha-3063493",), exists=True):
+            return {"name": name, "exists": exists, "spec_sha": spec,
+                    "running": list(running)}
+
+        def run(sha, status="completed", conclusion="success", age=0):
+            return {"sha": sha, "status": status, "conclusion": conclusion, "age": age}
+
+        ok_runs = [run(HEAD, age=300)]
+
+        # ---- the steady state: everything matches, nothing is said ---------
+        good = assess(T, HEAD, 600, ok_runs, [dep()], None, now, 900, 3600)
+        assert good["status"] == "ok" and good["codes"] == [], good
+        assert good["matches_main"] and good["behind_seconds"] is None
+        assert severity_of(good, None, now) is None
+
+        # ---- A REAL MID-DEPLOY, taken from the live cluster at 10:06Z on
+        # 2026-07-30: deploy run for 3063493 completed 10:01:28Z (4m32s ago), the
+        # new pod was created 10:04:54Z and is still pulling the image, and the
+        # only ready pod still runs the previous sha. This MUST be silent.
+        mid = assess(T, HEAD, 627, [run(HEAD, age=272)],
+                     [dep(spec="sha-3063493", running=("sha-0bfadd9",))],
+                     None, now, 900, 3600)
+        assert mid["status"] == "deploying" and mid["codes"] == [], mid
+        assert severity_of(mid, None, now) is None, "a running deploy is not a fault"
+
+        # Same, one link earlier: ArgoCD has not even applied the manifest yet.
+        early = assess(T, HEAD, 400, [run(HEAD, age=120)],
+                       [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                       None, now, 900, 3600)
+        assert early["status"] == "deploying" and not early["codes"], early
+
+        # A run still QUEUED for HEAD is silence too, however old the commit --
+        # in-flight is read from the API, never guessed from elapsed time.
+        inflight = assess(T, HEAD, 99999,
+                          [run(HEAD, status="in_progress", conclusion=None),
+                           run(PREV, age=99999)],
+                          [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                          None, now, 900, 3600)
+        assert inflight["status"] == "deploying" and not inflight["codes"], inflight
+
+        # ---- MUTATION CHECK ON THE TOLERANCE. Just inside stays quiet, just
+        # outside fires. If these two ever agree, the threshold is not a threshold.
+        inside = assess(T, HEAD, 1000, [run(HEAD, age=900)],
+                        [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                        None, now, 900, 3600)
+        assert inside["codes"] == [], inside
+        outside = assess(T, HEAD, 1000, [run(HEAD, age=901)],
+                         [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                         None, now, 900, 3600)
+        assert outside["codes"] == ["spec_behind"], outside
+
+        # ---- MUTATION CHECK ON THE CRITICAL THRESHOLD ----------------------
+        warn = assess(T, HEAD, 4000, [run(HEAD, age=3599)],
+                      [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                      None, now, 900, 3600)
+        assert severity_of(warn, None, now) == "warning", warn["behind_seconds"]
+        crit = assess(T, HEAD, 4000, [run(HEAD, age=3600)],
+                      [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                      None, now, 900, 3600)
+        assert severity_of(crit, None, now) == "critical", crit["behind_seconds"]
+
+        # ---- SIGNAL A: the manifest never got the bump ---------------------
+        behind = assess(T, HEAD, 9000, [run(HEAD, age=8000)],
+                        [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                        None, now, 900, 3600)
+        assert behind["codes"] == ["spec_behind"], behind
+        assert "sha-0bfadd9" in behind["problems"][0]
+        assert "sha-3063493" in behind["problems"][0], "the mismatch must be NAMED"
+        assert severity_of(behind, None, now) == "critical"
+
+        # ...and the bump landed but the rollout did not. Signal A would be blind
+        # to this if it only read the Deployment spec: ImagePullBackOff leaves the
+        # manifest perfect and every serving pod on the old image.
+        stuck = assess(T, HEAD, 9000, [run(HEAD, age=8000)],
+                       [dep(spec="sha-3063493", running=("sha-0bfadd9",))],
+                       None, now, 900, 3600)
+        assert stuck["codes"] == ["rollout_behind"], stuck
+        # No ready pods at all is the same finding, not an absence of one.
+        dead = assess(T, HEAD, 9000, [run(HEAD, age=8000)],
+                      [dep(spec="sha-3063493", running=())], None, now, 900, 3600)
+        assert dead["codes"] == ["rollout_behind"], dead
+        # An old pod lingering beside a good one during a rolling update is fine.
+        rolling = assess(T, HEAD, 9000, [run(HEAD, age=8000)],
+                         [dep(spec="sha-3063493",
+                              running=("sha-0bfadd9", "sha-3063493"))],
+                         None, now, 900, 3600)
+        assert rolling["codes"] == [], rolling
+
+        # The Deployment is gone entirely.
+        missing = assess(T, HEAD, 9000, ok_runs, [dep(exists=False)], None,
+                         now, 900, 3600)
+        assert missing["codes"] == ["deployment_missing"], missing
+
+        # ---- SIGNAL B: main moved but nothing built it ---------------------
+        # This is signal A's blind spot: the last build is delivered perfectly.
+        prompt_only = assess(T, HEAD, 9000, [run(PREV, age=9000)],
+                             [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                             "relevant", now, 900, 3600)
+        assert prompt_only["codes"] == ["build_missing"], prompt_only
+        assert severity_of(prompt_only, None, now) == "critical"
+
+        # A docs-only commit is NOT a fault: deploy.yml skips it on purpose and all
+        # four repos publish a blog from docs/ on main. Crying wolf here would make
+        # the whole thing noise within a day.
+        docs = assess(T, HEAD, 9000, [run(PREV, age=9000)],
+                      [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                      "ignorable", now, 900, 3600)
+        assert docs["status"] == "docs_only" and docs["codes"] == [], docs
+
+        # A commit whose files could not be classified is UNEVALUABLE, not fine.
+        unknown = assess(T, HEAD, 9000, [run(PREV, age=9000)],
+                         [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                         None, now, 900, 3600)
+        assert unknown["codes"] == ["unevaluable"], unknown
+
+        # The build ran and FAILED: the commit is stranded on main.
+        failed = assess(T, HEAD, 9000,
+                        [run(HEAD, conclusion="failure", age=8000), run(PREV, age=99999)],
+                        [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                        None, now, 900, 3600)
+        assert failed["codes"] == ["build_failed"], failed
+        assert "failure" in failed["problems"][0]
+
+        # `cancel-in-progress: true` litters the history with cancelled runs; the
+        # newest run is often not the newest SUCCESSFUL one. Reading runs[0] would
+        # hold the cluster to a sha that was never built.
+        littered = [run(HEAD, conclusion="cancelled", age=10),
+                    run(PREV, age=600)]
+        assert latest_success(littered)["sha"] == PREV
+        assert latest_success([run(HEAD, conclusion="cancelled")]) is None
+
+        # ---- UNEVALUABLE IS A FINDING, NEVER A SKIP ------------------------
+        blind = assess(T, None, None, None, [dep()], None, now, 900, 3600)
+        assert blind["codes"] == ["unevaluable", "unevaluable"], blind
+        assert blind["status"] == "unevaluable"
+        assert severity_of(blind, None, now) == "warning"
+        # ...and it escalates off the age of its own issue, or a permanent blind
+        # spot would sit at warning forever. That is how rolehunter hid 47 days.
+        old_issue = {"number": 1, "created_at": "2026-07-30T08:00:00Z",
+                     "updated_at": "2026-07-30T10:00:00Z",
+                     "labels": [{"name": SEVERITY_LABELS["warning"]}]}
+        assert severity_of(blind, old_issue, now) == "critical"
+        no_runs = assess(T, HEAD, 600, None, [dep()], None, now, 900, 3600)
+        assert no_runs["codes"] == ["unevaluable"], no_runs
+        # A repo that has never had a successful deploy run cannot be checked.
+        never = assess(T, HEAD, 600, [run(HEAD, conclusion="failure", age=10)],
+                       [dep()], None, now, 900, 3600)
+        assert "unevaluable" in never["codes"], never
+
+        # Severity reads EVERY code, not just the leading one. Here the manifest is
+        # older than the last successful build AND the newest commit failed to
+        # build: two independent links broken at once, and `status` is only the
+        # first of them.
+        both = assess(T, HEAD, 99999,
+                      [run(HEAD, conclusion="failure", age=9000), run(PREV, age=50000)],
+                      [dep(spec="sha-9999999", running=("sha-9999999",))],
+                      None, now, 900, 3600)
+        assert both["codes"] == ["spec_behind", "build_failed"], both
+        assert both["status"] == "spec_behind"
+        assert both["behind_seconds"] == 99999, both
+
+        # ---- titles and bodies --------------------------------------------
+        assert issue_title(behind, "critical") == \
+            "[critical] aifactory is running an image older than main"
+        assert issue_title(both, "critical") == \
+            "[critical] aifactory is running an image older than main", "worst first"
+        assert issue_title(prompt_only, "warning") == \
+            "[warning] aifactory has a commit on main that never deployed"
+        body = issue_body(behind, "critical")
+        assert body.splitlines()[0] == MARKER.format(service="aifactory")
+        assert "sha-0bfadd9" in body and "sha-3063493" in body
+        assert "CRITICAL" in body
+
+        # ---- the routing decision -----------------------------------------
+        def iss(sev, updated, created="2026-07-30T09:00:00Z"):
+            return {"number": 7, "updated_at": updated, "created_at": created,
+                    "labels": [{"name": ISSUE_LABEL}, {"name": SEVERITY_LABELS[sev]}]}
+
+        assert notify_action(behind, None, now, 24) == "open"
+        # THE SILENCE HALF, which matters as much as the alarm half.
+        assert notify_action(good, None, now, 24) is None
+        assert notify_action(mid, None, now, 24) is None, "mid-deploy must be silent"
+        assert notify_action(behind, iss("critical", "2026-07-30T09:50:00Z"), now, 24) is None
+        assert notify_action(warn, iss("warning", "2026-07-01T00:00:00Z"), now, 24) is None, \
+            "warnings are reported once and then stay quiet"
+        assert notify_action(behind, iss("warning", "2026-07-30T10:00:00Z"), now, 24) == "escalate"
+        assert notify_action(behind, iss("critical", "2026-07-28T00:00:00Z"), now, 24) == "renotify"
+        assert notify_action(behind, iss("critical", "2026-07-28T00:00:00Z"), now, 999) is None
+        assert notify_action(good, iss("critical", "2026-07-30T10:00:00Z"), now, 24) == "close"
+
+        # ---- MUTATION CHECK ON THE NOTIFIER CALL PATH ----------------------
+        # notify_action being right is not enough. A correct verdict that never
+        # reaches the notifier -- or that reaches it for every record -- is the bug
+        # one layer up, and in a sibling watchdog exactly that mutation (deleting
+        # the `if action is None: continue` guard) survived every assertion above.
+        # So drive notify() itself over a stub transport and count the writes.
+        calls: list = []
+        stub_issues: list = []
+
+        def fake_gh(token, method, path, body=None):
+            calls.append((method, path))
+            if method == "POST" and path.endswith("/issues"):
+                return {"number": 99}
+            if "/issues?" in path:
+                return list(stub_issues)
+            return {}
+
+        def writes():
+            return [c for c in calls if c[0] != "GET" and not c[1].endswith("/labels")]
+
+        real_gh = globals()["gh"]
+        globals()["gh"] = fake_gh
+        try:
+            # A MATCHING FLEET SENDS NOTHING AT ALL.
+            assert notify("t", "o/r", [good, good, mid, docs], now, 24) == 0
+            assert not writes(), writes()
+
+            # One genuinely behind service sends exactly one thing.
+            calls.clear()
+            assert notify("t", "o/r", [behind], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues")], writes()
+
+            # A mixed fleet notifies once, for the one that is broken.
+            calls.clear()
+            assert notify("t", "o/r", [good, behind, mid], now, 24) == 1
+            assert len(writes()) == 1, writes()
+
+            # DEDUP off the body marker, checked against a real issue payload --
+            # and against a title a human has rewritten, because the marker is what
+            # keys it, never the title.
+            stub_issues.append({
+                "number": 99, "title": "renamed by a human",
+                "created_at": "2026-07-30T09:00:00Z",
+                "updated_at": "2026-07-30T09:55:00Z",
+                "body": issue_body(behind, "critical"),
+                "labels": [{"name": ISSUE_LABEL}, {"name": SEVERITY_LABELS["critical"]}],
+            })
+            assert list(open_match_issues("t", "o/r")) == [
+                MARKER.format(service="aifactory")]
+            calls.clear()
+            assert notify("t", "o/r", [behind], now, 24) == 0, "must not duplicate"
+            assert not writes(), writes()
+
+            # An issue a human STRIPPED THE LABEL FROM is still adopted, not
+            # rivalled: the scan is over all open issues, keyed on the marker.
+            stub_issues[0]["labels"] = []
+            calls.clear()
+            assert notify("t", "o/r", [behind], now, 24) == 1
+            assert writes()[0] == ("PATCH", "/repos/o/r/issues/99"), writes()
+            stub_issues[0]["labels"] = [{"name": ISSUE_LABEL},
+                                        {"name": SEVERITY_LABELS["critical"]}]
+
+            # Recovery: comment, then close.
+            calls.clear()
+            assert notify("t", "o/r", [good], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues/99/comments"),
+                                ("PATCH", "/repos/o/r/issues/99")], writes()
+
+            # ORPHAN: the service left the watch list entirely, so no record
+            # mentions it. Its issue must not sit open forever.
+            calls.clear()
+            other = dict(good, service="pfactory")
+            assert notify("t", "o/r", [other], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues/99/comments"),
+                                ("PATCH", "/repos/o/r/issues/99")], writes()
+
+            # ...and with no orphans, a matching fleet is completely silent again.
+            stub_issues.clear()
+            calls.clear()
+            assert notify("t", "o/r", [good], now, 24) == 0
+            assert not writes(), writes()
+        finally:
+            globals()["gh"] = real_gh
+
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fleet-match
+  namespace: factory
+  labels: { app: fleet-match }
+spec:
+  # Every 10 minutes. Polling faster than the 900s tolerance buys nothing — a
+  # mismatch cannot become a finding until it has outlived the tolerance — and
+  # the failures this exists to catch lasted days, not minutes. Cost of the
+  # cadence, stated rather than hidden: 2 authenticated GitHub API calls per
+  # service per run (main HEAD + deploy-run history), so 8 per run and ~48 an
+  # hour against a 5000/hr limit. The commit-comparison call happens only when
+  # main is ahead of the last build, so a fleet at rest makes none.
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: { labels: { app: fleet-match } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          serviceAccountName: fleet-match
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: match
+              # Stock python; the script is stdlib-only, so there is no custom
+              # image and nothing to rebuild when it changes. (A watchdog whose
+              # own image needs a deploy to update would be a poor watchdog for
+              # deploys that do not happen.)
+              image: python:3.12-slim
+              command: ["python3", "/script/match.py"]
+              env:
+                - { name: NAMESPACE, value: "factory" }
+                - { name: OO_STREAM, value: "fleet_match" }
+                - { name: OO_ORG, value: "default" }
+                # 900s, timed from the deploy run COMPLETING, not from the
+                # commit. Floor is the ~360s ArgoCD blind window plus rollout
+                # and image pull; the longest convergence measured on this
+                # cluster was 5m43s. LOWER IT once the ArgoCD webhook is live
+                # (measured 37s with it) and not before — see
+                # docs/argocd-sync-honesty.md.
+                - { name: TOLERANCE_SECONDS, value: "900" }
+                # 4x the tolerance. Past an hour a mismatch is not a slow
+                # deploy, and it starts re-surfacing every 24h instead of
+                # sinking down the issue list the way postgres-backup did.
+                - { name: CRITICAL_AFTER_SECONDS, value: "3600" }
+                - { name: DEPLOY_WORKFLOW, value: "deploy.yml" }
+                # Where mismatches go so a human passively meets them — the
+                # same repo and the same channel apps/job-watchdog uses.
+                - { name: ALERT_REPO, value: "olafkfreund/Factory" }
+                - { name: ALERT_RENOTIFY_HOURS, value: "24" }
+                # Existing fleet token; needs `repo` (issues) and read access
+                # to Actions on the four service repos. No new secret, and no
+                # token or webhook URL is committed anywhere.
+                - name: GITHUB_TOKEN
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } }
+                # Same observe-root secret apps/job-watchdog already uses.
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: fleet-match-script
