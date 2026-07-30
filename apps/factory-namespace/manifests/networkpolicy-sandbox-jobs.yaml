@@ -71,13 +71,32 @@ metadata:
   labels:
     app.kubernetes.io/part-of: factory
 spec:
+  # SELECT ON factory.io/kind, NOT ON AN ENUMERATED `app` LIST (Factory#502).
+  #
+  # This was `app In (aifactory-sandbox, tfactory-sandbox)`, which covered two
+  # of FOUR task-dispatch lanes. `job_dispatch.py:410` calls
+  # `task_pod_labels(spec.service)` with no role, and the signature defaults to
+  # `role="task"`, so those pods land on `<service>-task`:
+  #
+  #   AIFactory kube_sandbox.py:187  app=aifactory-sandbox   matched
+  #   TFactory  kube_sandbox.py:276  app=tfactory-sandbox    matched
+  #   AIFactory job_dispatch.py      app=aifactory-task      NOT matched
+  #   TFactory  job_dispatch.py:410  app=tfactory-task       NOT matched
+  #
+  # `task_pod_labels()` returns `factory.io/kind: task` for EVERY role, and
+  # TFactory's kube_sandbox.py already documents it as "the fleet-wide per-task
+  # NetworkPolicy selector (#812)". The label was always the right axis; this
+  # policy simply was not using it.
+  #
+  # DO NOT "just add aifactory-task to the list" when this is next extended.
+  # Enumerating `app` values is what produced a selector that silently missed
+  # half the lanes, and TFactory#908's portal-ui builder is queued to be the
+  # fifth. `app` distinguishes ROLES within a service; `factory.io/kind`
+  # distinguishes task pods from everything else, which is what this policy
+  # actually means.
   podSelector:
-    matchExpressions:
-      - key: app
-        operator: In
-        values:
-          - aifactory-sandbox
-          - tfactory-sandbox
+    matchLabels:
+      factory.io/kind: task
   policyTypes:
     - Ingress
     - Egress
