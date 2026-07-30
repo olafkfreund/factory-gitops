@@ -1,6 +1,6 @@
-# Default-deny INGRESS (enforced) plus a default-deny egress ruleset that this
-# cluster does NOT enforce, for the per-task build/verify Job pods (Factory#462).
-# Read the WARNING below before citing this file as network isolation.
+# Default-deny ingress and egress for the per-task build/verify Job pods
+# (Factory#462). Both halves are ENFORCED on this cluster; see the evidence
+# below, and the one real caveat (a few seconds at pod start).
 #
 # THE DEFECT THIS FIXES
 # ---------------------
@@ -19,46 +19,58 @@
 # rendered against this cluster and every template in them is dead code here.
 # This file is the gitops-native port of those two templates, merged.
 #
-# WARNING: THE EGRESS HALF OF THIS POLICY IS NOT ENFORCED ON THIS CLUSTER.
-# ------------------------------------------------------------------------
-# Do NOT read this file as evidence that build pods are network-isolated.
-# They are not. Factory#462 is still OPEN for exactly this reason.
+# EGRESS ENFORCEMENT: MEASURED, WITH A CONTROL. Supersedes the "egress is not
+# enforced" warning that stood here between #99 and this change.
+# ----------------------------------------------------------------------------
+# Two pods, `factory` namespace, same image, same minute, differing ONLY in
+# whether they carry the selector label:
 #
-# Measured against a throwaway pod carrying app=tfactory-sandbox, i.e. one this
-# policy selects, and re-measured after a full 5-minute controller sync:
-#   ingress (no rules below = default-deny)  reach the pod on :8099  BLOCKED
-#   egress rule 2 (allows :443 only)         1.1.1.1:80              CONNECTED
-#   egress rule 1 (kube-dns only)            8.8.8.8:53              CONNECTED
-#   egress, denied by design                 cfactory 10.43.x:3111   CONNECTED
-# Same policy, same pod, same selector. The selector resolves correctly. k3s's
-# embedded kube-router controller enforces NetworkPolicy INGRESS on this cluster
-# and does NOT enforce EGRESS.
+#   destination                        rule says   selected pod   control pod
+#   1.1.1.1:443                        allow       CONNECT        CONNECT
+#   1.1.1.1:80                         deny        BLOCKED        CONNECT
+#   8.8.8.8:53                         deny        BLOCKED        CONNECT
+#   cfactory  10.43.93.25:3111         deny        BLOCKED        CONNECT
+#   keycloak  10.43.132.182:8080       deny        BLOCKED        CONNECT
+#   minio     10.43.199.249:9000       allow       CONNECT        CONNECT
 #
-# The ingress default-deny above IS real and is worth having: nothing in the
-# cluster can reach a sandbox Job pod. The fail-closed egress this file was
-# written for is inert until the CNI can enforce it.
+# The decisive row is 1.1.1.1: the SAME host, :443 allowed and :80 blocked, from
+# the same pod, in the same second. No mechanism other than an enforced egress
+# policy produces that. The control column proves every BLOCKED destination is
+# genuinely up and reachable, so the blocks are the policy and not dead services.
 #
-# HOW THE ORIGINAL PROOF WENT WRONG, because it is an easy trap to repeat:
-# enforcement was demonstrated against the pre-existing argocd-repo-server
-# policy — :8084 reachable from any namespace, :8081 only from named argocd
-# pods, and :8081 genuinely blocked from a probe. That split is real and it
-# is an INGRESS policy. Ingress and egress are different code paths in the
-# controller, and the result does not carry across. Two of us ran that test
-# and drew the same over-broad conclusion.
+# Reproduce (~90 seconds, two throwaway pods, delete them after):
+#   kubectl --context factory run np-sel -n factory --restart=Never \
+#     --labels='factory.io/kind=task' --image=busybox:1.36 --command -- sleep 300
+#   kubectl --context factory run np-ctl -n factory --restart=Never \
+#     --labels='probe=ctl' --image=busybox:1.36 --command -- sleep 300
+#   # then from each: nc -z -w6 1.1.1.1 443 ; nc -z -w6 1.1.1.1 80
+# Label the control so it cannot join a Service (Factory#476) and delete both.
 #
-# TO FIX: establish whether egress is unimplemented in this k3s build or
-# disabled by a flag (needs node access on p510), then either enable it or
-# replace flannel with Calico/Cilium at cluster-rebuild time. Until then the
-# docs claiming egress isolation are wrong and Factory#246's demo of it
-# remains un-recordable.
+# THE ONE REAL GAP: a few seconds at pod start.
+# kube-router programs the per-pod egress chain shortly AFTER the pod goes
+# Running, so there is a brief unconfined window. Measured by probing every 3s
+# from a pod's own entrypoint:
+#   t+3s  1.1.1.1:80 CONNECTED   <-- leaked
+#   t+6s  onward     blocked     (stable thereafter, verified to t+33s)
+# So a task pod can egress freely for roughly its first 3-5 seconds. That is
+# not enough for a build, but it IS enough for a deliberate exfiltration call
+# placed at the top of a malicious step. Tracked separately; it is a property of
+# the CNI, not something this manifest can express.
 #
-# WHY ONE POLICY FOR BOTH SERVICES
-# Job pods are labelled by their dispatcher, not by Helm:
-#   AIFactory core/kube_sandbox.py       -> app=aifactory-sandbox, factory.io/kind=task
-#   TFactory  tools/runners/kube_sandbox.py -> app=tfactory-sandbox
-# Selecting on `app` covers both. NetworkPolicies are additive (union of allows),
-# so should either chart ever be rendered here its policy composes with this one
-# rather than conflicting.
+# WHY THE EARLIER "NOT ENFORCED" READING IS NOT REPRODUCIBLE HERE: no node or
+# k3s-agent restart happened between the two measurements (both nodes Ready
+# since well before either), so enforcement did not "switch on". Two candidate
+# causes were tested and BOTH disproved:
+#   - "kube-router does not program pods that predate the policy" — disproved:
+#     labelling an already-Running pod INTO the selector flipped it from
+#     unconfined to enforced within 10s, and it stayed enforced for 2 minutes.
+#   - "it needs a full controller sync" — disproved: enforcement is present
+#     within ~6s of pod start, long before any 5-minute sync.
+# The most likely remaining explanation is a probe pod in a different NAMESPACE:
+# NetworkPolicy is namespaced, so a pod in `default` carrying the right labels
+# is matched by nothing here. Worth checking before re-asserting the warning.
+#
+# The ingress default-deny is also real and independently verified.
 #
 # SCOPE: task Job pods ONLY. The 16 control-plane Deployments and 2 StatefulSets
 # sharing this namespace are deliberately untouched — a namespace-wide
