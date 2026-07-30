@@ -1,6 +1,4 @@
-# Default-deny INGRESS (enforced) plus a default-deny egress ruleset that this
-# cluster does NOT enforce, for the per-task build/verify Job pods (Factory#462).
-# Read the WARNING below before citing this file as network isolation.
+# Default-deny egress for the per-task build/verify Job pods (Factory#462).
 #
 # THE DEFECT THIS FIXES
 # ---------------------
@@ -19,46 +17,45 @@
 # rendered against this cluster and every template in them is dead code here.
 # This file is the gitops-native port of those two templates, merged.
 #
-# WARNING: THE EGRESS HALF OF THIS POLICY IS NOT ENFORCED ON THIS CLUSTER.
-# ------------------------------------------------------------------------
-# Do NOT read this file as evidence that build pods are network-isolated.
-# They are not. Factory#462 is still OPEN for exactly this reason.
+# ENFORCEMENT IS REAL ON THIS CLUSTER — this is not a decorative object.
+# k3s embeds a kube-router NetworkPolicy controller in the agent (there is no
+# CNI DaemonSet to look for; `--disable-network-policy` is NOT set). Verified
+# against the pre-existing argocd-repo-server policy, which allows :8084 from
+# every namespace but :8081 only from named argocd pods:
+#   unlabelled probe pod  -> repo-server:8084  connects   (policy allows)
+#   unlabelled probe pod  -> repo-server:8081  BLOCKED    (policy denies)
+#   argocd-server pod     -> repo-server:8081  connects   (port IS listening)
+# Same destination pod, same port, two sources, two outcomes. A CNI that
+# ignored NetworkPolicy could not produce that split.
 #
-# Measured against a throwaway pod carrying app=tfactory-sandbox, i.e. one this
-# policy selects, and re-measured after a full 5-minute controller sync:
-#   ingress (no rules below = default-deny)  reach the pod on :8099  BLOCKED
-#   egress rule 2 (allows :443 only)         1.1.1.1:80              CONNECTED
-#   egress rule 1 (kube-dns only)            8.8.8.8:53              CONNECTED
-#   egress, denied by design                 cfactory 10.43.x:3111   CONNECTED
-# Same policy, same pod, same selector. The selector resolves correctly. k3s's
-# embedded kube-router controller enforces NetworkPolicy INGRESS on this cluster
-# and does NOT enforce EGRESS.
+# WHY TWO POLICIES AND NOT ONE
+# Job pods are labelled by their dispatcher, not by Helm, and the four builders
+# do NOT agree on a common label. There is no single selector that reaches all
+# of them:
 #
-# The ingress default-deny above IS real and is worth having: nothing in the
-# cluster can reach a sandbox Job pod. The fail-closed egress this file was
-# written for is inert until the CNI can enforce it.
+#   builder                                   pod labels                             A   B
+#   AIFactory core/kube_sandbox.py            app=aifactory-sandbox, kind=task       y   y
+#   AIFactory core/job_dispatch.py            app=<service>, kind=task               n   y
+#   TFactory  tools/runners/kube_sandbox.py   app=tfactory-sandbox                   y   n
+#   TFactory  agents/verify_dispatch.py       (wraps kube_sandbox) app=tfactory-sandbox  y   n
 #
-# HOW THE ORIGINAL PROOF WENT WRONG, because it is an easy trap to repeat:
-# enforcement was demonstrated against the pre-existing argocd-repo-server
-# policy — :8084 reachable from any namespace, :8081 only from named argocd
-# pods, and :8081 genuinely blocked from a probe. That split is real and it
-# is an INGRESS policy. Ingress and egress are different code paths in the
-# controller, and the result does not carry across. Two of us ran that test
-# and drew the same over-broad conclusion.
+# where A = `app in (aifactory-sandbox, tfactory-sandbox)` and B =
+# `factory.io/kind: task`. A misses AIFactory's RFC-0016 job_dispatch builder,
+# whose `app` label is the SERVICE name (`pfactory|aifactory|tfactory`, see the
+# JobSpec docstring) rather than a fixed sandbox string. B misses both TFactory
+# builders, which set no `factory.io/kind` on the pod at all.
 #
-# TO FIX: establish whether egress is unimplemented in this k3s build or
-# disabled by a flag (needs node access on p510), then either enable it or
-# replace flannel with Calico/Cilium at cluster-rebuild time. Until then the
-# docs claiming egress isolation are wrong and Factory#246's demo of it
-# remains un-recordable.
+# A podSelector cannot express OR across two label keys — matchExpressions are
+# ANDed — so this is two policies. NetworkPolicy is additive: a pod matched by
+# either gets that policy's allows, a pod matched by both gets the union, and
+# both carry the SAME egress rules so the outcome is identical either way. The
+# AIFactory chart template selects only B and would have left the TFactory pods
+# uncovered; selecting only A leaves AIFactory's job_dispatch pods uncovered.
+# Neither alone is correct.
 #
-# WHY ONE POLICY FOR BOTH SERVICES
-# Job pods are labelled by their dispatcher, not by Helm:
-#   AIFactory core/kube_sandbox.py       -> app=aifactory-sandbox, factory.io/kind=task
-#   TFactory  tools/runners/kube_sandbox.py -> app=tfactory-sandbox
-# Selecting on `app` covers both. NetworkPolicies are additive (union of allows),
-# so should either chart ever be rendered here its policy composes with this one
-# rather than conflicting.
+# Keep the two egress blocks byte-identical. `make -C apps/factory-namespace`
+# has no target for this; the check is in the PR body and is one command:
+# build the kustomization and diff the two `.spec.egress` blocks.
 #
 # SCOPE: task Job pods ONLY. The 16 control-plane Deployments and 2 StatefulSets
 # sharing this namespace are deliberately untouched — a namespace-wide
@@ -78,6 +75,130 @@ spec:
         values:
           - aifactory-sandbox
           - tfactory-sandbox
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress rules at all: default-deny inbound. Nothing legitimately
+  # connects INTO a task pod. The browser/Playwright lane drives the app it
+  # started over localhost inside the same pod, which NetworkPolicy never sees.
+  egress:
+    # 1. DNS. Everything below resolves a name first, so this must come first
+    #    in practice — without it the pod fails closed on every lookup.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # 2. 443/tcp to PUBLIC addresses only. This is the whole legitimate
+    #    external surface of a build/verify lane:
+    #      cache.nixos.org + substituters (Nix binary cache)
+    #      pypi.org / files.pythonhosted.org, registry.npmjs.org, proxy.golang.org
+    #      github.com + codeload (git remotes, gh CLI)
+    #      api.anthropic.com and the other configured LLM provider APIs
+    #      registry.opentofu.org (deploy lane `tofu init`)
+    #    RFC1918 stays excluded, so no in-cluster or host endpoint is reachable
+    #    by accident — each one below is an explicit, named opt-in.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # 3. The self-hosted model on the k3d host (`host.k3d.internal` = the docker
+    #    bridge gateway 172.18.0.1), which is what OPENAI_COMPATIBLE_BASE_URL
+    #    points at fleet-wide. It is plain HTTP on 11434 and 172.18.0.1 falls
+    #    inside the 172.16.0.0/12 exclusion in rule 2, so without this rule the
+    #    BYO/local-model path fails closed — which is the exact opposite of the
+    #    self-host story this control exists to support. The upstream Helm
+    #    templates both omit it.
+    - to:
+        - ipBlock:
+            cidr: 172.18.0.1/32
+      ports:
+        - protocol: TCP
+          port: 11434
+
+    # 4. The Kubernetes API server. The TFactory verify-orchestration Job
+    #    dispatches nested per-lane Jobs, and the deploy lane runs
+    #    `kubectl apply --dry-run=server`, both via the API.
+    #    Both the ClusterIP and the real backend address are listed on purpose:
+    #    whether a CNI matches egress pre- or post-DNAT is implementation
+    #    detail, and exactly one of these two entries is dead weight depending
+    #    on the answer. Listing both is correct under either behaviour; listing
+    #    one and guessing wrong wedges every verify run.
+    - to:
+        - ipBlock:
+            cidr: 10.43.0.1/32   # `kubernetes` Service ClusterIP (pre-DNAT)
+        - ipBlock:
+            cidr: 172.18.0.2/32  # k3d-factory-server-0, the real endpoint (post-DNAT)
+      ports:
+        - protocol: TCP
+          port: 6443
+        - protocol: TCP
+          port: 443
+
+    # 5. In-namespace DATA services only, by explicit pod identity. Deliberately
+    #    NOT the blanket `podSelector: {}` the upstream TFactory template uses:
+    #    namespace-wide egress lets an untrusted task pod dial the AIFactory,
+    #    TFactory, PFactory and CFactory control-plane APIs and Keycloak, which
+    #    makes "fail-closed" unfalsifiable. Named ports on named pods keeps the
+    #    control plane on the deny side, where it is demonstrable.
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - postgres  # durable job-state row
+                  - minio     # artifact / packed-workspace object store
+                  - redis     # RFC-0016 job coordination
+                  - observe   # OpenObserve OTLP ingest
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 5080
+        - protocol: TCP
+          port: 5081
+---
+# Policy B — AIFactory's RFC-0016 job_dispatch builder (core/job_dispatch.py).
+# Its pods carry `app: <service>` (pfactory|aifactory|tfactory), NOT a fixed
+# sandbox string, so policy A above never matches them and they had no policy
+# at all. `factory.io/kind: task` is the one label that builder always sets.
+#
+# NOTE the `app: <service>` label on those pods is independently a bug: the
+# `aifactory` Service selects `app: aifactory`, so a task Job pod joins the real
+# control-plane Service as an endpoint (Factory#476). That is a dispatcher fix,
+# not a policy fix, and is filed separately — this policy only makes sure the
+# pods are not additionally unconfined while it is outstanding.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: factory-task-jobs-egress
+  namespace: factory
+  labels:
+    app.kubernetes.io/part-of: factory
+spec:
+  podSelector:
+    matchLabels:
+      factory.io/kind: task
   policyTypes:
     - Ingress
     - Egress
