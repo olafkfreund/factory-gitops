@@ -7,10 +7,18 @@
 # deliberately excluded below because it is not signed yet (CFactory#191).
 # See docs/image-signature-admission.md for the enforce path.
 #
-# Signer identity verified per repo, taken from each repo's release.yml
-# "Verify signature (release self-test)" step:
+# Signer identity verified per repo:
 #   issuer  = https://token.actions.githubusercontent.com  (GitHub Actions OIDC)
-#   subject = ^https://github.com/olafkfreund/<Repo>/       (the release workflow)
+#   subject = ^https://github.com/olafkfreund/<Repo>/
+#
+# The subject prefix deliberately matches BOTH publishing workflows, because
+# both produce images this cluster runs:
+#   .../.github/workflows/release.yml@refs/heads/main   -> :vX.Y.Z  (semver)
+#   .../.github/workflows/deploy.yml@refs/heads/main    -> :sha-<short> (CD)
+#   .../.github/workflows/build-nix.yml@refs/heads/main -> :sha-<short>-nix
+# Until Factory#430 only release.yml signed, so every running Pod (all on
+# sha-* tags from deploy.yml) failed verification. Signing was added to the
+# CD workflows; do not remove it.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -54,6 +62,14 @@ spec:
                 - keyless:
                     issuer: "https://token.actions.githubusercontent.com"
                     subjectRegExp: "^https://github\\.com/olafkfreund/AIFactory/"
+                    # Kyverno v1.18 REJECTS a keyless attestor with neither
+                    # `rekor` nor `roots` ("Either Rekor URL or roots are
+                    # required"). Without it ArgoCD cannot apply this file at
+                    # all, so the cluster kept a stale copy of the policy that
+                    # had lost its subjectRegExp — i.e. it accepted a signature
+                    # from ANY GitHub Actions workflow in ANY repo. Factory#430.
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
     - name: verify-pfactory-signature
       match:
         any:
@@ -72,6 +88,14 @@ spec:
                 - keyless:
                     issuer: "https://token.actions.githubusercontent.com"
                     subjectRegExp: "^https://github\\.com/olafkfreund/PFactory/"
+                    # Kyverno v1.18 REJECTS a keyless attestor with neither
+                    # `rekor` nor `roots` ("Either Rekor URL or roots are
+                    # required"). Without it ArgoCD cannot apply this file at
+                    # all, so the cluster kept a stale copy of the policy that
+                    # had lost its subjectRegExp — i.e. it accepted a signature
+                    # from ANY GitHub Actions workflow in ANY repo. Factory#430.
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
     - name: verify-tfactory-signature
       match:
         any:
@@ -90,6 +114,14 @@ spec:
                 - keyless:
                     issuer: "https://token.actions.githubusercontent.com"
                     subjectRegExp: "^https://github\\.com/olafkfreund/TFactory/"
+                    # Kyverno v1.18 REJECTS a keyless attestor with neither
+                    # `rekor` nor `roots` ("Either Rekor URL or roots are
+                    # required"). Without it ArgoCD cannot apply this file at
+                    # all, so the cluster kept a stale copy of the policy that
+                    # had lost its subjectRegExp — i.e. it accepted a signature
+                    # from ANY GitHub Actions workflow in ANY repo. Factory#430.
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
     # CFactory (ghcr.io/olafkfreund/cfactory + cfactory-frontend) is intentionally
     # NOT listed: it is not cosign-signed yet. Add a verify-cfactory-signature
     # rule once CFactory#191 lands, then move to the Enforce rollout (see docs).

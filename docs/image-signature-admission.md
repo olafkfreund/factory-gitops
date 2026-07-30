@@ -27,6 +27,120 @@ its images yet — it has no `release.yml` cosign step. Signing is tracked in
 CFactory#191. This is the reason the policy must stay in audit mode: an Enforce
 policy would block every CFactory Pod.
 
+### Correction — Factory#430 (the audit was failing 100%)
+
+Everything above was true and still left the control verifying nothing. Once
+the policy went live it reported `fail: unverified image` for **every** factory
+image. Three separate defects, all of which had to be fixed:
+
+1. **The signed images are not the images that run.** `release.yml` signs only
+   on a semver bump and publishes `:vX.Y.Z`. Nothing in the cluster runs a
+   `:vX.Y.Z` tag — ArgoCD is pinned by `deploy.yml`/`build-nix.yml` to
+   `:sha-<short>` and `:sha-<short>-nix`, and *those* workflows had no cosign
+   step at all. The audit was correctly measuring a genuine absence:
+
+   ```
+   $ cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+       --certificate-identity-regexp='olafkfreund/AIFactory' \
+       ghcr.io/olafkfreund/aifactory:sha-0ffa542
+   Error: no signatures found          # the tag the cluster runs
+
+   $ cosign verify ... ghcr.io/olafkfreund/aifactory:v3.6.73
+   Verification for ghcr.io/olafkfreund/aifactory:v3.6.73 --  # the tag nobody runs
+   ```
+
+   Fixed by adding cosign keyless sign + a verify self-test to the CD
+   workflows (AIFactory `deploy.yml` + `build-nix.yml`, PFactory `deploy.yml`,
+   TFactory `deploy.yml`, CFactory `deploy.yml`). The policy was **not**
+   loosened.
+
+2. **The live policy had silently lost its `subjectRegExp`.** The manifest in
+   git pins each repo's signer identity; the object in the cluster carried only
+   `issuer: https://token.actions.githubusercontent.com`. Any GitHub Actions
+   workflow in any repo on earth would have satisfied it. A control that
+   fails 100% of the time hid a second control that would have passed too
+   easily.
+
+3. **ArgoCD had been unable to sync this Application since the Kyverno
+   v1.12.6 -> v1.18.2 bump**, which is why (2) was never corrected:
+
+   ```
+   admission webhook "validate-policy.kyverno.svc" denied the request:
+   spec.rules[0].verifyImages[0].attestors[0].entries[0].keyless:
+   Invalid value: {...}: Either Rekor URL or roots are required
+   ```
+
+   The app sat `OutOfSync` + `SyncError` while reporting `Healthy`, so the
+   drift was invisible. Fixed by adding an explicit
+   `rekor.url: https://rekor.sigstore.dev` to each keyless attestor.
+
+That missing `rekor` was also producing a **false `pass`**. The live
+PolicyReport for the `aifactory` Deployment read `pass: image verified` while
+the image it runs has no signature at all:
+
+```
+$ cosign verify ... ghcr.io/olafkfreund/aifactory:sha-0bfadd9
+Error: no signatures found
+```
+
+Replaying the policy through the Kyverno CLI (v1.18.2, same version as the
+cluster) isolates the cause to exactly that one field:
+
+```
+# live shape: no rekor, no roots
+$ kyverno apply live-shape-policy.yaml --resource pod-running.yaml
+Policies Skipped (as required variables are not provided by the user):
+1. verify-factory-image-signatures
+pass: 0, fail: 0, warn: 0, error: 1, skip: 0
+
+# same policy, rekor added, nothing else changed
+$ kyverno apply rekor-only-policy.yaml --resource pod-running.yaml
+verify-aifactory-signature failed to verify image
+  ghcr.io/olafkfreund/aifactory:sha-0bfadd9: no signatures found
+pass: 0, fail: 2, warn: 0, error: 0, skip: 0
+```
+
+So the policy was not merely failing everything — it was unevaluable, and one
+of the three services was being reported green on that basis. Treat a `pass`
+from before this change as meaningless.
+
+### Two blockers that remain open after this change
+
+Neither is fixed here; both must close before Enforce.
+
+1. **Kyverno cannot read the private GHCR packages.** `aifactory` is a public
+   package; `pfactory`, `tfactory`, `cfactory` and `cfactory-frontend` are
+   private. The kubelet pulls them with the `ghcr-pull` imagePullSecret in the
+   `factory` namespace, but Kyverno verifies anonymously — it has no
+   `--imagePullSecrets` flag and no credential secret in the `kyverno`
+   namespace — so it cannot even fetch the manifest, let alone the signature:
+
+   ```
+   failed to verify image ghcr.io/olafkfreund/pfactory:sha-4452338:
+   GET https://ghcr.io/token?scope=repository%3Aolafkfreund%2Fpfactory%3Apull:
+   UNAUTHORIZED: authentication required
+   ```
+
+   Signing those images will not make this pass. The fix is a read-only GHCR
+   credential in the `kyverno` namespace, referenced per rule:
+
+   ```yaml
+   imageRegistryCredentials:
+     providers: [github]
+     secrets: [kyverno-ghcr-pull]     # must exist in the kyverno namespace
+   ```
+
+   Deliberately not wired up in this PR: pointing the policy at a secret that
+   does not exist yet is another control that looks configured and verifies
+   nothing. Wire it and the secret together.
+
+2. **`background: false` freezes every report at admission.** The `aifactory`
+   Deployment is on generation 212; its PolicyReport is dated 2026-07-26 and
+   has never been recomputed. A long-lived Pod is evaluated once, ever, and a
+   report can stay green across arbitrarily many image changes. Audit results
+   are therefore not a live signal today — they are a snapshot of whenever the
+   Pod was last admitted.
+
 ## What this PR adds
 
 Two ArgoCD Applications, auto-discovered by `bootstrap/argocd-root-app.yaml`:
@@ -93,6 +207,28 @@ Do NOT skip a phase. Each is a separate, small PR.
 1. **Audit (this PR).** Land the policy in `Audit`. Watch PolicyReports for a
    sustained period across real runs. Confirm the three signed services report
    `pass` and there are no false negatives (registry timeouts, identity typos).
+
+   Concretely, after Factory#430 this phase is not complete until **every**
+   currently-running Pod has been rebuilt by a signing workflow. Signing the CD
+   workflows does not retroactively sign the images already deployed — the
+   `sha-*` images live in the cluster today were built before the cosign step
+   existed and can never verify. Each service must land one more commit on
+   `main` (or a `workflow_dispatch` re-run of `deploy.yml`) before its Pods can
+   report `pass`. Check with:
+
+   ```bash
+   kubectl --context factory get pods -n factory \
+     -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | sort -u
+   ```
+
+   and verify each tag directly:
+
+   ```bash
+   cosign verify \
+     --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+     --certificate-identity-regexp='^https://github\.com/olafkfreund/AIFactory/' \
+     ghcr.io/olafkfreund/aifactory:<the-tag-actually-running>
+   ```
 
 2. **Sign CFactory (CFactory#191).** Add the cosign keyless sign + verify steps
    to CFactory's release workflow, matching the other three. Then add a
