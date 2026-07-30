@@ -1,0 +1,1027 @@
+# endpoint-guard — is every pod behind a Service actually able to serve it?
+#
+# THE DEFECT THIS CLOSES: a Job or task pod carries a label that a Service selects
+# on, so the pod becomes a Service endpoint. It listens on nothing, so kube-proxy
+# hands it a share of real production traffic and answers connection refused.
+#
+# A Service selector is a SUBSET match — extra labels on a pod never exclude it —
+# and this fleet got that wrong in five places, found on 2026-07-30 and each filed
+# separately by someone who did not know about the others:
+#
+#   TFactory#885     the portal-ui browser-test Job carried app=tfactory. Cloudflare
+#                    served 502s for the length of every run: the browser test took
+#                    the portal it was testing offline and then reported it broken.
+#   AIFactory#1107   task Job pods carried app=aifactory, so `kubectl exec
+#                    deploy/aifactory` intermittently landed in a build pod.
+#   Factory#458      with two coder Jobs up, aifactory's endpoints held 1 API pod
+#                    and 2 serving nothing; 5 of 8 in-cluster probes refused.
+#   Factory#456      `emit-contract` reported TimeoutError for a handoff that had
+#                    SUCCEEDED. An operator trusting that would double-submit.
+#   apps/minio       the minio-create-bucket PostSync Job carried app=minio, so
+#                    every sync of that app briefly put an `mc` pod in front of
+#                    real artifact traffic. Found by the sweep, not by an incident.
+#
+# The single root cause of the first four was ONE line in the hub's shared
+# reference library, scripts/job_dispatch.py, which every service vendors.
+#
+# WHY THIS CHECK IS WORTH MORE THAN THOSE FIVE FIXES: the defect is invisible in
+# every ordinary signal. The Deployment is Healthy, the Service exists, the pod is
+# Running, and the failures are a FRACTION of requests for a BOUNDED window — it
+# reads as flakiness, and it was filed as flakiness four times. TFactory's was
+# found only because someone was recording a demo and the portal 502'd in front of
+# them. Nothing structural was watching, so the same defect kept arriving.
+#
+# NOT A LINTER ON THIS REPO, ON PURPOSE. The two worst instances were built at
+# RUNTIME by application code (TFactory's portal_testing/dispatch.py and the hub's
+# job_dispatch.py) and appear in no manifest anywhere. A manifest-only search
+# misses precisely the cases that hurt. Reading the live API is what sees them.
+#
+# TWO SIGNALS, BECAUSE THEY FAIL SEPARATELY — measured, not assumed:
+#
+#   1. OBSERVED. Walk each Service's real Endpoints, resolve each address to its
+#      pod, and ask whether any container declares the Service's targetPort. This
+#      is the actual invariant ("listens on nothing"), so it is intent-free and
+#      needs no allowlist: it catches Jobs, StatefulSets, bare pods, and labels
+#      added later by a webhook. It is what caught the bundled-Postgres case in the
+#      Helm charts, a StatefulSet that no Job-shaped rule would have found.
+#
+#   2. PREDICTED. Compare every Job and CronJob POD TEMPLATE's labels against every
+#      Service selector. Templates outlive their pods, so this reports a two-minute
+#      Job hours later and reports a CronJob that has not run yet at all.
+#
+#   Signal 2 is the one that makes this work. Verified during the sweep: a
+#   deliberately mislabelled Job was an endpoint of a test Service, and 15 minutes
+#   later its pod had Succeeded and dropped out of Endpoints — signal 1 went blind
+#   exactly as predicted, while signal 2 still reported it from the template.
+#   A currently clean endpoint list is NOT evidence the bug is absent, which also
+#   matters because `kubectl label pod <p> app-` was used to unstick this by hand
+#   (Factory#458) and leaves the endpoint list looking fine.
+#
+# AN UNEVALUABLE RESULT IS A FINDING, NOT A SKIP (standards §4.7). containerPort
+# declarations are optional in Kubernetes, so a pod declaring none cannot be judged
+# by signal 1; that reports `unverifiable_endpoint` rather than passing quietly.
+# The premise was measured before being relied on: 18 of 18 live serving pods in
+# this namespace declare their Service's targetPort, so the rule is sound here and
+# the unverifiable branch is the exception it is written as.
+#
+# WHY IT EXITS 0 EVEN WHEN IT FINDS PROBLEMS: following apps/job-watchdog and
+# apps/fleet-match. A watchdog that goes red on its findings is indistinguishable
+# from a watchdog that is itself broken. Non-zero means ONLY "the check could not
+# do its job" — API server unreachable, or OpenObserve refused the record.
+#
+# NO NEW DELIVERY PATH: findings become a GitHub issue on ALERT_REPO, the channel
+# apps/job-watchdog and apps/fleet-match already prove works, with the same
+# open / escalate / re-notify / close-on-recovery state machine. A healthy fleet
+# produces zero GitHub traffic — an alarm that fires every run is muted within a
+# week, which is this same bug by another route.
+#
+# THE ESCAPE HATCH IS DELIBERATE. A Job genuinely meant to back a Service sets
+# `factory.io/service-endpoint: intentional` on the Job/CronJob. An un-silenceable
+# check gets deleted; an opt-out that shows up in a diff does not.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: endpoint-guard
+  namespace: factory
+  labels: { app: endpoint-guard }
+---
+# Least privilege, following the apps/cred-broker, apps/job-watchdog,
+# apps/argocd-drift and apps/fleet-match precedent: a namespaced Role, no
+# ClusterRole, read-only, and only the five resource kinds it reads. Endpoints as
+# well as Services and Pods, because "the selector would match" and "the pod is
+# actually receiving traffic" are different claims and this app exists precisely
+# because the gap between them went unnoticed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: endpoint-guard
+  namespace: factory
+  labels: { app: endpoint-guard }
+rules:
+  - apiGroups: [""]
+    resources: ["services", "pods", "endpoints"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: endpoint-guard
+  namespace: factory
+  labels: { app: endpoint-guard }
+subjects:
+  - kind: ServiceAccount
+    name: endpoint-guard
+    namespace: factory
+roleRef:
+  kind: Role
+  name: endpoint-guard
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: endpoint-guard-script
+  namespace: factory
+  labels: { app: endpoint-guard }
+data:
+  guard.py: |
+    #!/usr/bin/env python3
+    """Is every pod behind a Service actually able to serve it? (Factory endpoint-guard)
+
+    THE DEFECT THIS CLOSES: a Job or task pod carries a label that a Service selects
+    on, so the pod becomes a Service endpoint. It listens on nothing, so kube-proxy
+    hands it a share of real production traffic and it answers connection refused.
+
+    A Service selector is a SUBSET match. Extra labels on a pod never exclude it, so
+    "I added a component label" is not a defence. Confirmed four times in this fleet
+    in one day, each filed separately by someone who did not know about the others:
+
+      - TFactory#885   the portal-ui browser-test Job carried app=tfactory. Cloudflare
+                       served 502s for the length of every run: the browser test took
+                       the portal it was testing offline and then reported it broken.
+      - AIFactory#1107 task Job pods carried app=aifactory, so `kubectl exec
+                       deploy/aifactory` landed in a build pod.
+      - Factory#458    with two coder Jobs up, aifactory's endpoints held 1 API pod
+                       and 2 serving nothing; 5 of 8 in-cluster probes refused.
+      - Factory#456    `emit-contract` reported TimeoutError for a handoff that had
+                       SUCCEEDED. An operator trusting that would double-submit.
+      plus factory-gitops' minio-create-bucket PostSync Job, found by the sweep.
+
+    WHY A CHECK IS WORTH MORE THAN THOSE FIVE FIXES: the defect is invisible in every
+    ordinary signal. The Deployment is Healthy, the Service exists, the pod is
+    Running, and the failures are a FRACTION of requests for a BOUNDED window. It
+    reads as flakiness. TFactory's was found only because someone was recording a
+    demo and the portal 502'd in front of them; three agents found three of the
+    others today without connecting them. Nothing structural was watching.
+
+    TWO SIGNALS, BECAUSE THEY FAIL SEPARATELY:
+
+      1. OBSERVED — walk each Service's real Endpoints, resolve each address to its
+         pod, and ask whether any container declares the Service's targetPort. This is
+         the actual invariant ("listens on nothing"), so it is intent-free: it catches
+         Jobs, StatefulSets, bare pods, and labels added after creation by a webhook,
+         with no allowlist and no guessing at what a workload is *for*. It caught the
+         bundled-Postgres case, which is a StatefulSet and which no Job-shaped rule
+         would have found. Its limit: it only sees what is an endpoint right now.
+
+      2. PREDICTED — compare every Job and CronJob POD TEMPLATE's labels against every
+         Service selector. Templates outlive their pods (Jobs persist for
+         ttlSecondsAfterFinished, CronJob objects persist forever), so this still
+         reports a two-minute Job hours later, and reports a CronJob that has not run
+         yet at all. Signal 1 would be blind to both. Its limit: it only knows about
+         Job-shaped workloads.
+
+         This is the signal that closes the CLASS rather than the instances: it is
+         evaluated against the dispatched template, so a service that starts stamping
+         the wrong label tomorrow is reported on the next run.
+
+    NOT A LINTER ON THE GITOPS REPO, ON PURPOSE. The two worst instances were built
+    at RUNTIME by application code (TFactory's portal_testing/dispatch.py, the hub's
+    scripts/job_dispatch.py) and appear in no manifest anywhere. A manifest-only
+    search misses exactly the cases that hurt. Reading the live API is what sees them.
+
+    WHY IT EXITS 0 EVEN WHEN IT FINDS PROBLEMS: following apps/job-watchdog and
+    apps/fleet-match. A watchdog that goes red on its findings is indistinguishable
+    from a watchdog that is itself broken. Non-zero here means ONLY "the check could
+    not do its job" — API server unreachable, or OpenObserve refused the record.
+
+    AN UNEVALUABLE RESULT IS A FINDING, NOT A SKIP (standards §4.7). containerPort
+    declarations are optional in Kubernetes, so a pod that declares none cannot be
+    judged by signal 1. That reports `unverifiable_endpoint` rather than passing
+    quietly. Measured on this cluster before relying on it: 18 of 18 live serving pods
+    declare their Service's targetPort, so the rule is sound here and the
+    unverifiable case is the exception it is written as.
+
+    THE ESCAPE HATCH IS DELIBERATE. A Job that really is meant to back a Service can
+    set `factory.io/service-endpoint: intentional` on the Job/CronJob. An
+    un-silenceable check gets deleted, which is worse than one with a documented
+    opt-out that shows up in a diff.
+    """
+
+    from __future__ import annotations
+
+    import base64
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    OPT_OUT_ANNOTATION = "factory.io/service-endpoint"
+    OPT_OUT_VALUE = "intentional"
+
+
+    def eprint(msg: str) -> None:
+        sys.stderr.write(msg + "\n")
+
+
+    def _parse_ts(s: str) -> datetime:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+    def _dur(sec: float | None) -> str:
+        if sec is None:
+            return "unknown"
+        sec = int(sec)
+        if sec < 90:
+            return f"{sec}s"
+        if sec < 5400:
+            return f"{sec // 60}m"
+        if sec < 172800:
+            return f"{sec // 3600}h"
+        return f"{sec // 86400}d"
+
+
+    # ---------------------------------------------------------------------------
+    # Pure analysis. No I/O — the selftest drives all of it from literals.
+    # ---------------------------------------------------------------------------
+
+
+    def selector_matches(selector: dict, labels: dict) -> bool:
+        """Kubernetes Service-selector semantics: a SUBSET match.
+
+        The single most important line in this file. Every instance of this defect
+        came from someone assuming extra labels on the pod would exclude it. An empty
+        selector is NOT "matches everything" here — a Service with no selector has no
+        label-driven endpoints at all, and the caller filters those out first.
+        """
+        return bool(selector) and all(labels.get(k) == v for k, v in selector.items())
+
+
+    def declared_ports(pod_spec: dict) -> set:
+        """Every containerPort a pod declares, by number AND by name.
+
+        Both, because a Service targetPort may be either, and comparing only numbers
+        would report every named-port Service as broken.
+        """
+        out: set = set()
+        for c in (pod_spec.get("containers") or []) + (pod_spec.get("initContainers") or []):
+            for p in c.get("ports") or []:
+                if p.get("containerPort") is not None:
+                    out.add(p["containerPort"])
+                if p.get("name"):
+                    out.add(p["name"])
+        return out
+
+
+    def service_target_ports(svc: dict) -> set:
+        """The ports a backend pod must actually be listening on."""
+        out: set = set()
+        for p in ((svc.get("spec") or {}).get("ports") or []):
+            tp = p.get("targetPort", p.get("port"))
+            if tp is not None:
+                out.add(tp)
+        return out
+
+
+    def owner_kind(pod: dict) -> str:
+        refs = (pod.get("metadata") or {}).get("ownerReferences") or []
+        return refs[0].get("kind", "?") if refs else "none"
+
+
+    def assess_endpoint(svc: dict, pod: dict) -> tuple[str, str] | None:
+        """(code, human sentence) for one pod that IS an endpoint of svc, or None.
+
+        Deliberately graded in three, not two. "Declares other ports but not this
+        one" is a pod that demonstrably serves something else and is refusing this
+        Service's traffic — certain. "Declares no ports at all" cannot be judged from
+        the API, and saying so is honest where calling it broken would be noise and
+        calling it fine would be the silence this exists to end.
+        """
+        want = service_target_ports(svc)
+        have = declared_ports(pod.get("spec") or {})
+        if not want:
+            return None
+        missing = [p for p in want if p not in have]
+        if not missing:
+            return None
+        name = (pod.get("metadata") or {}).get("name", "?")
+        kind = owner_kind(pod)
+        if not have:
+            return (
+                "unverifiable_endpoint",
+                f"pod `{name}` (owned by {kind}) is an endpoint but declares NO "
+                f"containerPorts, so whether it serves {sorted(map(str, want))} "
+                f"cannot be determined from the API",
+            )
+        return (
+            "endpoint_cannot_serve",
+            f"pod `{name}` (owned by {kind}) is an endpoint of this Service but "
+            f"declares ports {sorted(map(str, have))} and NOT "
+            f"{sorted(map(str, missing))} — traffic routed to it is answered with "
+            f"connection refused",
+        )
+
+
+    def opted_out(workload: dict) -> bool:
+        ann = (workload.get("metadata") or {}).get("annotations") or {}
+        return ann.get(OPT_OUT_ANNOTATION) == OPT_OUT_VALUE
+
+
+    def template_labels(workload: dict) -> dict:
+        """Pod-template labels of a Job or CronJob. The POD's labels, not the
+        object's — a Job object is never a Service endpoint, only its pods are, and
+        conflating the two is how a fix gets applied to the wrong line."""
+        spec = workload.get("spec") or {}
+        if workload.get("kind") == "CronJob":
+            spec = ((spec.get("jobTemplate") or {}).get("spec") or {})
+        tpl = spec.get("template") or {}
+        return (tpl.get("metadata") or {}).get("labels") or {}
+
+
+    def assess_template(workload: dict, services: list) -> list:
+        """Which Services this Job/CronJob pod template would join. [] is the good case."""
+        if opted_out(workload):
+            return []
+        labels = template_labels(workload)
+        return [
+            (s.get("metadata") or {}).get("name")
+            for s in services
+            if selector_matches((s.get("spec") or {}).get("selector") or {}, labels)
+        ]
+
+
+    def build_records(services: list, pods: list, endpoints: list, workloads: list) -> list:
+        """One record per Service (observed) plus one per offending workload
+        (predicted). Clean records are emitted too: "no news" must never be the only
+        thing distinguishing a healthy fleet from a check that stopped running."""
+        by_name = {(p.get("metadata") or {}).get("name"): p for p in pods}
+        ep_pods: dict = {}
+        for ep in endpoints:
+            name = (ep.get("metadata") or {}).get("name")
+            names = []
+            for subset in ep.get("subsets") or []:
+                for addr in subset.get("addresses") or []:
+                    ref = addr.get("targetRef") or {}
+                    if ref.get("kind") == "Pod" and ref.get("name"):
+                        names.append(ref["name"])
+            ep_pods[name] = names
+
+        records = []
+        for svc in services:
+            name = (svc.get("metadata") or {}).get("name")
+            selector = (svc.get("spec") or {}).get("selector") or {}
+            if not selector:
+                continue  # no label-driven endpoints; nothing this check can say
+            problems, serving = [], []
+            for pod_name in ep_pods.get(name, []):
+                pod = by_name.get(pod_name)
+                if pod is None:
+                    continue
+                verdict = assess_endpoint(svc, pod)
+                if verdict is None:
+                    serving.append(pod_name)
+                else:
+                    problems.append(verdict)
+            would_join = []
+            for w in workloads:
+                hits = assess_template(w, [svc])
+                if hits:
+                    kind = w.get("kind")
+                    wname = (w.get("metadata") or {}).get("name")
+                    code = (
+                        "cronjob_template_joins_service"
+                        if kind == "CronJob"
+                        else "job_template_joins_service"
+                    )
+                    extra = (
+                        " It is a CronJob, so this recurs on its schedule; a currently "
+                        "clean endpoint list only means no run is in flight."
+                        if kind == "CronJob"
+                        else ""
+                    )
+                    would_join.append(
+                        (
+                            code,
+                            f"{kind} `{wname}` has a pod template whose labels "
+                            f"{json.dumps(template_labels(w), sort_keys=True)} satisfy "
+                            f"this Service's selector {json.dumps(selector, sort_keys=True)}, "
+                            f"so its pods join the Service while it runs.{extra}",
+                        )
+                    )
+            all_problems = problems + would_join
+            records.append(
+                {
+                    "service": name,
+                    "selector": selector,
+                    "target_ports": sorted(map(str, service_target_ports(svc))),
+                    "serving_endpoints": serving,
+                    "endpoint_count": len(ep_pods.get(name, [])),
+                    "codes": [c for c, _ in all_problems],
+                    "problems": [m for _, m in all_problems],
+                    "healthy": not all_problems,
+                }
+            )
+        return records
+
+
+    SEVERITY_OF_CODE = {
+        # Happening now, to real traffic.
+        "endpoint_cannot_serve": "critical",
+        # Guaranteed to happen again on a schedule.
+        "cronjob_template_joins_service": "critical",
+        # Happened, or will on the next dispatch. Not necessarily in flight.
+        "job_template_joins_service": "warning",
+        # Cannot be judged. A finding, not a skip (standards §4.7).
+        "unverifiable_endpoint": "warning",
+    }
+
+
+    def severity_of(record: dict) -> str | None:
+        """critical | warning | None. None means healthy — say nothing at all."""
+        sevs = {SEVERITY_OF_CODE.get(c, "warning") for c in record.get("codes") or []}
+        if not sevs:
+            return None
+        return "critical" if "critical" in sevs else "warning"
+
+
+    # ---------------------------------------------------------------------------
+    # Notification. Same path and same state machine as apps/job-watchdog and
+    # apps/fleet-match: a GitHub issue on ALERT_REPO, deduped on a marker in the
+    # BODY so severity wording may change without orphaning the issue, opened once,
+    # escalated on severity change, re-commented only on critical and only every
+    # ALERT_RENOTIFY_HOURS, closed on recovery, orphans closed out loud.
+    #
+    # A separate implementation rather than an import of either app's ConfigMap, for
+    # the reason apps/fleet-match already states: mounting another Application's
+    # ConfigMap makes this job crash-loop if that app is renamed. Three consumers now
+    # argue for extraction — worth doing, and deliberately not done in the same change
+    # that lands the check.
+    # ---------------------------------------------------------------------------
+
+    ISSUE_LABEL = "endpoint-guard"
+    SEVERITY_LABELS = {"critical": "severity:critical", "warning": "severity:warning"}
+    MARKER = "<!-- endpoint-guard:{service} -->"
+
+    TITLE_PHRASE = [
+        ("endpoint_cannot_serve", "is routing traffic to a pod that cannot serve it"),
+        ("cronjob_template_joins_service", "has a CronJob whose pods join it"),
+        ("job_template_joins_service", "has a Job whose pods join it"),
+        ("unverifiable_endpoint", "has an endpoint that cannot be verified"),
+    ]
+
+
+    def issue_title(record: dict, sev: str) -> str:
+        for code, phrase in TITLE_PHRASE:
+            if code in (record.get("codes") or []):
+                return f"[{sev}] Service {record['service']} {phrase}"
+        return f"[{sev}] Service {record['service']} has a non-serving endpoint"
+
+
+    def issue_body(record: dict, sev: str) -> str:
+        svc = record["service"]
+        lines = [
+            MARKER.format(service=svc),
+            f"**Severity: {sev.upper()}** — the `{svc}` Service has at least one "
+            "backend that does not serve it.",
+            "",
+            f"- selector: `{json.dumps(record['selector'], sort_keys=True)}`",
+            f"- target ports: `{', '.join(record['target_ports']) or 'none'}`",
+            f"- endpoints: {record['endpoint_count']} "
+            f"({len(record['serving_endpoints'])} of them can serve)",
+            "",
+            "What the check found:",
+            "",
+        ]
+        lines += [f"- {p}" for p in record["problems"]]
+        lines += [
+            "",
+            "Why this is worth acting on even though nothing looks broken: a Service "
+            "selector is a SUBSET match, so a pod with extra labels is still selected. "
+            "kube-proxy load-balances across every endpoint, so a non-serving pod "
+            "makes a FRACTION of requests fail for as long as it is Running, while the "
+            "Deployment stays Healthy, the Service exists and every pod is Running. It "
+            "reads as flakiness. It has been filed as a flake four times in this fleet "
+            "(TFactory#885, AIFactory#1107, Factory#456, Factory#458).",
+            "",
+            "The fix is to give the non-serving pod template a distinct `app` / "
+            "`app.kubernetes.io/name` value, and to narrow the Service selector so the "
+            "next one cannot rediscover the hole. Check what else selects the label "
+            "first — a NetworkPolicy, PDB or ownership query may depend on it, and a "
+            "pod that no NetworkPolicy selects is UNRESTRICTED.",
+            "",
+            "If a Job is genuinely meant to back this Service, annotate the "
+            f"Job/CronJob `{OPT_OUT_ANNOTATION}: {OPT_OUT_VALUE}` and this will go "
+            "quiet for it.",
+            "",
+            "Every record, including the healthy ones, is in the OpenObserve stream "
+            f"`{os.environ.get('OO_STREAM', 'endpoint_guard')}`:",
+            "",
+            "```sql",
+            f"SELECT * FROM \"endpoint_guard\" WHERE service = '{svc}' "
+            "ORDER BY _timestamp DESC",
+            "```",
+            "",
+            "Raised automatically by the `endpoint-guard` CronJob, and it will be "
+            "closed automatically when the Service has only servable backends again.",
+        ]
+        return "\n".join(lines)
+
+
+    def gh(token: str, method: str, path: str, body: dict | None = None):
+        req = urllib.request.Request(
+            f"https://api.github.com{path}",
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "authorization": f"Bearer {token}",
+                "accept": "application/vnd.github+json",
+                "content-type": "application/json",
+                "user-agent": "factory-endpoint-guard",
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+    def ensure_labels(token: str, repo: str) -> None:
+        """Idempotent. A missing label makes issue creation 422 and the whole
+        notification fail — the alarm silenced by its own first run."""
+        for name, color, desc in (
+            (ISSUE_LABEL, "1d76db", "Raised by the endpoint-guard watchdog"),
+            (SEVERITY_LABELS["critical"], "b60205", "Real traffic is being refused"),
+            (SEVERITY_LABELS["warning"], "fbca04", "Would refuse traffic, or unverifiable"),
+        ):
+            try:
+                gh(token, "POST", f"/repos/{repo}/labels",
+                   {"name": name, "color": color, "description": desc})
+            except urllib.error.HTTPError as e:
+                if e.code != 422:  # 422 = already exists
+                    raise
+
+
+    def open_guard_issues(token: str, repo: str) -> dict:
+        """marker -> issue, over every OPEN issue. Not filtered by label: an issue a
+        human relabelled is still the issue for this finding, and filing a rival
+        beside it is how an alert channel loses its credibility."""
+        out: dict = {}
+        for page in (1, 2, 3):
+            issues = gh(token, "GET",
+                        f"/repos/{repo}/issues?state=open&per_page=100&page={page}") or []
+            for i in issues:
+                for line in (i.get("body") or "").splitlines():
+                    line = line.strip()
+                    if line.startswith("<!-- endpoint-guard:"):
+                        out.setdefault(line, i)
+                        break
+            if len(issues) < 100:
+                break
+        return out
+
+
+    def issue_severity(issue: dict) -> str | None:
+        names = {l.get("name") for l in (issue.get("labels") or [])}
+        for sev, label in SEVERITY_LABELS.items():
+            if label in names:
+                return sev
+        return None
+
+
+    def notify_action(record: dict, issue: dict | None, now: datetime,
+                      renotify_hours: float) -> str | None:
+        """Pure. (record, its open issue or None) -> what to do. None = stay quiet.
+
+        Both halves matter equally. A Service with a non-serving endpoint and no issue
+        MUST produce one. A healthy fleet, and an already-reported finding, MUST
+        produce nothing — an alert that repeats every ten minutes is muted inside a
+        week, and a muted alarm is the silence this exists to end.
+        """
+        sev = severity_of(record)
+        if sev is None:
+            return "close" if issue else None
+        if issue is None:
+            return "open"
+        if sev != issue_severity(issue):
+            return "escalate"
+        if sev == "critical":
+            age = (now - _parse_ts(issue["updated_at"])).total_seconds()
+            if age >= renotify_hours * 3600:
+                return "renotify"
+        return None
+
+
+    def notify(token: str, repo: str, records: list, now: datetime,
+               renotify_hours: float) -> int:
+        ensure_labels(token, repo)
+        existing = open_guard_issues(token, repo)
+        sent = 0
+        for r in records:
+            key = MARKER.format(service=r["service"])
+            issue = existing.get(key)
+            action = notify_action(r, issue, now, renotify_hours)
+            if action is None:
+                continue
+            sev = severity_of(r)
+            svc = r["service"]
+            if action == "open":
+                new = gh(token, "POST", f"/repos/{repo}/issues", {
+                    "title": issue_title(r, sev),
+                    "body": issue_body(r, sev),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                eprint(f"NOTIFIED  {svc} [{sev}] -> opened {repo}#{new['number']}")
+            elif action == "escalate":
+                was = issue_severity(issue)
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}", {
+                    "title": issue_title(r, sev),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Severity changed: **{was} -> {sev}**.\n\n"
+                            + issue_body(r, sev)})
+                eprint(f"NOTIFIED  {svc} [{was} -> {sev}] -> {repo}#{issue['number']}")
+            elif action == "renotify":
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Still unresolved after {renotify_hours:g}h.\n\n"
+                            + issue_body(r, sev)})
+                eprint(f"NOTIFIED  {svc} [still {sev}] -> {repo}#{issue['number']}")
+            elif action == "close":
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"RESOLVED. Every endpoint of `{svc}` now declares the "
+                            "Service's target port, and no Job or CronJob pod template "
+                            "satisfies its selector. Closing automatically."})
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+                   {"state": "closed", "state_reason": "completed"})
+                eprint(f"HEALTHY   {svc} -> closed {repo}#{issue['number']}")
+            sent += 1
+
+        # ORPHANS: an open issue for a Service that no longer exists. Nothing else
+        # will ever close it, because closing is driven by a record. A permanent
+        # unactionable critical is what trains people to ignore the label.
+        seen = {MARKER.format(service=r["service"]) for r in records}
+        for key, issue in existing.items():
+            if key in seen:
+                continue
+            gone = key.split("endpoint-guard:", 1)[1].split(" ", 1)[0]
+            gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+               {"body": f"Service `{gone}` is no longer present in the watched "
+                        "namespace, so this finding can no longer be evaluated. "
+                        "Closing.\n\nIf it was not retired deliberately then its "
+                        "disappearance is itself the problem, not the fix."})
+            gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+               {"state": "closed", "state_reason": "not_planned"})
+            eprint(f"GONE      {gone} -> closed {repo}#{issue['number']}")
+            sent += 1
+        return sent
+
+
+    # ---------------------------------------------------------------------------
+    # I/O
+    # ---------------------------------------------------------------------------
+
+
+    def k8s_get(path: str):
+        with open(f"{SA}/token") as f:
+            token = f.read().strip()
+        req = urllib.request.Request(
+            f"https://kubernetes.default.svc{path}",
+            headers={"authorization": f"Bearer {token}", "accept": "application/json"},
+            method="GET",
+        )
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            return json.load(r)
+
+
+    def emit(oo: str, org: str, stream: str, basic: str, records: list) -> None:
+        req = urllib.request.Request(
+            f"{oo}/api/{org}/{stream}/_json",
+            data=json.dumps(records).encode(),
+            headers={"authorization": f"Basic {basic}", "content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.load(r)
+        st = (res.get("status") or [{}])[0] if isinstance(res.get("status"), list) else res
+        if isinstance(st, dict) and st.get("failed"):
+            raise RuntimeError(f"OpenObserve rejected {st['failed']} record(s): {res}")
+
+
+    def collect(ns: str) -> list:
+        services = k8s_get(f"/api/v1/namespaces/{ns}/services")["items"]
+        pods = k8s_get(f"/api/v1/namespaces/{ns}/pods")["items"]
+        endpoints = k8s_get(f"/api/v1/namespaces/{ns}/endpoints")["items"]
+        jobs = k8s_get(f"/apis/batch/v1/namespaces/{ns}/jobs")["items"]
+        crons = k8s_get(f"/apis/batch/v1/namespaces/{ns}/cronjobs")["items"]
+        # The list API omits `kind` on items; template_labels/assess need it.
+        for j in jobs:
+            j["kind"] = "Job"
+        for c in crons:
+            c["kind"] = "CronJob"
+        return build_records(services, pods, endpoints, jobs + crons)
+
+
+    def main() -> int:
+        ns = os.environ.get("NAMESPACE", "factory")
+        now = datetime.now(timezone.utc)
+        oo = os.environ.get(
+            "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080").rstrip("/")
+        org = os.environ.get("OO_ORG", "default")
+        stream = os.environ.get("OO_STREAM", "endpoint_guard")
+        user, pw = os.environ.get("OO_USER", ""), os.environ.get("OO_PASS", "")
+        repo = os.environ.get("ALERT_REPO", "")
+        token = os.environ.get("GITHUB_TOKEN", "")
+        renotify = float(os.environ.get("ALERT_RENOTIFY_HOURS", "24"))
+
+        # Fatal up front. Without a delivery path the findings reach nobody, and a
+        # green job that told nobody anything is the defect, not a degraded mode.
+        if not repo or not token:
+            eprint("FATAL: ALERT_REPO/GITHUB_TOKEN not set — findings would reach nobody")
+            return 2
+        if not user or not pw:
+            eprint("FATAL: OO_USER/OO_PASS not set (observe-root secret missing)")
+            return 2
+
+        records = collect(ns)
+        stamp = now.isoformat()
+        for r in records:
+            r["_timestamp"] = stamp
+            r["namespace"] = ns
+            r["severity"] = severity_of(r) or "ok"
+        emit(oo, org, stream, base64.b64encode(f"{user}:{pw}".encode()).decode(), records)
+
+        bad = [r for r in records if not r["healthy"]]
+        for r in records:
+            mark = "OK  " if r["healthy"] else f"{(severity_of(r) or '').upper():8s}"
+            eprint(f"{mark} {r['service']}: {'; '.join(r['problems']) or 'all endpoints can serve'}")
+        sent = notify(token, repo, records, now, renotify)
+        eprint(f"checked {len(records)} services, {len(bad)} with findings, "
+               f"{sent} notification(s) sent")
+        return 0
+
+
+    # ---------------------------------------------------------------------------
+    # Self-test. Mutation-checked in both directions: it MUST flag a deliberately
+    # mislabelled template and MUST stay silent on a corrected fleet. A check that
+    # only ever passes proves nothing, which is the failure mode this whole app is
+    # about.
+    # ---------------------------------------------------------------------------
+
+
+    def _require(cond: bool, msg: str) -> None:
+        if not cond:
+            raise AssertionError(msg)
+
+
+    def _svc(name, selector, port=3101, target=None):
+        return {
+            "kind": "Service",
+            "metadata": {"name": name},
+            "spec": {"selector": selector,
+                     "ports": [{"port": port, "targetPort": target or port}]},
+        }
+
+
+    def _pod(name, labels, ports, owner="ReplicaSet"):
+        return {
+            "kind": "Pod",
+            "metadata": {"name": name, "labels": labels,
+                         "ownerReferences": [{"kind": owner, "name": "x"}]},
+            "spec": {"containers": [{"name": "c", "ports": [
+                ({"containerPort": p} if isinstance(p, int) else {"name": p,
+                                                                  "containerPort": 1})
+                for p in ports]}]},
+        }
+
+
+    def _ep(name, pod_names):
+        return {
+            "metadata": {"name": name},
+            "subsets": [{"addresses": [
+                {"targetRef": {"kind": "Pod", "name": n}} for n in pod_names]}],
+        }
+
+
+    def _job(name, labels, kind="Job", annotations=None):
+        tpl = {"metadata": {"labels": labels}, "spec": {}}
+        meta = {"name": name}
+        if annotations:
+            meta["annotations"] = annotations
+        if kind == "CronJob":
+            return {"kind": "CronJob", "metadata": meta,
+                    "spec": {"jobTemplate": {"spec": {"template": tpl}}}}
+        return {"kind": "Job", "metadata": meta, "spec": {"template": tpl}}
+
+
+    def _selftest() -> int:
+        now = datetime.now(timezone.utc)
+
+        # --- selector semantics: the subset rule every instance of this bug assumed away
+        _require(selector_matches({"app": "x"}, {"app": "x", "extra": "y"}),
+                 "SUBSET match: extra pod labels must NOT exclude the pod. Getting this "
+                 "backwards is the entire bug.")
+        _require(not selector_matches({"app": "x", "c": "s"}, {"app": "x"}),
+                 "a pod missing a selector key must not match")
+        _require(not selector_matches({}, {"app": "x"}),
+                 "an empty selector must never match (a selectorless Service has no "
+                 "label-driven endpoints at all)")
+
+        # --- port comparison must handle NAMED targetPorts, or every named-port
+        #     Service in the fleet is reported broken and the check gets deleted.
+        named = _svc("obs", {"app": "obs"}, port=5080, target="http")
+        ok_named = _pod("obs-1", {"app": "obs"}, ["http"])
+        _require(assess_endpoint(named, ok_named) is None,
+                 "a pod declaring the NAMED targetPort must pass")
+
+        # ============ THE BUG, exactly as it shipped ============
+        svc = _svc("aifactory", {"app": "aifactory"}, port=3101)
+        api = _pod("aifactory-abc", {"app": "aifactory"}, [3101])
+        task = _pod("factory-aifactory-task-xyz",
+                    {"app": "aifactory", "factory.io/kind": "task"}, [], owner="Job")
+        # A task pod that declares SOME port but not the Service's — the certain case.
+        task_other = _pod("factory-aifactory-other",
+                          {"app": "aifactory"}, [9999], owner="Job")
+
+        buggy_job = _job("factory-aifactory-build",
+                         {"app": "aifactory", "factory.io/kind": "task"})
+        recs = build_records([svc], [api, task_other],
+                             [_ep("aifactory", ["aifactory-abc", "factory-aifactory-other"])],
+                             [buggy_job])
+        r = recs[0]
+        _require(not r["healthy"], "the shipped bug MUST be reported")
+        _require("endpoint_cannot_serve" in r["codes"],
+                 f"observed signal must fire on a non-serving endpoint: {r['codes']}")
+        _require("job_template_joins_service" in r["codes"],
+                 f"predicted signal must fire on the Job template: {r['codes']}")
+        _require(severity_of(r) == "critical", "traffic being refused now is critical")
+        _require(r["serving_endpoints"] == ["aifactory-abc"],
+                 "the real API pod must still be counted as serving")
+
+        # The predicted signal alone, with NO pod running — the case that makes this
+        # check work at all, since these Jobs live for two minutes.
+        recs = build_records([svc], [api], [_ep("aifactory", ["aifactory-abc"])],
+                             [buggy_job])
+        _require(not recs[0]["healthy"],
+                 "a Job TEMPLATE that would join must be reported even with no pod up "
+                 "— a currently clean endpoint list is not evidence of absence")
+        _require(recs[0]["codes"] == ["job_template_joins_service"], recs[0]["codes"])
+        _require(severity_of(recs[0]) == "warning", "not in flight -> warning")
+
+        # A CronJob is guaranteed to recur, so it outranks a one-off Job.
+        recs = build_records([svc], [api], [_ep("aifactory", ["aifactory-abc"])],
+                             [_job("nightly", {"app": "aifactory"}, kind="CronJob")])
+        _require(severity_of(recs[0]) == "critical",
+                 "a CronJob template will fire again on its schedule -> critical")
+
+        # The unverifiable case: an endpoint pod declaring no ports at all. Reported,
+        # not skipped (standards §4.7), and not escalated to certain.
+        recs = build_records([svc], [api, task],
+                             [_ep("aifactory", ["aifactory-abc",
+                                                "factory-aifactory-task-xyz"])], [])
+        _require("unverifiable_endpoint" in recs[0]["codes"], recs[0]["codes"])
+        _require(severity_of(recs[0]) == "warning", "unevaluable is a warning, not silence")
+        _require(not recs[0]["healthy"], "unevaluable must NOT read as healthy")
+
+        # ============ THE FIX, and it must go quiet ============
+        fixed_job = _job("factory-aifactory-build",
+                         {"app": "aifactory-task", "factory.io/service": "aifactory",
+                          "factory.io/kind": "task"})
+        recs = build_records([svc], [api], [_ep("aifactory", ["aifactory-abc"])],
+                             [fixed_job])
+        r = recs[0]
+        _require(r["healthy"], f"the corrected fleet must be SILENT: {r['problems']}")
+        _require(severity_of(r) is None, "healthy -> no severity")
+        _require(notify_action(r, None, now, 24) is None,
+                 "a healthy Service with no issue must produce no GitHub traffic")
+        _require(r["serving_endpoints"] == ["aifactory-abc"],
+                 "and the real backend must still be there — a fix that empties the "
+                 "Service is worse than the bug")
+
+        # The Helm variant: component label added but selectorLabels still present.
+        # This is what three of the four charts shipped, and the reason the naive
+        # 'just add a component label' fix does not work.
+        helm_svc = _svc("tf", {"app.kubernetes.io/name": "tfactory",
+                               "app.kubernetes.io/instance": "tfactory"}, port=3103)
+        helm_cron = _job("tf-regression",
+                         {"app.kubernetes.io/name": "tfactory",
+                          "app.kubernetes.io/instance": "tfactory",
+                          "app.kubernetes.io/component": "regression-cron"},
+                         kind="CronJob")
+        _require(assess_template(helm_cron, [helm_svc]) == ["tf"],
+                 "adding a `component` label must NOT be treated as excluding the pod")
+        helm_fixed = _job("tf-regression",
+                          {"app.kubernetes.io/name": "tfactory-regression",
+                           "app.kubernetes.io/instance": "tfactory",
+                           "app.kubernetes.io/component": "regression-cron"},
+                          kind="CronJob")
+        _require(assess_template(helm_fixed, [helm_svc]) == [],
+                 "a distinct name label must clear it")
+
+        # The escape hatch works, and ONLY with the exact value.
+        _require(assess_template(
+            _job("x", {"app": "aifactory"},
+                 annotations={OPT_OUT_ANNOTATION: OPT_OUT_VALUE}), [svc]) == [],
+            "the documented opt-out must silence a deliberate Service-backing Job")
+        _require(assess_template(
+            _job("x", {"app": "aifactory"},
+                 annotations={OPT_OUT_ANNOTATION: "yes"}), [svc]) == ["aifactory"],
+            "a wrong annotation value must NOT silence it")
+
+        # Recovery closes the issue rather than leaving a stale critical open.
+        stale = {"number": 7, "labels": [{"name": SEVERITY_LABELS["critical"]}],
+                 "updated_at": now.isoformat().replace("+00:00", "Z"),
+                 "created_at": now.isoformat().replace("+00:00", "Z"), "body": ""}
+        _require(notify_action(recs[0] | {"codes": [], "healthy": True}, stale, now, 24)
+                 == "close", "a recovered Service must close its issue")
+
+        # A selectorless Service (kubernetes, ExternalName) must be skipped, not
+        # reported as matching everything.
+        _require(build_records([{"kind": "Service", "metadata": {"name": "ext"},
+                                 "spec": {}}], [], [], [buggy_job]) == [],
+                 "a Service with no selector yields no record")
+
+        print("endpoint-guard self-test: PASS — subset semantics, named ports, both "
+              "signals, severity grading, unevaluable-is-a-finding, opt-out, "
+              "recovery-closes, and the corrected fleet stays silent")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: endpoint-guard
+  namespace: factory
+  labels: { app: endpoint-guard }
+spec:
+  # Every 10 minutes, matching apps/fleet-match. Polling faster buys little: the
+  # PREDICTED signal reads Job and CronJob templates, which outlive their pods
+  # (ttlSecondsAfterFinished is 300s for task Jobs, 600s for the minio hook, 3600s
+  # for the portal-ui Job), so a short-lived offender is still reported long after
+  # its pod is gone. Cost of the cadence, stated rather than hidden: 5 read-only
+  # in-cluster API list calls per run, plus 1-3 authenticated GitHub calls only
+  # when something is unhealthy. A healthy fleet makes no GitHub write calls at all.
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        # app=endpoint-guard, NOT app=<anything a Service selects>. This app would
+        # be a poor advertisement for itself if its own Job pod joined a Service.
+        # It is also the case the check would report on itself, which is the
+        # cheapest possible end-to-end test of the predicted signal: if this label
+        # is ever changed to collide, the next run raises an issue about it.
+        metadata: { labels: { app: endpoint-guard } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          serviceAccountName: endpoint-guard
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: guard
+              # Stock python; the script is stdlib-only, so there is no custom
+              # image and nothing to rebuild when it changes. (A watchdog whose own
+              # image needs a deploy to update would be a poor watchdog.)
+              image: python:3.12-slim
+              command: ["python3", "/script/guard.py"]
+              env:
+                - { name: NAMESPACE, value: "factory" }
+                - { name: OO_STREAM, value: "endpoint_guard" }
+                - { name: OO_ORG, value: "default" }
+                # Where findings go so a human passively meets them — the same repo
+                # and channel apps/job-watchdog and apps/fleet-match use.
+                - { name: ALERT_REPO, value: "olafkfreund/Factory" }
+                - { name: ALERT_RENOTIFY_HOURS, value: "24" }
+                # Existing fleet token; needs `repo` (issues). No new secret, and
+                # no token is committed anywhere.
+                - name: GITHUB_TOKEN
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } }
+                # Same observe-root secret apps/job-watchdog already uses.
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: endpoint-guard-script
