@@ -65,10 +65,43 @@ spec:
     metadata: { labels: { app: cloudflared } }
     spec:
       enableServiceLinks: false
+      # Factory#521. This pod had NO securityContext at all — not pod level, not
+      # container level — and it is the outbound tunnel: every public request to
+      # *.freundcloud.org.uk arrives through this process.
+      #
+      # runAsUser is explicit and NUMERIC. The image already declares
+      # `USER 65532:65532` (measured: docker image inspect -> Config.User
+      # "65532:65532"), so this changes nothing at runtime and makes the kubelet
+      # refuse to start the pod the day an image bump drops that directive.
+      # A NAME here would be AIFactory#848 all over again — runAsNonRoot cannot
+      # resolve one.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: cloudflared
           image: docker.io/cloudflare/cloudflared:2026.5.2
           args: ["tunnel", "--config", "/etc/cloudflared/config.yaml", "run"]
+          # readOnlyRootFilesystem is safe here and MEASURED, not assumed: run
+          # read-only as 65532 with --cap-drop ALL and no-new-privileges against
+          # this exact tag, with this config shape mounted read-only, and it
+          # reaches "Starting metrics server on [::]:2000/metrics" plus a full
+          # PASS on the connectivity pre-checks. It is a static Go binary with
+          # no-autoupdate: config and credentials are both read-only mounts and
+          # nothing else touches disk.
+          #
+          # drop ALL removes NET_RAW, which cloudflared uses for its ICMP proxy
+          # (ping THROUGH the tunnel). Every ingress rule above is an http
+          # service, so nothing here needs it; the daemon logs the ICMP source
+          # it picked and carries on. Add NET_RAW back only if an ICMP route is
+          # ever added to the ingress list.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           livenessProbe: { httpGet: { path: /ready, port: 2000 }, initialDelaySeconds: 10, periodSeconds: 20 }
           volumeMounts:
             - { name: config, mountPath: /etc/cloudflared, readOnly: true }
