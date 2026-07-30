@@ -40,9 +40,35 @@ spec:
             cpu: "100m"
             memory: "128Mi"
         securityContext:
+          # Factory#521 — ACCEPTED EXCEPTION, now with the reason attached.
+          # `runAsNonRoot: false` here was explicit, i.e. somebody decided it,
+          # unlike the Deployments in Factory#503 where the field was simply
+          # absent. #521 asked for the decision to be confirmed rather than
+          # inherited. It is correct, and this manifest is why: the
+          # `odin-ssh-key` Secret below is mounted at /root/.ssh, and in this
+          # image /root is `drwx------ root root` with HOME=/root (measured:
+          # `id` -> uid=0(root), `ls -ld /root` -> drwx------). A non-root uid
+          # cannot traverse /root, so it could not read its own deploy key.
+          # Changing that means moving the mount off /root and giving the image
+          # a non-root USER — an Odin image change, not a manifest one.
+          #
+          # readOnlyRootFilesystem: false is likewise kept: uvicorn runs with
+          # --reload against /app and Python writes __pycache__ there.
+          #
+          # What was missing and is added: seccompProfile RuntimeDefault and
+          # drop ALL. Measured against the live image sha-50b5932 with
+          # --cap-drop ALL --security-opt no-new-privileges:
+          #   INFO: Uvicorn running on http://0.0.0.0:8000
+          #   INFO: Application startup complete.
+          #   GET / -> 200
+          # A root container with no capabilities is still root, but it is a
+          # materially smaller target than root with the full default set.
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: false
           runAsNonRoot: false
+          seccompProfile: { type: RuntimeDefault }
+          capabilities:
+            drop: ["ALL"]
         volumeMounts:
         - name: ssh-key
           mountPath: /root/.ssh
