@@ -29,7 +29,22 @@ spec:
     spec:
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
-      securityContext: { fsGroup: 65532 }
+      # Factory#503. Every CronJob in this namespace has carried this set since
+      # it was written; the Deployments never did, so nothing VERIFIED that the
+      # control plane runs non-root — the image's `USER nonroot` was the only
+      # thing holding it, and an image change that dropped it would start this
+      # pod as root silently.
+      # runAsUser is explicit and NUMERIC on purpose: the chainguard image's
+      # `USER nonroot` is a NAME, and `runAsNonRoot: true` alone cannot resolve a
+      # name — that is AIFactory#848, where every build Job died
+      # CreateContainerConfigError. 65532 IS chainguard's `nonroot`, i.e. the uid
+      # this pod already runs as; setting it changes nothing at runtime and makes
+      # the kubelet refuse to start the pod the day the image changes.
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
       initContainers:
         # The provider CLIs (claude-code/codex/gemini + antigravity) are now BAKED
         # into the image at /home/nonroot/.npm-global (#791) — the install-clis
@@ -48,8 +63,23 @@ spec:
               cp /seed/codex-auth.json          /h/.codex/auth.json
               cp /seed/copilot-apps.json        /h/.config/github-copilot/apps.json
               cp /seed/gemini-oauth_creds.json  /h/.gemini/oauth_creds.json
-              chmod -R g+rwX /h/.claude /h/.codex /h/.gemini /h/.config
+              # `|| true` is load-bearing under the pod-level runAsUser: 65532
+              # added for Factory#503. The four mount ROOTS are owned root:65532
+              # (kubelet applies fsGroup), and chmod(2) requires ownership, so as
+              # uid 65532 they return EPERM. Measured, not assumed:
+              #   chmod: /h/.claude: Operation not permitted
+              # With `set -e` that aborts the init container and the pod never
+              # starts at all. Everything BELOW the roots still gets chmod'd.
+              # The chmod is near-redundant now anyway — every file here is
+              # created by 65532, so it is already owner-writable.
+              chmod -R g+rwX /h/.claude /h/.codex /h/.gemini /h/.config || true
               echo "seeded:"; ls -la /h/.claude /h/.codex /h/.gemini
+          # Writes only into the mounts above, so a read-only root fs is free.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - { name: cc-claude, mountPath: /h/.claude }
             - { name: cc-codex,  mountPath: /h/.codex }
@@ -93,6 +123,9 @@ spec:
                   time.sleep(60)
           securityContext:
             allowPrivilegeEscalation: false
+            # Stdlib-only inline script; every write goes to the /h/.claude
+            # emptyDir. Verified read-only + uid 65532 against python:3.12-slim.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           resources:
@@ -104,6 +137,21 @@ spec:
         - name: pfactory
           image: ghcr.io/olafkfreund/pfactory:0.6.0
           imagePullPolicy: IfNotPresent
+          # Factory#503. readOnlyRootFilesystem is DELIBERATELY ABSENT here, and
+          # this is the honest reason rather than an oversight:
+          # this container is an agent host. It writes outside every mounted
+          # volume — tempfile lands in /tmp, and the provider CLIs it spawns
+          # (claude/codex/gemini/npm/git) write ~/.claude.json at the HOME root
+          # (not under the .claude mount) plus npm/git/XDG state. An emptyDir
+          # over /home/nonroot would MASK the CLIs baked at
+          # /home/nonroot/.npm-global (#791), so the obvious fix is the wrong
+          # one. Enabling it needs each write path enumerated and given its own
+          # volume; until then it would trade an unenforced control for a service
+          # that 500s at runtime. Tracked separately.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports: [{ containerPort: 3114 }]
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
