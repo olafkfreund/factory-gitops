@@ -53,10 +53,37 @@ spec:
     metadata: { labels: { app: redis } }
     spec:
       enableServiceLinks: false
-      securityContext: { fsGroup: 999, runAsUser: 999, runAsNonRoot: true }
+      # Factory#521. This pod was already the closest to the standard — non-root
+      # was enforced at pod level — but it had no seccompProfile and its
+      # container had no securityContext at all, so it kept every default
+      # capability. uid 999 is unchanged and deliberately so: the redis-data PVC
+      # is owned by 999 and a different uid here would come up unable to read
+      # its own AOF.
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: redis
           image: redis:7.4.2-alpine
+          # readOnlyRootFilesystem is MEASURED. redis:7.4.2-alpine run read-only
+          # as uid 999 with --cap-drop ALL and no-new-privileges, /data writable:
+          #   * Creating AOF base file appendonly.aof.1.base.rdb on server start
+          #   * Ready to accept connections tcp
+          #   redis-cli ping -> PONG
+          # PONG is the exact readiness AND liveness probe below, so the proof is
+          # a request against the server rather than a pod status.
+          # Everything durable goes to /data (the PVC); nothing else touches
+          # disk with `--save ""`.
+          # `Increased maximum number of open files to 10032` still succeeds
+          # with ALL capabilities dropped — that raise is soft-limit-to-hard,
+          # which needs no SYS_RESOURCE.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           # appendonly: durable-ish across restarts (panes index survives a
           # bounce). pub/sub itself is fire-and-forget; the AOF only persists
           # the panes-index hash, which the app also rebuilds on session create.
