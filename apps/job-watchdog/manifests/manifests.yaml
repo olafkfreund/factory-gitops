@@ -35,10 +35,38 @@
 # job" — unreachable API server, or OpenObserve refused the record. The findings
 # live in the stream.
 #
-# WHO WATCHES THE WATCHDOG: it is a CronJob in this namespace, so it reports on
-# itself like any other. If it stops running entirely, its own absence is
-# visible as `job_health` having no records at all for a window — a stacked
-# second watchdog would just move the same question one level up.
+# WHO WATCHES THE WATCHDOG (Factory#450): the previous answer here — "it is a
+# CronJob in this namespace, so it reports on itself like any other" — was true
+# only while the notification path worked, which is the one case where it is
+# needed. If notify() fails permanently (token revoked, ALERT_REPO renamed,
+# GitHub unreachable) then every run returns 5 before reaching the step that
+# would have reported the previous run's failure, forever, and the only evidence
+# is failed Jobs nobody is watching. Same shape if this CronJob is suspended or
+# deleted: nothing emits, nothing notifies, and its absence is silence.
+#
+# A dead-man's switch cannot be built out of the thing it is watching, so the
+# watchdog PUSHES A HEARTBEAT OUT instead: after a successful notify, it stamps
+# a UTC timestamp into the GitHub Actions repo variable JOB_WATCHDOG_HEARTBEAT
+# on ALERT_REPO. A scheduled workflow in that repo then asserts on the
+# heartbeat's ABSENCE — it goes red when the stamp is missing or stale.
+#
+# Direction matters. The rejected alternative was GitHub Actions reaching INTO
+# the cluster to read `job_health`, which needs an SSO-bypassing ingress on the
+# audit log: new external attack surface, opened to close a monitoring gap.
+# Pushing out needs no inbound reachability, no new credential (the same
+# GITHUB_TOKEN it already uses for issues) and no new account. And it fails
+# correctly for every case at once: notify broken, CronJob suspended, CronJob
+# deleted, cluster down, node gone. All of them stop the stamp.
+#
+# THE ORDER IS THE WHOLE POINT: the stamp happens only AFTER notify() succeeds,
+# never after the OpenObserve emit. Stamping after the emit would mean a
+# watchdog that emits fine but cannot notify keeps its heartbeat fresh and
+# reports itself healthy while telling nobody anything — which is precisely the
+# defect this closes, rebuilt one layer in.
+#
+# A stamp that cannot be written FAILS THE RUN (exit 6). The heartbeat is part
+# of the contract, not a nice-to-have: a gate that cannot run must fail. The
+# stale heartbeat is the durable signal and the red Job is the immediate one.
 #
 # ROUTING TO A HUMAN (Factory#439): the durable record above was still
 # functionally silent. The watchdog logged "postgres-backup has NEVER succeeded
@@ -147,12 +175,18 @@ data:
     stream alone was not a notification: it was read by nobody for days while the
     fleet ran with no database backup at all.
 
+    Finally it stamps a HEARTBEAT out to a GitHub Actions repo variable, so that
+    a scheduled workflow outside the cluster can go red on the watchdog's own
+    silence (#450). Only after the notification succeeded — see the manifest
+    header.
+
     Exit codes: 0 = reported (whatever the findings), 2 = no OpenObserve
     credentials, 3 = kubernetes API unreachable, 4 = OpenObserve ingest failed,
-    5 = notification could not be delivered. A non-zero exit means THIS JOB is
-    broken, never that a watched job is. 5 counts as much as the rest: an alert
-    path that is not proven to deliver is the same bug one layer up, so an
-    undelivered notification is a hard failure and never a logged warning.
+    5 = notification could not be delivered, 6 = heartbeat could not be stamped.
+    A non-zero exit means THIS JOB is broken, never that a watched job is. 5 and
+    6 count as much as the rest: an alert path that is not proven to deliver is
+    the same bug one layer up, so neither an undelivered notification nor an
+    unprovable liveness is ever a logged warning.
 
     Env:
       NAMESPACE             namespace to watch (default "factory")
@@ -164,6 +198,8 @@ data:
       ALERT_REPO            owner/repo to raise issues on
       ALERT_RENOTIFY_HOURS  re-comment cadence for critical (default 24)
       GITHUB_TOKEN          token with `repo` scope on ALERT_REPO
+      HEARTBEAT_VAR         Actions variable to stamp on ALERT_REPO
+                            (default "JOB_WATCHDOG_HEARTBEAT")
     """
 
     import base64
@@ -686,6 +722,32 @@ data:
         return sent
 
 
+    def heartbeat(token: str, repo: str, name: str, now: datetime) -> str:
+        """Stamp `now` into the ALERT_REPO Actions variable `name`.
+
+        The dead-man's switch for the watchdog itself (Factory#450). Called
+        ONLY after notify() has succeeded — see the manifest header for why
+        the order is the entire mechanism and not a detail.
+
+        PATCH first, POST on 404: the variable is created on the very first
+        run so nothing has to be seeded by hand, and a hand-deleted variable
+        heals itself on the next run rather than staying red forever.
+
+        Returns the value written. Raises on failure; the caller turns that
+        into a red Job.
+        """
+        stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            gh(token, "PATCH", f"/repos/{repo}/actions/variables/{name}",
+               {"name": name, "value": stamp})
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            gh(token, "POST", f"/repos/{repo}/actions/variables",
+               {"name": name, "value": stamp})
+        return stamp
+
+
     def main() -> int:
         ns = os.environ.get("NAMESPACE", "factory")
         threshold = int(os.environ.get("FAIL_THRESHOLD", "2"))
@@ -703,6 +765,7 @@ data:
         repo = os.environ.get("ALERT_REPO", "")
         token = os.environ.get("GITHUB_TOKEN", "")
         renotify = float(os.environ.get("ALERT_RENOTIFY_HOURS", "24"))
+        hb_var = os.environ.get("HEARTBEAT_VAR", "JOB_WATCHDOG_HEARTBEAT")
         # Checked UP FRONT, before any work, and fatal — never a warning that
         # degrades to stream-only. Silently running without a notification path
         # is the exact defect #439 is about, and it would be undetectable from
@@ -756,6 +819,18 @@ data:
             eprint(f"FATAL: cannot notify via {repo}: {e!r}")
             return 5
         eprint(f"notifications sent: {sent} (silence on healthy and on already-reported)")
+
+        # AFTER notify, never after the emit. A watchdog that emits fine but
+        # cannot notify must NOT be able to report itself alive — that is the
+        # whole of Factory#450, and stamping any earlier would rebuild it.
+        try:
+            stamp = heartbeat(token, repo, hb_var, now)
+        except Exception as e:  # noqa: BLE001 — an unprovable liveness is a finding
+            eprint(f"FATAL: cannot stamp heartbeat {hb_var} on {repo}: {e!r}")
+            eprint("       the scheduled check on its absence will go red; this "
+                   "run reports red too so both signals agree")
+            return 6
+        eprint(f"heartbeat {hb_var}={stamp}")
 
         # Exit 0 on findings BY DESIGN: see the manifest header. A red watchdog
         # must mean the watchdog is broken, not that a watched job is.
@@ -1051,6 +1126,74 @@ data:
         assert issue_title(cb, "critical") == \
             "[critical] cred-broker has not succeeded within its tolerance", issue_title(cb, "critical")
         assert issue_title(blip, "warning") == "[warning] blip is failing"
+
+        # ------------------------------------------------------------------
+        # HEARTBEAT (Factory#450). The dead-man's switch this watchdog cannot
+        # check for itself, so its contract is checked here instead.
+        # ------------------------------------------------------------------
+        calls.clear()
+        globals()["gh"] = fake_gh
+        try:
+            # Normal run: one PATCH, and the value is a parseable UTC stamp the
+            # consumer workflow can subtract from `now`.
+            stamp = heartbeat("t", "o/r", "JOB_WATCHDOG_HEARTBEAT", now)
+            assert calls == [("PATCH",
+                              "/repos/o/r/actions/variables/JOB_WATCHDOG_HEARTBEAT")], calls
+            assert _parse_ts(stamp) == now.replace(microsecond=0), stamp
+
+            # First ever run, or someone deleted the variable: 404 on PATCH must
+            # CREATE it, not fail forever. A switch that needs hand-seeding is a
+            # switch that is off.
+            def gh_404(token, method, path, body=None):
+                calls.append((method, path))
+                if method == "PATCH":
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+                return {}
+
+            calls.clear()
+            globals()["gh"] = gh_404
+            heartbeat("t", "o/r", "JOB_WATCHDOG_HEARTBEAT", now)
+            assert calls == [
+                ("PATCH", "/repos/o/r/actions/variables/JOB_WATCHDOG_HEARTBEAT"),
+                ("POST", "/repos/o/r/actions/variables"),
+            ], calls
+
+            # Anything that is NOT a missing variable propagates. A revoked
+            # token (401) or a renamed repo must reach main() and turn the run
+            # red — swallowing it is how a heartbeat starts lying. The stub
+            # deliberately lets POST SUCCEED, so a 404-only guard that decayed
+            # into catch-everything would quietly "create" its way to green
+            # here instead of raising.
+            def gh_401(token, method, path, body=None):
+                calls.append((method, path))
+                if method == "PATCH":
+                    raise urllib.error.HTTPError(path, 401, "Unauthorized", {}, None)
+                return {}
+
+            calls.clear()
+            globals()["gh"] = gh_401
+            try:
+                heartbeat("t", "o/r", "JOB_WATCHDOG_HEARTBEAT", now)
+                raise AssertionError("a rejected stamp must not be swallowed")
+            except urllib.error.HTTPError as e:
+                assert e.code == 401
+            assert calls == [
+                ("PATCH", "/repos/o/r/actions/variables/JOB_WATCHDOG_HEARTBEAT")
+            ], f"a non-404 must not fall through to create: {calls}"
+        finally:
+            globals()["gh"] = real_gh
+
+        # THE ORDERING CONSTRAINT, asserted on the source rather than trusted:
+        # the stamp must come after the notify call. If it ever drifts above it,
+        # a watchdog that cannot notify would keep its heartbeat fresh and report
+        # itself healthy while telling nobody anything.
+        src = open(__file__).read() if os.path.exists(__file__) else ""
+        if src:
+            body_of_main = src.split("def main() -> int:", 1)[1]
+            assert body_of_main.index("sent = notify(") < body_of_main.index(
+                "stamp = heartbeat("), "heartbeat must be stamped AFTER notify"
+            assert body_of_main.index("emit(oo,") < body_of_main.index(
+                "sent = notify("), "emit still comes first; a dropped record is a blind spot"
 
         print("selftest OK")
         return 0
