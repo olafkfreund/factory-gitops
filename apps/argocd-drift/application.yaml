@@ -1,0 +1,42 @@
+# argocd-drift — is ArgoCD's `Synced` actually true? (Factory#425)
+#
+# ArgoCD's `status.sync.revision` is the revision its repo-server last
+# RESOLVED, served from a Redis `git-refs` cache with its own 180s TTL. So
+# `Synced` means "synced to the revision I last fetched", not "synced to what
+# git says", and the two are indistinguishable from outside. On 2026-07-28 a
+# tfactory image bump landed in gitops and ArgoCD reported Synced/Healthy
+# against the previous commit while the pod ran a 68-minute-old image; it
+# happened twice more the following day, both times stranding the fix the
+# author was about to verify.
+#
+# This app re-checks that claim from outside ArgoCD, against the git remote
+# itself, every 5 minutes, and writes a durable record per Application into
+# the OpenObserve stream `argocd_drift`. It is the thing that makes a future
+# regression visible instead of silent — the webhook (docs/argocd-sync-
+# honesty.md) shrinks the blind window, this proves the window closed.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
+# the manifests/ kustomization; the Role that reads Applications is pinned to
+# the `argocd` namespace inside the manifests, everything else to `factory`.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-drift
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/argocd-drift/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

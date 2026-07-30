@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# NO `namespace:` transformer here, unlike the other apps. This app spans two
+# namespaces on purpose: the CronJob runs in `factory` (where the observe-root
+# secret lives) but the Role that lets it read Applications must live in
+# `argocd` (where Applications live). A blanket transformer would rewrite the
+# Role into `factory`, where it would grant nothing. Each resource carries its
+# own explicit namespace instead.
+resources:
+  - manifests.yaml
