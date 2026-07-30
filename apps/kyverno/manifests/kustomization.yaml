@@ -32,3 +32,44 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - https://github.com/kyverno/kyverno/releases/download/v1.18.2/install.yaml
+
+# Drop the empty `metadata.labels: {}` upstream emits on the eleven
+# policies.kyverno.io CRDs (Factory#440).
+#
+# THE DEFECT: v1.18.2's install.yaml renders those eleven CRDs with a literal
+# `labels: {}` — the other eleven Kyverno CRDs carry real labels. The API
+# server does not store an empty map, so the live object comes back with no
+# `labels` key at all. ArgoCD then compares a desired object that HAS
+# `metadata.labels` against a live object that does not, forever. Measured
+# against the live cluster via the ArgoCD managed-resources API:
+#
+#   validatingpolicies.policies.kyverno.io   (OutOfSync)
+#     live -> target:  + "labels": {}
+#   clusterpolicies.kyverno.io               (Synced)
+#     live -> target:  (no metadata difference)
+#
+# The correlation is exact in both directions: all 11 CRDs rendering
+# `labels: {}` are OutOfSync, all 11 rendering real labels are Synced. That
+# was the whole of the `kyverno` app's OutOfSync — nothing was actually
+# unapplied, and `kubectl diff` against the same manifests is empty.
+#
+# WHY A PATCH AND NOT `ignoreDifferences`: ignoring /metadata/labels on
+# CustomResourceDefinition would also blind the other eleven CRDs to a real
+# label change. This removes a field that cannot be stored instead of hiding
+# the fact that it cannot. Nothing reads these labels — the live CRDs have
+# had none since 2026-07-26 and Kyverno is unaffected.
+#
+# WHY IT MATTERS BEYOND TIDINESS: `kyverno` was one of two apps permanently
+# yellow on the ArgoCD board. A column that is never all-green is a column
+# nobody reads, which is how the postgres-backup failure in Factory#429 went
+# unnoticed for 5.6 days.
+#
+# Delete this patch when a Kyverno release stops emitting the empty map.
+patches:
+  - target:
+      group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+      name: '^.+\.policies\.kyverno\.io$'
+    patch: |-
+      - op: remove
+        path: /metadata/labels

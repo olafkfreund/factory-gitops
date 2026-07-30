@@ -33,7 +33,7 @@
 # time. A number lowered without checking is the same class of bug as the one
 # being fixed.
 #
-# TWO SIGNALS, BECAUSE ONE IS NOT ENOUGH:
+# FOUR SIGNALS, BECAUSE NO ONE OF THEM SURVIVES ALL THE CASES:
 #   1. REVISION BEHIND -- reported revision != the branch tip read from git.
 #      Catches the #425 incident. Gated on the tip being older than the
 #      tolerance, because a commit pushed seconds ago is legitimately not
@@ -43,6 +43,18 @@
 #      wedged during a quiet hour looks perfect to it. Signal 2 reads the
 #      timestamp of the last LOOK and is the only one that survives a quiet
 #      repo. "No news" must never read as OK.
+#   3. FAILING SYNC (#443) -- any status condition ArgoCD names *Error. Signals
+#      1 and 2 both go blind on an app that is reconciling briskly against the
+#      right revision and failing to APPLY it: kyverno-policies did that for
+#      four days, reporting Healthy throughout, while the cluster ran a stale
+#      and WEAKER copy of the image-signature policy.
+#   4. SUSTAINED OutOfSync (#443) -- OutOfSync with no sync in flight and
+#      nothing pending. Signal 3 goes blind in turn on a sync that keeps
+#      SUCCEEDING and keeps leaving the app OutOfSync, which sets no error
+#      condition at all. That is the `kyverno` app, yellow since 2026-07-26.
+#
+# Health and sync are different axes. Until #443 only health was watched, so a
+# GitOps repo could quietly stop being authoritative with every dashboard green.
 #
 # NO NEW DELIVERY PATH: reuses apps/job-watchdog's exact pattern -- stock
 # python image, stdlib-only script in a ConfigMap, the observe-root secret, and
@@ -305,7 +317,44 @@ data:
             None if not reconciled_raw else (now - _parse_ts(reconciled_raw)).total_seconds()
         )
 
+        # Every condition ArgoCD names *Error: SyncError, ComparisonError,
+        # InvalidSpecError, UnknownError. Matching on the SUFFIX rather than a
+        # fixed list is deliberate -- a condition type this code has never heard
+        # of must not be the one it stays quiet about (Factory#443).
+        errs = [
+            c for c in (status.get("conditions") or [])
+            if str(c.get("type", "")).endswith("Error")
+        ]
+
+        # The two states in which OutOfSync is the NORMAL, momentary truth
+        # rather than a finding: a sync running right now, and an app still
+        # behind a commit that landed inside the tolerance.
+        syncing = (status.get("operationState") or {}).get("phase") == "Running"
+        pending_deploy = bool(
+            tip and reported and reported != tip
+            and tip_age is not None and tip_age <= drift_tol
+        )
+
         problems: list[tuple[str, str]] = []
+
+        # SIGNAL 3 -- FAILING SYNC (Factory#443). An Application can fail every
+        # sync attempt, exhaust its retries, and still report Healthy, because
+        # `Healthy` describes the running workload and says nothing about
+        # whether git is still the truth. kyverno-policies did exactly that for
+        # four days from the Kyverno v1.12.6 -> v1.18.2 bump, and what the
+        # cluster kept running through those four days was a STALE, WEAKER copy
+        # of verify-factory-image-signatures that had lost its subjectRegExp --
+        # it would have accepted a signature from any GitHub Actions workflow in
+        # any repo. Every review artefact pointed at the git manifest, which was
+        # correct. Nothing said the object doing the work was not.
+        for c in errs:
+            since = c.get("lastTransitionTime")
+            age = "" if not since else f" for {_dur((now - _parse_ts(since)).total_seconds())}"
+            problems.append(
+                (f"condition_{str(c.get('type')).lower()}",
+                 f"{c.get('type')}{age}: {str(c.get('message', '')).strip()[:400]} "
+                 f"-- health={health} says nothing about this")
+            )
 
         if tip is None:
             problems.append(
@@ -342,6 +391,34 @@ data:
                  "app against git at all, so neither Synced nor OutOfSync is "
                  "being claimed and nothing else reports it")
             )
+        elif sync_status == "OutOfSync" and not syncing and not pending_deploy:
+            # SIGNAL 4 -- SUSTAINED OutOfSync (Factory#443). Health and sync are
+            # different axes and only health was watched, so an app could sit
+            # OutOfSync indefinitely and stay green on the board.
+            #
+            # It fires where signal 3 cannot: a sync that keeps SUCCEEDING
+            # ("successfully synced (all tasks run)") and keeps leaving the app
+            # OutOfSync sets no *Error condition at all. That is the `kyverno`
+            # app, permanently yellow on eleven CRDs since 2026-07-26.
+            #
+            # ONLY TWO THINGS ARE SUPPRESSED, and neither is a time window:
+            #   - a sync operation running RIGHT NOW (operationState Running)
+            #   - an app still BEHIND a tip that landed within the tolerance,
+            #     i.e. an ordinary in-flight deploy
+            # A tip-age gate like revision_behind's would be wrong here and was
+            # measured wrong on this cluster: factory-gitops takes cd commits
+            # every few minutes, so its tip is almost always younger than the
+            # tolerance, and gating on it silenced the real, four-day-stuck
+            # `kyverno` app on the very first live run. An app reporting the tip
+            # AND OutOfSync has nothing pending -- that is live-object drift,
+            # and a fresh commit somewhere else does not explain it.
+            problems.append(
+                ("out_of_sync",
+                 f"OutOfSync with nothing in flight (revision {reported[:10]} "
+                 f"{'== tip' if tip and reported == tip else 'vs tip ' + (tip or '?')[:10]}"
+                 f", no sync running). health={health} describes the running "
+                 "workload, NOT whether git is still the truth")
+            )
 
         if reconciled_age is None:
             problems.append(
@@ -367,6 +444,7 @@ data:
             "git_tip_revision": tip or "",
             "sync_status": sync_status,
             "health_status": health,
+            "error_conditions": [str(c.get("type")) for c in errs],
             "status": problems[0][0] if problems else "ok",
             "problems": [p[1] for p in problems],
             "revision_matches_git": bool(tip and reported == tip),
@@ -539,13 +617,15 @@ data:
 
         def app(name, rev, sync="Synced", health="Healthy",
                 reconciled="2026-07-28T22:39:00Z", target="main",
-                repo="https://github.com/olafkfreund/factory-gitops"):
+                repo="https://github.com/olafkfreund/factory-gitops",
+                conditions=None):
             return {
                 "metadata": {"name": name},
                 "spec": {"source": {"repoURL": repo, "targetRevision": target}},
                 "status": {
                     "sync": {"revision": rev, "status": sync},
                     "health": {"status": health},
+                    **({"conditions": conditions} if conditions else {}),
                     **({"reconciledAt": reconciled} if reconciled else {}),
                 },
             }
@@ -598,10 +678,74 @@ data:
         rh = assess(app("rolehunter", TIP, sync="Unknown"), TIP, 8 * 60, now, 600, 900)
         assert rh["status"] == "sync_unevaluated", rh
 
-        # OutOfSync is NOT a drift finding -- ArgoCD is telling the truth there,
-        # and duplicating its own signal is noise.
-        assert assess(app("kyverno", TIP, sync="OutOfSync"), TIP, 8 * 60, now, 600, 900)[
+        # ---- Factory#443: sync is a second axis, and it was unwatched -------
+        #
+        # THE INCIDENT, as it actually was: kyverno-policies failed every sync
+        # attempt for four days and reported Healthy throughout, so nothing
+        # anywhere said the live admission policy had stopped matching git.
+        syncerr = [{
+            "type": "SyncError",
+            "lastTransitionTime": "2026-07-28T22:00:00Z",
+            "message": 'Failed sync attempt to 6a92bcb: one or more objects failed to '
+                       'apply, reason: admission webhook "validate-policy.kyverno.svc" '
+                       'denied the request (retried 5 times).',
+        }]
+        failing = assess(
+            app("kyverno-policies", TIP, sync="OutOfSync", conditions=syncerr),
+            TIP, 8 * 60, now, 600, 900)
+        assert failing["status"] == "condition_syncerror", failing
+        assert failing["error_conditions"] == ["SyncError"], failing
+        assert "40m" in failing["problems"][0], failing   # how long it has been failing
+        assert "Healthy" in failing["problems"][0], failing
+
+        # A type this code has never seen must still be reported, not skipped.
+        assert assess(app("x", TIP, conditions=[{"type": "ComparisonError", "message": "m"}]),
+                      TIP, 8 * 60, now, 600, 900)["status"] == "condition_comparisonerror"
+
+        # ...and the OTHER direction: an informational condition is NOT an
+        # error. A suffix match that had degenerated into "any condition at all"
+        # would paint every app red and pass the two lines above.
+        assert assess(app("x", TIP, conditions=[{"type": "SharedResourceWarning", "message": "m"}]),
+                      TIP, 8 * 60, now, 600, 900)["status"] == "ok"
+
+        # SUSTAINED OutOfSync with NO error condition -- the `kyverno` app,
+        # which reports "successfully synced (all tasks run)" and stays
+        # OutOfSync forever on eleven CRDs. Signal 3 sees nothing here.
+        stuck = assess(app("kyverno", TIP, sync="OutOfSync"), TIP, 20 * 60, now, 600, 900)
+        assert stuck["status"] == "out_of_sync", stuck
+        assert stuck["error_conditions"] == [], stuck
+
+        # ON the tip and OutOfSync stays a finding however FRESH the tip is.
+        # A tip-age gate here reads as caution and is not: factory-gitops takes
+        # cd commits every few minutes, so its tip is nearly always inside the
+        # tolerance, and that gate silenced the real four-day-stuck `kyverno`
+        # app on the first live run against this cluster.
+        assert assess(app("kyverno", TIP, sync="OutOfSync"), TIP, 30, now, 600, 900)[
+            "status"] == "out_of_sync"
+
+        # THE OTHER DIRECTION, twice, because an alarm that fires on every
+        # ordinary deploy is an alarm that gets muted:
+        #   (a) a sync running RIGHT NOW.
+        running = app("kyverno", TIP, sync="OutOfSync")
+        running["status"]["operationState"] = {"phase": "Running"}
+        assert assess(running, TIP, 20 * 60, now, 600, 900)["status"] == "ok"
+        #   (b) an app still BEHIND a commit that landed 30 seconds ago.
+        assert assess(app("tfactory", OLD, sync="OutOfSync"), TIP, 30, now, 600, 900)[
             "status"] == "ok"
+
+        # ...and one second past tolerance the same app IS a finding. This pair
+        # is the mutation check: a suppression stuck on either constant passes
+        # one line and fails the other.
+        assert assess(app("tfactory", OLD, sync="OutOfSync"), TIP, 601, now, 600, 900)[
+            "status"] == "revision_behind"
+        # Unknown tip age fails CLOSED -- unverifiable is not the same as fine.
+        assert assess(app("tfactory", OLD, sync="OutOfSync"), TIP, None, now, 600, 900)[
+            "status"] == "revision_behind"
+
+        # And Synced on the tip stays quiet -- this must not have become "flag
+        # every app whose sync status is not the string I expected".
+        assert assess(app("kyverno", TIP), TIP, 20 * 60, now, 600, 900)["status"] == "ok"
+        assert assess(app("kyverno", TIP), TIP, 30, now, 600, 900)["status"] == "ok"
 
         # THE QUIET-REPO CASE: revision == tip, everything green, but the
         # controller stopped looking 40 minutes ago. Signal 1 sees nothing here;
@@ -636,6 +780,20 @@ data:
         assert reachable == 2
         assert [r["status"] for r in recs] == [
             "ok", "revision_behind", "ok", "ok"], [r["status"] for r in recs]
+
+        # An app ON the tip and OutOfSync needs NO commit-age lookup to be
+        # judged (Factory#443) -- nothing is in flight, so the age of the last
+        # commit is irrelevant and the REST call stays unspent.
+        age_calls: list = []
+        globals()["resolve_tip"] = lambda r, v, **k: TIP
+        globals()["head_commit_age"] = lambda *a, **k: (age_calls.append(a[:2]), 30)[1]
+        try:
+            recs2, _ = build_records([app("kyverno", TIP, sync="OutOfSync")],
+                                     now, 600, 900, "https://api.github.com")
+        finally:
+            globals()["resolve_tip"], globals()["head_commit_age"] = real_tip, real_age
+        assert age_calls == [], age_calls
+        assert recs2[0]["status"] == "out_of_sync", recs2
 
         print("selftest OK")
         return 0
