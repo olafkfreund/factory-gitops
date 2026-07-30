@@ -40,15 +40,50 @@
 # visible as `job_health` having no records at all for a window — a stacked
 # second watchdog would just move the same question one level up.
 #
-# PAGING A HUMAN (not done here, deliberately, and NOT invented): OpenObserve has
-# an Alerts + Destinations + Templates feature. Turning these records into a page
-# needs, in the OpenObserve UI or API: (a) a Destination holding a real webhook
-# URL and its auth header — that URL does not exist yet and is not guessed here;
-# (b) a Template rendering the record; (c) a scheduled Alert on stream
-# `job_health` with a condition such as `status != 'ok'` over a 30m window. This
-# PR's job is the durable record and the query surface; wiring the destination is
-# a follow-up that requires a real endpoint from a human. See
-# docs/job-health-watchdog.md.
+# ROUTING TO A HUMAN (Factory#439): the durable record above was still
+# functionally silent. The watchdog logged "postgres-backup has NEVER succeeded
+# in 5.6d since creation" every 30 minutes for days, correctly, and the fleet ran
+# with no database backup at all because the only reader of `job_health` is
+# someone who already went looking — precisely the person who does not need it.
+#
+# So the watchdog now NOTIFIES, itself, directly. Two choices were on the table:
+#
+#   (1) an OpenObserve Alert + Destination on the `job_health` stream, or
+#   (2) the watchdog posts on unhealthy.
+#
+# (2), for two reasons. First, a notification chain whose first link is the
+# subsystem most likely to be misconfigured is a poor chain — if OpenObserve
+# alerting breaks, or is never configured, it breaks silently and we are back
+# here a third time. (The live cluster had ZERO destinations and ZERO alerts
+# defined; option 1 was never actually armed.) Second, OpenObserve alert config
+# is imperative API state that lives nowhere in git, so it would drift out of
+# this GitOps repo the moment anyone touched it.
+#
+# THE DESTINATION IS A GITHUB ISSUE on the repo named by ALERT_REPO, because a
+# real channel that already exists beats a better channel that does not. No Slack
+# webhook, SMTP relay or pager endpoint exists anywhere in this fleet — the
+# previous revision of this file said so and declined to invent one, which was
+# right. GitHub issues need no new secret (the fleet GITHUB_TOKEN is already in
+# factory-secrets), reach the maintainer by notification and email without anyone
+# going looking, and are where every other fleet fault — #437, #438, #439 itself
+# — is already tracked and worked. When a webhook endpoint does exist, it belongs
+# alongside this, not instead of it.
+#
+# TWO SEVERITIES, because "this backup has NEVER worked" must not sit level with
+# one transient failed run:
+#   critical (never_succeeded, stale) — the job's purpose is NOT being served and
+#       no success is within tolerance. Opens an issue and RE-COMMENTS every
+#       ALERT_RENOTIFY_HOURS while it persists, so a long outage keeps surfacing
+#       instead of sinking down the issue list.
+#   warning  (failing, not_scheduled, suspended) — misbehaving, but a success is
+#       still inside its tolerance window or a human suspended it on purpose.
+#       Opens an issue, then stays quiet. It escalates itself to critical when
+#       the last success finally ages out.
+#
+# AND IT SHUTS UP. A healthy CronJob produces zero GitHub traffic; an already
+# reported one produces zero until it escalates or the re-notify window elapses;
+# a recovered one gets a comment and its issue CLOSED. An alarm that fires every
+# 30 minutes is muted within a week, which is this same bug by another route.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -108,17 +143,27 @@ data:
     they remain true long after every Job has been reaped. A CronJob with no
     surviving Jobs is therefore NOT reported healthy: it is reported stale.
 
+    Unhealthy CronJobs are then ROUTED TO A HUMAN as a GitHub issue (#439). The
+    stream alone was not a notification: it was read by nobody for days while the
+    fleet ran with no database backup at all.
+
     Exit codes: 0 = reported (whatever the findings), 2 = no OpenObserve
-    credentials, 3 = kubernetes API unreachable, 4 = OpenObserve ingest failed.
-    A non-zero exit means THIS JOB is broken, never that a watched job is.
+    credentials, 3 = kubernetes API unreachable, 4 = OpenObserve ingest failed,
+    5 = notification could not be delivered. A non-zero exit means THIS JOB is
+    broken, never that a watched job is. 5 counts as much as the rest: an alert
+    path that is not proven to deliver is the same bug one layer up, so an
+    undelivered notification is a hard failure and never a logged warning.
 
     Env:
-      NAMESPACE        namespace to watch (default "factory")
-      FAIL_THRESHOLD   consecutive failures before status=failing (default 2)
-      OBSERVE_URL      OpenObserve base url (default in-cluster service)
-      OO_ORG           OpenObserve organization (default "default")
-      OO_STREAM        target stream (default "job_health")
-      OO_USER/OO_PASS  OpenObserve login (from the observe-root secret)
+      NAMESPACE             namespace to watch (default "factory")
+      FAIL_THRESHOLD        consecutive failures before status=failing (2)
+      OBSERVE_URL           OpenObserve base url (default in-cluster service)
+      OO_ORG                OpenObserve organization (default "default")
+      OO_STREAM             target stream (default "job_health")
+      OO_USER/OO_PASS       OpenObserve login (from the observe-root secret)
+      ALERT_REPO            owner/repo to raise issues on
+      ALERT_RENOTIFY_HOURS  re-comment cadence for critical (default 24)
+      GITHUB_TOKEN          token with `repo` scope on ALERT_REPO
     """
 
     import base64
@@ -156,6 +201,43 @@ data:
     # the one that eventually will, because real schedules are messier than a
     # parser.
     PERIOD_ANNOTATION = "factory.dev/expected-period-seconds"
+
+    # Which findings are CRITICAL. Both mean the same thing in different words:
+    # the work this CronJob exists to do is not being done, and no success sits
+    # inside its tolerance window. `never_succeeded` is the postgres-backup case
+    # — there is not even a stale backup to fall back on, because there has never
+    # been one. The rest (failing, not_scheduled, suspended) are warnings: a
+    # success is still within tolerance and the next run may well clear it. A
+    # warning that does not clear becomes critical on its own once the last
+    # success ages past tolerance, so nothing has to remember to escalate it.
+    CRITICAL_CODES = {"never_succeeded", "stale"}
+
+    ISSUE_LABEL = "job-watchdog"
+    SEVERITY_LABELS = {"critical": "severity:critical", "warning": "severity:warning"}
+    # Dedup key. In the BODY, not the title, so the title can gain and lose
+    # severity wording as the finding changes without ever orphaning the issue
+    # and opening a duplicate beside it.
+    MARKER = "<!-- job-watchdog:{ns}/{name} -->"
+
+    # The title is the part that actually reaches a human — it is the GitHub
+    # notification and the email subject line, read in a list, often on a phone.
+    # So it states the severity and the REASON, not the bare status code.
+    # `status` alone is the first problem found, which for cred-broker is
+    # "failing" while the thing that makes it critical is "stale"; a subject line
+    # saying "failing" would understate it at exactly the moment that matters.
+    TITLE_PHRASE = {
+        "never_succeeded": "has never once succeeded",
+        "stale": "has not succeeded within its tolerance",
+        "failing": "is failing",
+        "not_scheduled": "is no longer being scheduled",
+        "suspended": "is suspended and will never run",
+    }
+
+
+    def issue_title(record: dict, sev: str) -> str:
+        codes = record.get("codes") or []
+        worst = next((c for c in codes if c in CRITICAL_CODES), codes[0])
+        return f"[{sev}] {record['cronjob']} {TITLE_PHRASE[worst]}"
 
 
     def eprint(*a):
@@ -334,6 +416,11 @@ data:
             "schedule": schedule,
             "suspended": bool(spec.get("suspend")),
             "status": problems[0][0] if problems else "ok",
+            # ALL codes, not just the leading one. `status` is problems[0], and a
+            # CronJob that is both not_scheduled AND stale reports status
+            # "not_scheduled" — deriving severity from that alone would grade a
+            # dead backup as a warning. Severity reads the whole list.
+            "codes": [p[0] for p in problems],
             "problems": [p[1] for p in problems],
             "consecutive_failures": fails,
             "surviving_jobs": len(jobs),
@@ -386,6 +473,219 @@ data:
             raise RuntimeError(f"OpenObserve rejected {st['failed']} record(s): {res}")
 
 
+    def severity_of(record: dict) -> str | None:
+        """critical | warning | None. None means healthy — say nothing."""
+        codes = record.get("codes") or []
+        if not codes:
+            return None
+        return "critical" if any(c in CRITICAL_CODES for c in codes) else "warning"
+
+
+    def issue_severity(issue: dict) -> str | None:
+        names = {l.get("name") for l in (issue.get("labels") or [])}
+        for sev, label in SEVERITY_LABELS.items():
+            if label in names:
+                return sev
+        return None
+
+
+    def notify_action(record: dict, issue: dict | None, now: datetime,
+                      renotify_hours: float) -> str | None:
+        """Pure. (health record, its open issue or None) -> what to do about it.
+
+        None means STAY SILENT, and most calls return None by design. Both halves
+        of this matter equally:
+
+          - an unhealthy CronJob with no issue MUST produce one, or we are back
+            to a correct signal nobody reads;
+          - a healthy fleet, and an already-reported problem, MUST produce
+            nothing at all. An alert that repeats every 30 minutes gets muted
+            inside a week, and a muted alert is the same silence this closes,
+            reached by a more annoying road.
+
+        Recovery closes the issue, so the open-issue list stays a list of things
+        that are actually wrong rather than a graveyard nobody trusts.
+        """
+        sev = severity_of(record)
+        if sev is None:
+            return "close" if issue else None
+        if issue is None:
+            return "open"
+        if sev != issue_severity(issue):
+            return "escalate"  # or de-escalate; either way the label is now a lie
+        if sev == "critical":
+            age = (now - _parse_ts(issue["updated_at"])).total_seconds()
+            if age >= renotify_hours * 3600:
+                return "renotify"
+        return None
+
+
+    def issue_body(record: dict, sev: str) -> str:
+        ns, name = record["namespace"], record["cronjob"]
+        def fmt(field):
+            v = record.get(field)
+            return "never" if v is None else f"{_dur(v)} ago"
+        lines = [
+            MARKER.format(ns=ns, name=name),
+            f"**Severity: {sev.upper()}** — `{ns}/{name}`, schedule "
+            f"`{record['schedule']}`, status `{record['status']}`.",
+            "",
+            "What the watchdog found:",
+            "",
+        ]
+        lines += [f"- {p}" for p in record["problems"]]
+        lines += [
+            "",
+            f"- Consecutive failed runs: {record['consecutive_failures']}",
+            f"- Surviving Jobs: {record['surviving_jobs']} "
+            "(absence of failed Jobs is not health — they are garbage collected)",
+            f"- Last success: {fmt('last_success_age_seconds')}",
+            f"- Last schedule: {fmt('last_schedule_age_seconds')}",
+            f"- Tolerance: {_dur(record['tolerance_seconds'])} "
+            f"(period {_dur(record['expected_period_seconds'])})",
+            "",
+            "Every record, including the healthy runs, is in the OpenObserve "
+            f"stream `{os.environ.get('OO_STREAM', 'job_health')}`:",
+            "",
+            "```sql",
+            f"SELECT * FROM \"job_health\" WHERE cronjob = '{name}' "
+            "ORDER BY _timestamp DESC",
+            "```",
+            "",
+            "Raised automatically by the `job-watchdog` CronJob, and it will be "
+            "closed automatically when this CronJob reports healthy again. "
+            "Closing it by hand while the CronJob is still unhealthy just opens "
+            "a fresh one on the next run.",
+        ]
+        return "\n".join(lines)
+
+
+    def gh(token: str, method: str, path: str, body: dict | None = None):
+        req = urllib.request.Request(
+            f"https://api.github.com{path}",
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "authorization": f"Bearer {token}",
+                "accept": "application/vnd.github+json",
+                "content-type": "application/json",
+                "user-agent": "factory-job-watchdog",
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+    def ensure_labels(token: str, repo: str) -> None:
+        """Idempotent. A missing label makes the dedup query silently match
+        nothing, which would open a duplicate issue every 30 minutes — the
+        crying-wolf failure, self-inflicted on the very first run."""
+        for name, color, desc in (
+            (ISSUE_LABEL, "5319e7", "Raised by the CronJob health watchdog"),
+            (SEVERITY_LABELS["critical"], "b60205", "The job's purpose is not being served"),
+            (SEVERITY_LABELS["warning"], "fbca04", "Misbehaving, may still self-recover"),
+        ):
+            try:
+                gh(token, "POST", f"/repos/{repo}/labels",
+                   {"name": name, "color": color, "description": desc})
+            except urllib.error.HTTPError as e:
+                if e.code != 422:  # 422 = already exists
+                    raise
+
+
+    def open_watchdog_issues(token: str, repo: str) -> dict:
+        """marker -> issue, for every open issue this watchdog raised."""
+        issues = gh(token, "GET",
+                    f"/repos/{repo}/issues?state=open&labels={ISSUE_LABEL}&per_page=100") or []
+        out = {}
+        for i in issues:
+            for line in (i.get("body") or "").splitlines():
+                line = line.strip()
+                if line.startswith("<!-- job-watchdog:"):
+                    out[line] = i
+                    break
+        return out
+
+
+    def notify(token: str, repo: str, records: list[dict], now: datetime,
+               renotify_hours: float) -> int:
+        """Route findings to a human. Returns the number of notifications sent."""
+        ensure_labels(token, repo)
+        existing = open_watchdog_issues(token, repo)
+        sent = 0
+        for r in records:
+            key = MARKER.format(ns=r["namespace"], name=r["cronjob"])
+            issue = existing.get(key)
+            action = notify_action(r, issue, now, renotify_hours)
+            if action is None:
+                continue
+            sev = severity_of(r)
+            name = r["cronjob"]
+            if action == "open":
+                new = gh(token, "POST", f"/repos/{repo}/issues", {
+                    "title": issue_title(r, sev),
+                    "body": issue_body(r, sev),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                eprint(f"NOTIFIED  {name} [{sev}] -> opened {repo}#{new['number']}")
+            elif action == "escalate":
+                was = issue_severity(issue)
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}", {
+                    "title": issue_title(r, sev),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Severity changed: **{was} -> {sev}**.\n\n"
+                            + issue_body(r, sev)})
+                eprint(f"NOTIFIED  {name} [{was} -> {sev}] -> {repo}#{issue['number']}")
+            elif action == "renotify":
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Still {r['status']} after "
+                            f"{renotify_hours:g}h with no change.\n\n"
+                            + issue_body(r, sev)})
+                eprint(f"NOTIFIED  {name} [still {sev}] -> {repo}#{issue['number']}")
+            elif action == "close":
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"RECOVERED. `{r['namespace']}/{name}` now reports "
+                            f"healthy: last success {_dur(r['last_success_age_seconds'])} "
+                            f"ago, within its {_dur(r['tolerance_seconds'])} tolerance. "
+                            "Closing automatically."})
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+                   {"state": "closed", "state_reason": "completed"})
+                eprint(f"RECOVERED {name} -> closed {repo}#{issue['number']}")
+            sent += 1
+
+        # ORPHANS: an open issue whose CronJob no longer exists at all. Without
+        # this the issue sits open forever — nothing recovers it, because
+        # recovery is driven by a record and there is no longer a record to
+        # produce. A permanently-open critical nobody can action is precisely
+        # what teaches people to ignore the label, and a discredited channel is
+        # this whole issue again.
+        #
+        # It is NOT closed silently, though. "The CronJob vanished" is itself the
+        # Factory#429 failure mode, so the disappearance is stated out loud in a
+        # comment first. The watchdog cannot tell a deliberate retirement from an
+        # accidental deletion, so it says what it saw and lets a human judge.
+        seen = {MARKER.format(ns=r["namespace"], name=r["cronjob"]) for r in records}
+        for key, issue in existing.items():
+            if key in seen:
+                continue
+            gone = key.split(":", 1)[1].rsplit(" ", 1)[0]
+            gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+               {"body": f"The CronJob `{gone}` no longer exists in the watched "
+                        "namespace, so this finding can no longer be evaluated. "
+                        "Closing.\n\nIf it was not retired deliberately then its "
+                        "disappearance is itself the problem, not the fix - a "
+                        "CronJob that stops existing produces no failures and no "
+                        "alerts, only silence (Factory#429)."})
+            gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+               {"state": "closed", "state_reason": "not_planned"})
+            eprint(f"VANISHED  {gone} -> closed {repo}#{issue['number']}")
+            sent += 1
+        return sent
+
+
     def main() -> int:
         ns = os.environ.get("NAMESPACE", "factory")
         threshold = int(os.environ.get("FAIL_THRESHOLD", "2"))
@@ -399,6 +699,18 @@ data:
             eprint("FATAL: OO_USER/OO_PASS not set (observe-root secret missing)")
             return 2
         basic = base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+        repo = os.environ.get("ALERT_REPO", "")
+        token = os.environ.get("GITHUB_TOKEN", "")
+        renotify = float(os.environ.get("ALERT_RENOTIFY_HOURS", "24"))
+        # Checked UP FRONT, before any work, and fatal — never a warning that
+        # degrades to stream-only. Silently running without a notification path
+        # is the exact defect #439 is about, and it would be undetectable from
+        # the outside: the job would go green having told nobody anything.
+        if not repo or not token:
+            eprint("FATAL: ALERT_REPO/GITHUB_TOKEN not set — there would be no "
+                   "path to a human, which is the defect this app exists to fix")
+            return 2
 
         try:
             cronjobs = k8s_get(f"/apis/batch/v1/namespaces/{ns}/cronjobs")["items"]
@@ -434,6 +746,17 @@ data:
             f"{len(records) - len(bad)} ok, {len(bad)} unhealthy"
             + (f" ({', '.join(bad)})" if bad else "")
         )
+
+        # Emit FIRST, notify second. If GitHub is down the durable record still
+        # lands, and the failure below is then visible in the stream rather than
+        # taking the finding down with it.
+        try:
+            sent = notify(token, repo, records, now, renotify)
+        except Exception as e:  # noqa: BLE001 — an undelivered alert is the bug
+            eprint(f"FATAL: cannot notify via {repo}: {e!r}")
+            return 5
+        eprint(f"notifications sent: {sent} (silence on healthy and on already-reported)")
+
         # Exit 0 on findings BY DESIGN: see the manifest header. A red watchdog
         # must mean the watchdog is broken, not that a watched job is.
         return 0
@@ -553,6 +876,182 @@ data:
                               job("b", "2026-07-26T11:00:00Z", "failed")])
         assert len(grouped["a"]) == 1 and "b" not in grouped
 
+        # ---- #439: severity, and the routing decision ----------------------
+        healthy_rec = assess(cj("ok", "0 */4 * * *", last_ok="2026-07-26T11:00:00Z",
+                                last_sched="2026-07-26T11:00:00Z"), [], now, 2)
+        assert severity_of(healthy_rec) is None
+
+        # postgres-backup's real shape: never once succeeded. CRITICAL.
+        assert severity_of(never) == "critical", never
+        assert severity_of(gcd) == "critical", gcd          # stale after GC
+        # A transient run of failures with the last success still INSIDE
+        # tolerance is not the same thing as a backup that has never worked.
+        # That distinction is the whole point of having two levels.
+        #
+        # Note `failing` above does not qualify: its last success is 49.5d old,
+        # so it is failing AND stale, and severity_of correctly grades it
+        # critical. This selftest asserted "warning" on it at first and the
+        # assertion was what was wrong. A genuinely transient blip needs a
+        # recent success, so build one:
+        blip = assess(
+            cj("blip", "0 */4 * * *", last_ok="2026-07-26T08:00:00Z",
+               last_sched="2026-07-26T11:00:00Z"),
+            [job("blip", "2026-07-26T09:00:00Z", "failed"),
+             job("blip", "2026-07-26T11:00:00Z", "failed")],
+            now, 2)
+        assert blip["codes"] == ["failing"], blip
+        assert severity_of(blip) == "warning", blip
+        # And it escalates itself with no help once that success ages out.
+        aged = assess(cj("blip", "0 */4 * * *", last_ok="2026-07-25T00:00:00Z",
+                         last_sched="2026-07-26T11:00:00Z"), [], now, 2)
+        assert severity_of(aged) == "critical", aged
+        assert severity_of(assess(cj("s", "0 */4 * * *", last_ok="2026-07-26T11:00:00Z",
+                                     last_sched="2026-07-26T11:00:00Z", suspend=True),
+                                  [], now, 2)) == "warning"
+
+        # Severity reads EVERY code, not just status. This CronJob stopped being
+        # scheduled AND its last success has aged out; status is "not_scheduled"
+        # (the first problem found) but it is unambiguously critical.
+        both = assess(cj("b", "0 */4 * * *", last_ok="2026-06-01T00:00:00Z",
+                         last_sched="2026-07-01T00:00:00Z"), [], now, 2)
+        assert both["status"] == "not_scheduled" and "stale" in both["codes"]
+        assert severity_of(both) == "critical", both
+
+        def iss(sev, updated):
+            return {"number": 1, "updated_at": updated,
+                    "labels": [{"name": ISSUE_LABEL}, {"name": SEVERITY_LABELS[sev]}]}
+
+        # THE ALARM HALF: an unhealthy CronJob nobody has an issue for gets one.
+        assert notify_action(never, None, now, 24) == "open"
+
+        # THE SILENCE HALF, which matters just as much. An alarm that re-fires
+        # every 30 minutes is muted within a week, and a muted alarm is #439
+        # again by a louder route.
+        assert notify_action(healthy_rec, None, now, 24) is None, "healthy must be silent"
+        assert notify_action(never, iss("critical", "2026-07-26T11:30:00Z"), now, 24) is None, \
+            "already reported 30m ago must not re-notify"
+        assert notify_action(blip, iss("warning", "2026-06-01T00:00:00Z"), now, 24) is None, \
+            "warnings are reported once and then stay quiet, however long they last"
+
+        # Escalation: the same CronJob, worse. The open issue's label is now
+        # wrong, so it is corrected and said out loud once.
+        assert notify_action(never, iss("warning", "2026-07-26T11:59:00Z"), now, 24) == "escalate"
+        # De-escalation is also a change worth one comment, not silent relabelling.
+        assert notify_action(blip, iss("critical", "2026-07-26T11:59:00Z"), now, 24) == "escalate"
+
+        # A critical that will not go away keeps surfacing, once a day, so a
+        # month-old outage does not quietly sink down the issue list. This is the
+        # postgres-backup case: right, ignored, and ignored again.
+        assert notify_action(never, iss("critical", "2026-07-24T00:00:00Z"), now, 24) == "renotify"
+        assert notify_action(never, iss("critical", "2026-07-24T00:00:00Z"), now, 999) is None
+
+        # Recovery closes the issue, so the open list stays things that are
+        # actually broken rather than a graveyard everyone learns to scroll past.
+        assert notify_action(healthy_rec, iss("critical", "2026-07-26T11:00:00Z"), now, 24) == "close"
+
+        # notify_action being right is not enough: a correct decision that the
+        # caller ignores is still an issue filed every 30 minutes. A mutation
+        # test caught exactly that — deleting the `if action is None: continue`
+        # guard in notify() left every assertion above passing. So drive notify()
+        # itself over a stub transport and count what it would really send.
+        calls: list = []
+        stub_issues: list = []
+
+        def fake_gh(token, method, path, body=None):
+            calls.append((method, path))
+            if method == "POST" and path.endswith("/issues"):
+                return {"number": 99}
+            if "/issues?" in path:
+                return list(stub_issues)
+            return {}
+
+        def writes():
+            return [c for c in calls
+                    if c[0] != "GET" and not c[1].endswith("/labels")]
+
+        real_gh = globals()["gh"]
+        globals()["gh"] = fake_gh
+        try:
+            # A HEALTHY FLEET SENDS NOTHING. Not one issue, comment or edit.
+            assert notify("t", "o/r", [healthy_rec, healthy_rec], now, 24) == 0
+            assert not writes(), writes()
+
+            # One genuinely unhealthy CronJob sends exactly one thing.
+            calls.clear()
+            assert notify("t", "o/r", [never], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues")], writes()
+
+            # And a mixed fleet notifies once, for the one that is broken.
+            calls.clear()
+            assert notify("t", "o/r", [healthy_rec, never, healthy_rec], now, 24) == 1
+            assert len(writes()) == 1, writes()
+
+            # DEDUP, matched off the body marker of the issue we already raised.
+            # This is what stops the same finding filing a fresh issue every 30
+            # minutes, so it is checked against a real issue payload rather than
+            # trusted. Note the title here is deliberately NOT the title notify()
+            # would write, because dedup must key on the marker alone.
+            stub_issues.append({
+                "number": 99,
+                "title": "something a human renamed it to",
+                "updated_at": "2026-07-26T11:45:00Z",
+                "body": issue_body(never, "critical"),
+                "labels": [{"name": ISSUE_LABEL},
+                           {"name": SEVERITY_LABELS["critical"]}],
+            })
+            assert list(open_watchdog_issues("t", "o/r")) == [
+                MARKER.format(ns="factory", name="postgres-backup")]
+            calls.clear()
+            assert notify("t", "o/r", [never], now, 24) == 0, "must not duplicate"
+            assert not writes(), writes()
+
+            # Same issue, but the CronJob has recovered: comment and close.
+            calls.clear()
+            recovered = assess(cj("postgres-backup", "15 2 * * *",
+                                  last_ok="2026-07-26T11:00:00Z",
+                                  last_sched="2026-07-26T11:00:00Z"), [], now, 2)
+            assert notify("t", "o/r", [recovered], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues/99/comments"),
+                                ("PATCH", "/repos/o/r/issues/99")], writes()
+
+            # ORPHAN: the CronJob has been deleted outright, so it appears in no
+            # record at all. Its issue must not sit open forever — an unactionable
+            # permanent critical is what trains people to ignore the label.
+            calls.clear()
+            assert notify("t", "o/r", [healthy_rec], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues/99/comments"),
+                                ("PATCH", "/repos/o/r/issues/99")], writes()
+
+            # ...but a healthy fleet with no orphans is still completely silent.
+            stub_issues.clear()
+            calls.clear()
+            assert notify("t", "o/r", [healthy_rec], now, 24) == 0
+            assert not writes(), writes()
+        finally:
+            globals()["gh"] = real_gh
+
+        # The dedup key lives in the body and survives the title changing, so a
+        # finding that worsens updates one issue instead of stacking duplicates.
+        body = issue_body(never, "critical")
+        assert body.splitlines()[0] == MARKER.format(ns="factory", name="postgres-backup")
+        assert "NEVER succeeded" in body and "CRITICAL" in body
+        assert "Last success: never" in body
+
+        # The title is the notification email's subject line, so it must name the
+        # reason that DROVE the severity, not merely the first problem found.
+        # cred-broker's live record is `failing` first and `stale` second; a
+        # subject line reading "is failing" would understate a three-day outage.
+        assert issue_title(never, "critical") == \
+            "[critical] postgres-backup has never once succeeded", issue_title(never, "critical")
+        cb = assess(cj("cred-broker", "0 */4 * * *", last_ok="2026-07-01T00:00:00Z",
+                       last_sched="2026-07-26T11:00:00Z"),
+                    [job("cred-broker", "2026-07-26T08:00:00Z", "failed"),
+                     job("cred-broker", "2026-07-26T11:00:00Z", "failed")], now, 2)
+        assert cb["status"] == "failing" and severity_of(cb) == "critical"
+        assert issue_title(cb, "critical") == \
+            "[critical] cred-broker has not succeeded within its tolerance", issue_title(cb, "critical")
+        assert issue_title(blip, "warning") == "[warning] blip is failing"
+
         print("selftest OK")
         return 0
 
@@ -600,6 +1099,14 @@ spec:
                 - { name: FAIL_THRESHOLD, value: "2" }
                 - { name: OO_STREAM, value: "job_health" }
                 - { name: OO_ORG, value: "default" }
+                # Where unhealthy findings go so a human passively meets them.
+                - { name: ALERT_REPO, value: "olafkfreund/Factory" }
+                - { name: ALERT_RENOTIFY_HOURS, value: "24" }
+                # Existing fleet token. No new secret, and no webhook URL is
+                # committed anywhere — a URL in git that silently drops messages
+                # would be this same bug wearing a convincing disguise.
+                - name: GITHUB_TOKEN
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } }
                 # Same observe-root secret apps/audit-siem-forward already uses.
                 - name: OO_USER
                   valueFrom: { secretKeyRef: { name: observe-root, key: email } }
