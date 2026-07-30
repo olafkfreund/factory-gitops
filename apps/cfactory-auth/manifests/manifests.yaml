@@ -34,9 +34,36 @@ spec:
         app: oauth2-proxy-cfactory
     spec:
       enableServiceLinks: false
+      # Factory#521. This pod had NO securityContext at all — and it is the
+      # front door to the cockpit: every public request to
+      # cfactory.freundcloud.org.uk is terminated here before it reaches the UI.
+      #
+      # 65532 is NUMERIC on purpose and it is what the image already declares
+      # (measured: docker image inspect -> Config.User "65532"), so nothing
+      # changes at runtime. A NAME cannot be resolved by runAsNonRoot alone —
+      # AIFactory#848 killed every build Job that way.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: oauth2-proxy
           image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0
+          # readOnlyRootFilesystem is MEASURED, not assumed. This exact tag run
+          # read-only as 65532 with --cap-drop ALL and no-new-privileges comes up
+          # and answers GET /ping -> 200, which is the readiness/liveness path
+          # below — so the check is a request against the port, not a pod status
+          # (the cfactory-frontend trap in #108: nginx stayed Running with no
+          # server block and refused every connection).
+          # Every input is a read-only mount: the alpha config, and the
+          # client-secret file. Sessions are cookie-backed, not disk-backed —
+          # there is no Redis session store configured — so nothing is written.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             # Provider, upstream and header injection live in the alpha config
             # (see alpha-config.yaml) — required for the tenant claim ->

@@ -70,10 +70,35 @@ spec:
     metadata: { labels: { app: minio } }
     spec:
       enableServiceLinks: false
-      securityContext: { fsGroup: 1000, runAsUser: 1000, runAsNonRoot: true }
+      # Factory#521. Non-root was already enforced at pod level, but there was
+      # no seccompProfile and the container had no securityContext at all, so it
+      # kept every default capability. uid 1000 is unchanged and deliberately
+      # so: the minio-data PVC (and the .minio.sys metadata inside it) is owned
+      # by 1000, and a different uid here comes up unable to read its own
+      # buckets. Note the IMAGE's own default is root — `docker image inspect`
+      # shows an empty Config.User — so this pod-level uid is the only thing
+      # keeping it non-root, which is exactly why it is worth enforcing.
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: minio
           image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
+          # readOnlyRootFilesystem is MEASURED. This exact tag run read-only as
+          # uid 1000 with --cap-drop ALL and no-new-privileges, /data writable:
+          #   API: http://.../ WebUI: http://...
+          #   GET /minio/health/live  -> 200
+          #   GET /minio/health/ready -> 200
+          # Those two are the exact liveness/readiness paths below, so the proof
+          # is a request against the port. Every write goes under /data (the
+          # PVC), including .minio.sys and the SSE-S3 key metadata.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args: ["server", "/data", "--console-address", ":9001"]
           ports:
             - { containerPort: 9000, name: s3 }
