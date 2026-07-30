@@ -137,19 +137,28 @@ spec:
         - name: pfactory
           image: ghcr.io/olafkfreund/pfactory:0.6.0
           imagePullPolicy: IfNotPresent
-          # Factory#503. readOnlyRootFilesystem is DELIBERATELY ABSENT here, and
-          # this is the honest reason rather than an oversight:
-          # this container is an agent host. It writes outside every mounted
-          # volume — tempfile lands in /tmp, and the provider CLIs it spawns
-          # (claude/codex/gemini/npm/git) write ~/.claude.json at the HOME root
-          # (not under the .claude mount) plus npm/git/XDG state. An emptyDir
-          # over /home/nonroot would MASK the CLIs baked at
-          # /home/nonroot/.npm-global (#791), so the obvious fix is the wrong
-          # one. Enabling it needs each write path enumerated and given its own
-          # volume; until then it would trade an unenforced control for a service
-          # that 500s at runtime. Tracked separately.
+          # Factory#520. readOnlyRootFilesystem is now ON. #503 left it off with
+          # an honest reason; this is the enumeration that reason asked for,
+          # measured by running THIS image read-only rather than by reading the
+          # source. Identical shape to aifactory and tfactory — see
+          # apps/aifactory/manifests/manifests.yaml for the full write-path
+          # table; the three images share a base and a HOME layout.
+          #
+          # The obvious fix stays wrong: /home/nonroot/.npm-global is ~1.1G of
+          # baked provider CLIs (#791), so an emptyDir over /home/nonroot would
+          # MASK them. Every volume below therefore sits BELOW /home/nonroot.
+          #
+          # Measured, this exact image, read-only + uid 65532 + cap-drop ALL +
+          # no-new-privileges: alembic migrations ran to head,
+          # "Application startup complete", uvicorn on :3114,
+          # GET /api/health -> 200.
+          #
+          # What is NOT proven here: a full planning run. A write failure
+          # mid-plan is a runtime 500, not a CrashLoop, so pod status will not
+          # catch it — watch one real plan after this rolls out.
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           ports: [{ containerPort: 3114 }]
@@ -180,6 +189,12 @@ spec:
             # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
             - { name: PATH, value: "/home/nonroot/.npm-global/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            # Factory#520. What makes readOnlyRootFilesystem possible at all:
+            # the claude CLI writes ~/.claude.json at the HOME ROOT, a single
+            # FILE that no emptyDir can cover. This relocates it into the
+            # .claude emptyDir that already exists — the same directory
+            # seed-creds seeds, so credential resolution is unchanged.
+            - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             - { name: PFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
             # Shared static API token for programmatic access (CFactory's adapters
@@ -236,6 +251,12 @@ spec:
             - { name: cc-codex,  mountPath: /home/nonroot/.codex }
             - { name: cc-gemini, mountPath: /home/nonroot/.gemini }
             - { name: cc-config, mountPath: /home/nonroot/.config }
+            # Factory#520. All BELOW /home/nonroot on purpose, so the 1.1G of
+            # baked CLIs at .npm-global stays visible.
+            - { name: tmp,        mountPath: /tmp }
+            - { name: home-cache, mountPath: /home/nonroot/.cache }
+            - { name: home-npm,   mountPath: /home/nonroot/.npm }
+            - { name: home-local, mountPath: /home/nonroot/.local }
           # Probe budgets (PFactory #265). Both probes previously inherited the
           # k8s DEFAULT timeoutSeconds: 1 — so a single sub-second stall under
           # plan load counted as a failure. Liveness (1s x 3 over 20s periods)
@@ -257,3 +278,8 @@ spec:
         - { name: cc-gemini, emptyDir: {} }
         - { name: cc-config, emptyDir: {} }
         - { name: cli-creds, secret: { secretName: factory-cli-creds } }
+        # Factory#520 — the writable holes a read-only rootfs needs.
+        - { name: tmp,        emptyDir: {} }
+        - { name: home-cache, emptyDir: {} }
+        - { name: home-npm,   emptyDir: {} }
+        - { name: home-local, emptyDir: {} }

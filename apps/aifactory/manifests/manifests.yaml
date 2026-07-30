@@ -158,21 +158,52 @@ spec:
         - name: aifactory
           image: ghcr.io/olafkfreund/aifactory:v3.4.2
           imagePullPolicy: IfNotPresent
-          # Factory#503. readOnlyRootFilesystem is DELIBERATELY ABSENT here, and
-          # this is the honest reason rather than an oversight:
-          # this container is an agent host. It writes outside every mounted
-          # volume — 18 `tempfile` call sites land in /tmp, and
-          # providers/opencode_agentic.py caches under `Path.home()/.cache`,
-          # which is NOT one of the mounts. The provider CLIs it spawns
-          # (claude/codex/gemini/npm/git/nix) add more: ~/.claude.json at the
-          # HOME root (not under the .claude mount), npm and git state, XDG dirs.
-          # An emptyDir over /home/nonroot would MASK the CLIs baked at
-          # /home/nonroot/.npm-global (#791), so the obvious fix is the wrong
-          # one. Enabling it needs each write path enumerated and given its own
-          # volume; until then it would trade an unenforced control for a service
-          # that 500s at runtime. Tracked separately.
+          # Factory#520. readOnlyRootFilesystem is now ON. #503 left it off with
+          # an honest reason; this is the enumeration that reason asked for,
+          # measured by running THIS image read-only rather than by reading the
+          # source.
+          #
+          # The obvious fix stays wrong: /home/nonroot/.npm-global is 1.1G of
+          # baked provider CLIs (#791, measured `du -sh` in the live pod), so an
+          # emptyDir over /home/nonroot would MASK them and a per-pod init copy
+          # of 1.1G under a KEDA autoscaler is not a fix either. Every volume
+          # below therefore sits BELOW /home/nonroot, and `ls .npm-global/bin`
+          # inside the read-only container still returns all 7 CLIs.
+          #
+          # Measured, read-only + uid 65532 + cap-drop ALL + no-new-privileges:
+          #   /tmp                    18 tempfile sites  -> emptyDir; verified
+          #                           tempfile.NamedTemporaryFile() succeeds
+          #   ~/.cache                opencode_agentic   -> emptyDir; without it
+          #                           `touch ~/.cache/x` -> Read-only file system
+          #   ~/.npm                  npm _logs/_cacache -> emptyDir; same
+          #   ~/.local                XDG state          -> emptyDir; not baked
+          #                           at all, so nothing is masked
+          #   ~/.claude.json          THE blocker. It is a FILE at the HOME
+          #                           root, which no emptyDir can cover, and
+          #                           `touch` there is Read-only file system.
+          #                           Solved by CLAUDE_CONFIG_DIR below, NOT by
+          #                           a volume — verified the CLI then writes
+          #                           .claude.json + backups/ INTO the existing
+          #                           .claude mount.
+          #   ~/.gitconfig            read-only is fine: the identity is BAKED
+          #                           and nothing in this codebase runs
+          #                           `git config --global` (grepped). A CLI
+          #                           that tries gets one failed command, not a
+          #                           broken service.
+          #   __pycache__ under       CPython silently skips bytecode on a
+          #   /home/projects/...      read-only fs. Measured 277 .pyc files
+          #                           written on the live pod today; they simply
+          #                           stop being written.
+          #
+          # End to end, this exact image, fully read-only: alembic migrations
+          # ran, "Application startup complete", GET /api/health -> 200.
+          #
+          # What is NOT proven here: a full agent build task. A write failure
+          # mid-task is a runtime 500, not a CrashLoop, so pod status will not
+          # catch it — watch one real build after this rolls out.
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           ports: [{ containerPort: 3101 }]
@@ -192,6 +223,17 @@ spec:
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
             - { name: PATH, value: "/home/nonroot/.npm-global/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            # Factory#520. This is what makes readOnlyRootFilesystem possible at
+            # all. The claude CLI writes ~/.claude.json at the HOME ROOT — a
+            # single file, which no emptyDir can cover and which a subPath mount
+            # would turn into a DIRECTORY. CLAUDE_CONFIG_DIR relocates it into
+            # the .claude emptyDir that already exists. Verified read-only
+            # against the baked CLI (2.1.215): with this set, `claude` writes
+            # .claude.json (389 bytes) and backups/ under /home/nonroot/.claude;
+            # without it the same call hits Read-only file system.
+            # It points at the SAME directory seed-creds already seeds, so
+            # .credentials.json resolution is unchanged.
+            - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
             # Static API token for programmatic/MCP access (alongside OIDC SSO).
@@ -531,6 +573,17 @@ spec:
             - { name: cc-codex,  mountPath: /home/nonroot/.codex }
             - { name: cc-gemini, mountPath: /home/nonroot/.gemini }
             - { name: cc-config, mountPath: /home/nonroot/.config }
+            # Factory#520. Every one of these is BELOW /home/nonroot on purpose
+            # — see the securityContext comment. They are emptyDirs, not
+            # volumes, because none of them holds anything worth surviving a
+            # pod: ~/.cache and ~/.npm are download caches whose baked contents
+            # are only useful to an installer that no longer runs at runtime
+            # (#791 baked the CLIs), and ~/.local does not exist in the image at
+            # all, so nothing is masked.
+            - { name: tmp,        mountPath: /tmp }
+            - { name: home-cache, mountPath: /home/nonroot/.cache }
+            - { name: home-npm,   mountPath: /home/nonroot/.npm }
+            - { name: home-local, mountPath: /home/nonroot/.local }
           readinessProbe: { httpGet: { path: /api/health, port: 3101 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3101 }, initialDelaySeconds: 30, periodSeconds: 20 }
           resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 12Gi } }
@@ -541,6 +594,11 @@ spec:
         - { name: cc-gemini, emptyDir: {} }
         - { name: cc-config, emptyDir: {} }
         - { name: cli-creds, secret: { secretName: factory-cli-creds } }
+        # Factory#520 — the writable holes a read-only rootfs needs.
+        - { name: tmp,        emptyDir: {} }
+        - { name: home-cache, emptyDir: {} }
+        - { name: home-npm,   emptyDir: {} }
+        - { name: home-local, emptyDir: {} }
 ---
 # RFC-0005 #68: dedicated SA + scoped Role so the coder can launch per-task
 # verification sandboxes as ephemeral Kubernetes Jobs (the in-cluster backend;

@@ -240,19 +240,33 @@ spec:
         - name: tfactory
           image: ghcr.io/olafkfreund/tfactory:0.6.4
           imagePullPolicy: IfNotPresent
-          # Factory#503. readOnlyRootFilesystem is DELIBERATELY ABSENT here, and
-          # this is the honest reason rather than an oversight:
-          # this container is an agent host. It writes outside every mounted
-          # volume — tempfile lands in /tmp, and the provider CLIs it spawns
-          # (claude/codex/gemini/npm/git) write ~/.claude.json at the HOME root
-          # (not under the .claude mount) plus npm/git/XDG state. An emptyDir
-          # over /home/nonroot would MASK the CLIs baked at
-          # /home/nonroot/.npm-global (#791), so the obvious fix is the wrong
-          # one. Enabling it needs each write path enumerated and given its own
-          # volume; until then it would trade an unenforced control for a service
-          # that 500s at runtime. Tracked separately.
+          # Factory#520. readOnlyRootFilesystem is now ON. #503 left it off with
+          # an honest reason; this is the enumeration that reason asked for,
+          # measured by running THIS image read-only rather than by reading the
+          # source. Identical shape to aifactory and pfactory — see
+          # apps/aifactory/manifests/manifests.yaml for the full write-path
+          # table; the three images share a base and a HOME layout.
+          #
+          # The obvious fix stays wrong: /home/nonroot/.npm-global is ~1.1G of
+          # baked provider CLIs (#791), so an emptyDir over /home/nonroot would
+          # MASK them. Every volume below therefore sits BELOW /home/nonroot.
+          #
+          # Measured, this exact image, read-only + uid 65532 + cap-drop ALL +
+          # no-new-privileges: alembic migrations ran to head,
+          # "Application startup complete", uvicorn on :3103,
+          # GET /api/health -> 200.
+          #
+          # NOTE: that same run surfaced a PRE-EXISTING defect unrelated to this
+          # change — a missing `import sys` makes both the #774 startup
+          # reconcile and the #742 worktree GC fail on every boot, swallowed by
+          # `(continuing)`. Reproduced on the live pod too. TFactory#918.
+          #
+          # What is NOT proven here: a full verify run. A write failure
+          # mid-verify is a runtime 500, not a CrashLoop, so pod status will not
+          # catch it — watch one real verification after this rolls out.
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           ports: [{ containerPort: 3103 }]
@@ -284,6 +298,12 @@ spec:
             # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
             - { name: PATH, value: "/home/nonroot/.npm-global/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
+            # Factory#520. What makes readOnlyRootFilesystem possible at all:
+            # the claude CLI writes ~/.claude.json at the HOME ROOT, a single
+            # FILE that no emptyDir can cover. This relocates it into the
+            # .claude emptyDir that already exists — the same directory
+            # seed-creds seeds, so credential resolution is unchanged.
+            - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             # The web-server process must import the backend's `agents` package
             # (create_spec_ingest_workspace schedules agents.planner on ingest).
             # Without apps/backend on the path the import fails silently and the
@@ -526,6 +546,12 @@ spec:
             - { name: cc-codex,  mountPath: /home/nonroot/.codex }
             - { name: cc-gemini, mountPath: /home/nonroot/.gemini }
             - { name: cc-config, mountPath: /home/nonroot/.config }
+            # Factory#520. All BELOW /home/nonroot on purpose, so the 1.1G of
+            # baked CLIs at .npm-global stays visible.
+            - { name: tmp,        mountPath: /tmp }
+            - { name: home-cache, mountPath: /home/nonroot/.cache }
+            - { name: home-npm,   mountPath: /home/nonroot/.npm }
+            - { name: home-local, mountPath: /home/nonroot/.local }
           readinessProbe: { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 30, periodSeconds: 20 }
           resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
@@ -536,6 +562,11 @@ spec:
         - { name: cc-gemini, emptyDir: {} }
         - { name: cc-config, emptyDir: {} }
         - { name: cli-creds, secret: { secretName: factory-cli-creds } }
+        # Factory#520 — the writable holes a read-only rootfs needs.
+        - { name: tmp,        emptyDir: {} }
+        - { name: home-cache, emptyDir: {} }
+        - { name: home-npm,   emptyDir: {} }
+        - { name: home-local, emptyDir: {} }
 ---
 # The tfactory-nix-store-gc CronJob (RFC-0016 #197) is GONE with the PVC it
 # trimmed (#623). It nightly `nix store gc`'d a warm store that nothing writes to
