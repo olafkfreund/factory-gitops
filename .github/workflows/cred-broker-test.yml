@@ -1,0 +1,32 @@
+# The cred-broker's refresh.py lives as a block scalar inside a ConfigMap, so
+# nothing imports it and nothing had ever run its decision logic. Factory#437:
+# it failed every 4 hours for days because it treated "this grant cannot rotate
+# a healthy long-lived credential" as an outage. An alarm that is always red is
+# as useless as a gate that is always green.
+#
+# No paths filter: this is cheap (seconds) and a required check that does not
+# run on a PR leaves that PR blocked forever.
+name: cred-broker decision logic
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: refresh.py exits correctly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Extract refresh.py from the ConfigMap
+        run: python3 .github/scripts/extract_cred_broker.py /tmp/refresh_extracted.py
+      - name: Both directions
+        run: python3 .github/scripts/test_cred_broker.py

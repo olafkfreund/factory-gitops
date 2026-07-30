@@ -197,6 +197,16 @@ data:
                     "must re-seed the Secret from a fresh `claude auth login`"
                 )
                 if days_left is not None and days_left > LONG_LIVED_DAYS:
+                    # NOT an incident, so NOT a failure. The credential is
+                    # healthy for months; this grant simply cannot rotate it,
+                    # and never will. Exiting non-zero here made the CronJob
+                    # fail six times a day, forever — and an alarm that is
+                    # always red is exactly as useless as a gate that is always
+                    # green. When the real expiry arrives, the alert that fires
+                    # must not be the two-thousandth identical one.
+                    #
+                    # The loud path is preserved below for the case this job
+                    # exists for: a refresh rejected while the runway is SHORT.
                     eprint(
                         f"NOTE: the access token still has {days_left:.0f} days left, so "
                         "this is a BROKEN ROTATION, not an imminent outage. A credential "
@@ -206,6 +216,17 @@ data:
                         "(8h token + usable refresh token) or retire the broker for this "
                         "credential. See Factory#437."
                     )
+                    eprint(
+                        "reporting SUCCESS: nothing to rotate and nothing at risk. This "
+                        "job goes red again the moment the runway drops below "
+                        f"{LONG_LIVED_DAYS}d with the grant still rejected."
+                    )
+                    record(
+                        "not-applicable:long-lived-credential",
+                        f"HTTP {e.code} invalid_grant, {days_left:.0f}d runway",
+                        exp_ms,
+                    )
+                    return 0
             code = "invalid_grant" if bad_grant else f"http_{e.code}"
             record(f"refresh-rejected:{code}", f"HTTP {e.code} {code}", exp_ms)
             return 3
