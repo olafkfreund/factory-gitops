@@ -108,6 +108,38 @@ spec:
     spec:
       serviceAccountName: nfs-provisioner
       terminationGracePeriodSeconds: 10
+      # Factory#521 — ACCEPTED EXCEPTION, recorded so the next sweep does not
+      # "fix" it. This pod runs as root and keeps the default capability set,
+      # and both are required. Ganesha is a userspace NFS server: it forks
+      # rpcbind and rpc.statd, which bind privileged ports and setuid down to
+      # the `rpc` user. Measured against this exact image rather than argued:
+      #
+      #   drop:[ALL] + the two adds below
+      #     -> Error setting up NFS server: Starting rpcbind failed with error:
+      #        exit status 1, output: rpcbind: /run/rpcbind/rpcbind.lock:
+      #        Permission denied                                   (exit 255)
+      #   drop:[ALL] + those two + SETUID SETGID DAC_OVERRIDE CHOWN FOWNER
+      #   NET_BIND_SERVICE
+      #     -> Error setting up NFS server: rpc.statd failed with error:
+      #        exit status 1                                       (exit 255)
+      #   default caps
+      #     -> Running NFS server!
+      #
+      # So `drop: [ALL]` alongside the two explicit adds — the shape #521
+      # suggested — does NOT work here, and a CrashLoop takes the `nfs`
+      # storageClass down with it, which is what tfactory-data-rwx (#781) is
+      # built on.
+      #
+      # What IS safe was measured the same way and is applied below:
+      # seccompProfile RuntimeDefault and allowPrivilegeEscalation: false. With
+      # no-new-privileges plus the two adds the server still reports
+      #   starting RLIMIT_NOFILE rlimit.Cur 1024 -> ending rlimit.Cur 1048576
+      #   Running NFS server!
+      # and without SYS_RESOURCE that same raise logs "operation not permitted"
+      # — which is the documented reason for the SYS_RESOURCE add, confirmed
+      # rather than taken on trust.
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: nfs-provisioner
           image: registry.k8s.io/sig-storage/nfs-provisioner:v4.0.8
@@ -125,8 +157,14 @@ spec:
             - { name: statd, containerPort: 662 }
             - { name: statd-udp, containerPort: 662, protocol: UDP }
           securityContext:
+            # DAC_READ_SEARCH: traverse exported trees regardless of the
+            # requesting uid. SYS_RESOURCE: raise this process's own
+            # file-descriptor limit (see the measured RLIMIT_NOFILE line above).
+            # Both are load-bearing for RWX provisioning — do not remove.
+            # No `drop: [ALL]` here, deliberately; see the pod-level comment.
             capabilities:
               add: ["DAC_READ_SEARCH", "SYS_RESOURCE"]
+            allowPrivilegeEscalation: false
           args:
             - "-provisioner=factory.io/nfs"
           env:
