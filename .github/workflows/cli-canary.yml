@@ -1,61 +1,107 @@
 name: cli-canary
 
-# Gate on the agent CLIs (#298). The pods reinstall these CLIs on every start, so
-# a broken or yanked upstream release would reach the whole fleet untested. This
-# runs on any change to the pinned versions (Renovate's weekly bump PR, or a hand
-# edit) and fails if a pinned version cannot install or launch — a bad bump can
-# never merge.
+# Gate on the agent CLIs (#298, rewritten for #90).
 #
-# This is the install + launch smoke gate. The heavier PARR --full canary (drive
-# one real task per runtime end-to-end against staging) is the intended follow-up
-# once staging cluster credentials are wired as repo secrets; see #298.
+# WHERE THE PINS LIVE. Not here any more. TFactory#791 baked claude-code, codex
+# and gemini-cli into each service's runtime image and deleted the install-clis
+# init container, so the pins moved from
+#   factory-gitops apps/{aifactory,pfactory,tfactory}/manifests/manifests.yaml
+# into the three service repos' Dockerfiles, in the `npm install -g` bake step.
+# This workflow reads them from there. factory-gitops is the only repo that can
+# see all three at once, which is why the cross-repo agreement check stays here.
+#
+# WHY THE OLD VERSION WAS BROKEN. It grepped the three manifests and compared
+# the results for equality. Once the pins moved out, every grep matched nothing;
+# `set -e` plus grep's exit-1-on-no-match turned that into a red check on every
+# PR. The red was the lesser fault: the comparison was of three values it never
+# asserted existed, so three absent pins compared equal and the step would have
+# reported success on no pins at all. Standards rule 4.7 -- a gate that cannot
+# run must fail, not pass -- and its corollary here: absent values must never
+# read as agreement. check_cli_pins.py asserts every pin EXISTS before it
+# asserts they match, and test_check_cli_pins.py holds that line.
+#
+# WHY IT RUNS ON A SCHEDULE. Nothing else watches these versions. Renovate's
+# GitHub App is not installed on this account (see the AIFactory/TFactory
+# .github/dependabot.yml headers), and Dependabot's docker ecosystem parses only
+# `FROM` lines -- it cannot see `npm install -g @anthropic-ai/claude-code@X`. So
+# no bot has ever proposed a bump for these three, and none will notice a yank.
+# Since #791 a bad release no longer reaches the fleet on pod start; it lands on
+# the next image build instead, which is a service repo's push-to-main deploy --
+# after merge, not on the PR. This weekly install+launch is what catches a
+# yanked or broken release before that build breaks. Tracked in Factory#90.
 
 on:
-  pull_request:
-    paths:
-      - 'apps/aifactory/manifests/manifests.yaml'
-      - 'apps/pfactory/manifests/manifests.yaml'
-      - 'apps/tfactory/manifests/manifests.yaml'
-      - '.github/workflows/cli-canary.yml'
+  schedule:
+    # Monday morning, ahead of the working week.
+    - cron: '0 5 * * 1'
   workflow_dispatch:
+  pull_request:
+    # The pins are no longer in this repo, so nothing under apps/** can change
+    # them. What a PR here can change is the gate itself -- so gate the gate.
+    paths:
+      - '.github/workflows/cli-canary.yml'
+      - '.github/scripts/check_cli_pins.py'
+      - '.github/scripts/test_check_cli_pins.py'
+
+permissions:
+  contents: read
 
 jobs:
   smoke:
-    name: install + launch the pinned agent CLIs
+    name: the fleet pins the same agent CLIs, and they install + launch
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Self-test the pin checker
+        # A gate whose own comparison logic is untested is how #90 happened.
+        run: python3 .github/scripts/test_check_cli_pins.py
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Extract the pinned CLI versions from the manifests
-        id: pins
+
+      - name: Fetch the Dockerfiles that bake the CLIs
         run: |
           set -euo pipefail
-          # The three manifests must agree on the versions; take aifactory as the
-          # source and assert the others match.
-          line() { grep -oE '@(anthropic-ai/claude-code|openai/codex|google/gemini-cli)@[0-9]+\.[0-9]+\.[0-9]+' "$1" | sort -u; }
-          a=$(line apps/aifactory/manifests/manifests.yaml)
-          p=$(line apps/pfactory/manifests/manifests.yaml)
-          t=$(line apps/tfactory/manifests/manifests.yaml)
-          if [ "$a" != "$p" ] || [ "$a" != "$t" ]; then
-            echo "::error::pinned CLI versions differ across the three manifests"
-            printf 'aifactory:\n%s\npfactory:\n%s\ntfactory:\n%s\n' "$a" "$p" "$t"
-            exit 1
-          fi
-          echo "pins<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$a" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-          echo "Pinned CLIs:"; echo "$a"
-      - name: Install the exact pinned versions (fails on a yanked/broken pin)
+          mkdir -p "$RUNNER_TEMP/dockerfiles"
+          # `main` in every service repo: each one's deploy.yml triggers on
+          # push-to-main, so main is the ref whose pins actually reach the
+          # cluster. `curl -f` exits non-zero on 404/500, so a repo rename, a
+          # moved Dockerfile or an outage fails this step rather than handing
+          # the checker an empty file to find no pins in.
+          for repo in AIFactory PFactory TFactory; do
+            curl -fsS --retry 3 --retry-delay 5 \
+              -o "$RUNNER_TEMP/dockerfiles/$repo" \
+              "https://raw.githubusercontent.com/olafkfreund/$repo/main/Dockerfile"
+          done
+
+      - name: Assert every image pins every CLI, to the same version
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/check_cli_pins.py \
+            AIFactory="$RUNNER_TEMP/dockerfiles/AIFactory" \
+            PFactory="$RUNNER_TEMP/dockerfiles/PFactory" \
+            TFactory="$RUNNER_TEMP/dockerfiles/TFactory" \
+            > "$RUNNER_TEMP/pins.txt"
+          echo "Fleet-agreed pins:"; cat "$RUNNER_TEMP/pins.txt"
+
+      - name: Install the exact pinned versions (fails on a yanked or broken pin)
         run: |
           set -euo pipefail
           export npm_config_prefix="$RUNNER_TEMP/clis"
-          # Install exactly what the pods install, in the same layout.
-          npm install -g $(echo "${{ steps.pins.outputs.pins }}" | tr '\n' ' ')
+          # Read the pins from a file rather than interpolating them into the
+          # shell -- they come from another repo's Dockerfile.
+          xargs -a "$RUNNER_TEMP/pins.txt" npm install -g --
+          # Mirrors the Dockerfiles. npm's postinstall fetches the native binary
+          # but leaves bin/claude as the stub that exits 1; install.cjs completes
+          # the swap (Factory#383). Without this the launch smoke below fails for
+          # a reason that has nothing to do with the pin.
+          node "$npm_config_prefix/lib/node_modules/@anthropic-ai/claude-code/install.cjs"
           ln -sf "$npm_config_prefix/bin/gemini" "$npm_config_prefix/bin/antigravity"
           echo "$npm_config_prefix/bin" >> "$GITHUB_PATH"
-      - name: Launch smoke — each CLI must start and report a version
+
+      - name: Launch smoke -- each CLI must start and report a version
         run: |
           set -euo pipefail
           fail=0

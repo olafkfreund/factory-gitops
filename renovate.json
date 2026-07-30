@@ -1,32 +1,13 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "The agent-CLI customManager that used to live here has been removed (Factory#90). It claimed to track @anthropic-ai/claude-code, @openai/codex and @google/gemini-cli and to open a weekly grouped bump PR that the cli-canary would gate. It did neither, for two independent reasons.",
+    "First, its fileMatch pointed at apps/{aifactory,pfactory,tfactory}/manifests/manifests.yaml, and TFactory#791 moved the pins out of those files into the service repos' Dockerfiles. It has matched nothing since.",
+    "Second, and true from the day it was written: the Renovate GitHub App is not installed on this account. There are zero Renovate PRs across all five Factory repos and no Dependency Dashboard issue despite config:recommended. See the AIFactory and TFactory .github/dependabot.yml headers, which record the same discovery for base images.",
+    "NOT COVERED, stated rather than implied. Nothing proposes bumps for the three agent CLIs. Dependabot's docker ecosystem parses only FROM lines, so it cannot see the `npm install -g @pkg@version` bake step that now holds them. .github/workflows/cli-canary.yml runs weekly and catches a yanked or broken pin, and catches the three Dockerfiles drifting apart, but it will not tell you a newer version exists. Remediation belongs in each service repo, not here, because the pins are no longer in this repo at all."
+  ],
   "extends": ["config:recommended"],
   "timezone": "Europe/London",
   "schedule": ["before 6am on monday"],
-  "labels": ["dependencies", "agent-cli"],
-  "customManagers": [
-    {
-      "description": "Track the pinned agent CLIs installed in the pod initContainers (#298). A broken upstream release must not reach the fleet on the next pod start; Renovate opens a bump PR the cli-canary gates.",
-      "customType": "regex",
-      "fileMatch": [
-        "^apps/(aifactory|pfactory|tfactory)/manifests/manifests\\.yaml$"
-      ],
-      "matchStrings": [
-        "(?<depName>@anthropic-ai/claude-code|@openai/codex|@google/gemini-cli)@(?<currentValue>\\d+\\.\\d+\\.\\d+)"
-      ],
-      "datasourceTemplate": "npm"
-    }
-  ],
-  "packageRules": [
-    {
-      "description": "One grouped weekly PR for all three agent CLIs; never auto-merge — the cli-canary must pass and a human confirms.",
-      "matchDepNames": [
-        "@anthropic-ai/claude-code",
-        "@openai/codex",
-        "@google/gemini-cli"
-      ],
-      "groupName": "agent CLIs",
-      "automerge": false
-    }
-  ]
+  "labels": ["dependencies"]
 }
