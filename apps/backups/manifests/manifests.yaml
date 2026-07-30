@@ -65,7 +65,19 @@ spec:
           initContainers:
             - name: dump
               image: postgres:16.4
-              command: ["/bin/sh", "-c"]
+              # MUST be bash, NOT sh. /bin/sh in postgres:16.4 (Debian bookworm)
+              # is dash, and dash has no `pipefail`: `set -euo pipefail` aborts
+              # with "set: Illegal option -o pipefail" (exit 2) before pg_dumpall
+              # ever runs. That is why this CronJob failed 4/4 runs and
+              # s3://factory-backups/postgres/ was empty — the fleet had no
+              # database backup at all. Do NOT "simplify" this back to sh.
+              #
+              # pipefail itself is load-bearing and must stay: without it a
+              # failing pg_dumpall still exits 0 through the `| gzip` pipe, so a
+              # truncated or empty dump would upload as a perfectly valid .gz and
+              # look like a good backup. A silently corrupt backup is worse than
+              # a loudly missing one.
+              command: ["/bin/bash", "-c"]
               args:
                 - |
                   set -euo pipefail
