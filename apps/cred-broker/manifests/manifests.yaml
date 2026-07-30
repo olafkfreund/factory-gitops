@@ -283,7 +283,20 @@ spec:
       template:
         spec:
           serviceAccountName: cred-broker
-          restartPolicy: OnFailure
+          # MUST be Never, NOT OnFailure (Factory#438). With OnFailure the Job
+          # controller deletes the pod once the backoff limit is exceeded, so
+          # failedJobsHistoryLimit above retains ten Job objects containing no
+          # readable logs. This job ran 10/10 failures over 37h and left zero
+          # pods; the fatal message had to be reproduced by hand (Factory#437).
+          # Re-running it identically with Never left an Error pod whose logs
+          # read fine minutes later. This is a single short-lived stdlib python
+          # process — there is nothing for an in-place container restart to save.
+          #
+          # Trade: backoffLimit counts pod failures rather than in-container
+          # restarts, so a failing run leaves up to 3 Error pods instead of 0.
+          # Ceiling is 3 x failedJobsHistoryLimit = 30 terminal pods, reaped
+          # with their Jobs. They hold no resources — that visibility IS the point.
+          restartPolicy: Never
           securityContext:
             runAsNonRoot: true
             runAsUser: 65532

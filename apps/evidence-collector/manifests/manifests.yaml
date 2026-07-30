@@ -284,7 +284,23 @@ spec:
       template:
         metadata: { labels: { app: evidence-collector } }
         spec:
-          restartPolicy: OnFailure
+          # MUST be Never, NOT OnFailure (Factory#438). OnFailure makes the Job
+          # controller delete the pod once the backoff limit is exceeded, which
+          # leaves failedJobsHistoryLimit above retaining ten Job objects with no
+          # readable logs — the same hole the removed TTL controller opened, one
+          # layer down. Observed on the two sibling jobs that had it: cred-broker
+          # (10 failed Jobs, 0 pods) and postgres-backup (4 failed Jobs, 0 pods),
+          # against audit-siem-forward and job-watchdog on Never, which kept
+          # every Error pod. This job has no equivalent object to write a
+          # diagnosis to, so the pod IS the evidence.
+          #
+          # Trade: backoffLimit counts pod failures rather than in-container
+          # restarts, so a failing run leaves up to 3 Error pods instead of 0.
+          # Ceiling is 3 x failedJobsHistoryLimit = 30 terminal pods, reaped with
+          # their Jobs. They hold no resources — that visibility IS the point.
+          # Secondary win: each retry gets a fresh `scratch` emptyDir, so a
+          # partial collect from a failed attempt cannot be uploaded by the next.
+          restartPolicy: Never
           serviceAccountName: evidence-collector
           enableServiceLinks: false
           securityContext:
