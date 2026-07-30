@@ -70,10 +70,35 @@ spec:
     metadata: { labels: { app: minio } }
     spec:
       enableServiceLinks: false
-      securityContext: { fsGroup: 1000, runAsUser: 1000, runAsNonRoot: true }
+      # Factory#521. Non-root was already enforced at pod level, but there was
+      # no seccompProfile and the container had no securityContext at all, so it
+      # kept every default capability. uid 1000 is unchanged and deliberately
+      # so: the minio-data PVC (and the .minio.sys metadata inside it) is owned
+      # by 1000, and a different uid here comes up unable to read its own
+      # buckets. Note the IMAGE's own default is root — `docker image inspect`
+      # shows an empty Config.User — so this pod-level uid is the only thing
+      # keeping it non-root, which is exactly why it is worth enforcing.
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: minio
           image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
+          # readOnlyRootFilesystem is MEASURED. This exact tag run read-only as
+          # uid 1000 with --cap-drop ALL and no-new-privileges, /data writable:
+          #   API: http://.../ WebUI: http://...
+          #   GET /minio/health/live  -> 200
+          #   GET /minio/health/ready -> 200
+          # Those two are the exact liveness/readiness paths below, so the proof
+          # is a request against the port. Every write goes under /data (the
+          # PVC), including .minio.sys and the SSE-S3 key metadata.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args: ["server", "/data", "--console-address", ":9001"]
           ports:
             - { containerPort: 9000, name: s3 }
@@ -119,7 +144,13 @@ metadata:
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
   backoffLimit: 6
-  ttlSecondsAfterFinished: 600
+  # NO ttlSecondsAfterFinished (Factory#508). It was 600, so ten minutes after
+  # this Job finished the TTL controller deleted the Job object — outcome and
+  # logs alike — exactly the reaper Factory#381 removed from apps/backups. The
+  # `hook-delete-policy: BeforeHookCreation` above already reaps the previous
+  # Job at the START of the next sync, which is the latest possible moment a
+  # human could still read why the last one failed. A TTL on top of that only
+  # shortens the window in which the evidence exists.
   template:
     # NOT app=minio. The `minio` Service selects exactly {app: minio}, and a
     # Service selector is a SUBSET match, so this pod joined the Service as an
@@ -145,7 +176,14 @@ spec:
     # is unaffected. Only pods route traffic.
     metadata: { labels: { app: minio-create-bucket } }
     spec:
-      restartPolicy: OnFailure
+      # Never, not OnFailure (Factory#508, same defect as Factory#438). Under
+      # OnFailure the Job controller deletes the POD once backoffLimit is
+      # exceeded, so a permanently failing bucket-init left nothing to read.
+      # Measured in #438: 14 failed Jobs under OnFailure left 0 readable pods;
+      # 7 under Never left 10. Under Never a failure leaves up to
+      # backoffLimit + 1 = 7 terminal pods, which is the price of being able to
+      # find out why the buckets were never configured.
+      restartPolicy: Never
       enableServiceLinks: false
       containers:
         - name: mc
@@ -154,9 +192,12 @@ spec:
           args:
             - |
               set -e
+              # The `fac` alias comes from MC_HOST_fac in the env below, not from
+              # `mc alias set fac <url> "$KEY" "$SECRET"`, which put the MinIO
+              # secret key in a process argument where any `ps` in this container
+              # could read it. Same credential, same Secret, off argv.
               echo "waiting for minio..."
-              until mc alias set fac http://minio.factory.svc.cluster.local:9000 \
-                    "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1; do
+              until mc ls fac/ >/dev/null 2>&1; do
                 sleep 3
               done
               mc mb --ignore-existing fac/factory-artifacts
@@ -186,38 +227,110 @@ spec:
               mc encrypt info fac/factory-artifacts
               mc encrypt info fac/factory-backups
               mc encrypt info fac/factory-evidence
+              ############################################################
+              # Retention, asserted rather than attempted (Factory#508)
+              #
+              # Every line below used to end `2>/dev/null || true`: stderr
+              # discarded, exit code swallowed. Retention on factory-backups and
+              # factory-evidence — the 14-day backup rule and the 90-day evidence
+              # floor both cited in the compliance docs — was therefore claimed by
+              # a command whose failure was unobservable by construction. A gate
+              # that cannot fail (standards 4.7).
+              #
+              # Measured on the live cluster 2026-07-30, with this Job long since
+              # deleted by its own TTL so nothing said why:
+              #   factory-backups   no lifecycle configuration at all
+              #   factory-evidence  no lifecycle configuration, and UN-VERSIONED
+              #   factory-artifacts 4 of the 6 intended rules
+              # ArgoCD reported apps/minio Synced + Healthy throughout.
+              #
+              # Two changes:
+              #  1. `mc ilm rule add` APPENDS — re-running it duplicates rules, so
+              #     it could never be re-asserted safely, which is what the
+              #     `|| true` was really papering over. `mc ilm import` replaces
+              #     the whole document instead: declarative, idempotent, and it
+              #     takes our own stable rule IDs (verified: importing the same
+              #     document twice leaves the same rules, not doubled).
+              #  2. Each import is read back with `mc ilm export` and the Job
+              #     fails if an expected rule is not there. The IDs come from the
+              #     document we just sent, so their presence is proof the whole
+              #     rule landed, not just its name.
+              ############################################################
               # Durability: object versioning so an overwrite or delete is
               # recoverable (a prior version survives). Floor for DR alongside the
-              # off-cluster copy tracked in docs/restore.md (#321). Idempotent.
-              mc version enable fac/factory-artifacts 2>/dev/null || true
-              mc version enable fac/factory-backups 2>/dev/null || true
-              mc version enable fac/factory-evidence 2>/dev/null || true
+              # off-cluster copy tracked in docs/restore.md (#321). Read back:
+              # factory-evidence was silently un-versioned under `|| true`.
+              # NOTE: this image has NO grep, sed, awk, tr or wc — it is mc plus
+              # coreutils plus bash, nothing else. The read-backs below therefore
+              # match with the shell's own `case`, which needs no binary at all.
+              # Found the hard way: the first version of this used `grep -q` and
+              # died with "grep: command not found" — a failure the old
+              # `2>/dev/null || true` would have swallowed without a trace.
+              for b in factory-artifacts factory-backups factory-evidence; do
+                mc version enable "fac/$b"
+                v="$(mc version info "fac/$b")"
+                case "$v" in
+                  *"versioning is enabled"*) ;;
+                  *) echo "FATAL: $b versioning NOT enabled after enable: $v" >&2
+                     exit 1 ;;
+                esac
+              done
+
+              # ilm_apply BUCKET JSON ID...  — import, export, assert each ID.
+              # The IDs come from the document we just sent, so seeing one come
+              # back is proof that whole rule landed, not just its name.
+              ilm_apply() {
+                b="$1"; doc="$2"; shift 2
+                printf '%s' "$doc" | mc ilm import "fac/$b"
+                got="$(mc ilm export "fac/$b")"
+                for id in "$@"; do
+                  case "$got" in
+                    *"\"ID\":\"$id\""*) ;;
+                    *) echo "FATAL: $b lifecycle rule '$id' absent after import" >&2
+                       echo "$got" >&2
+                       exit 1 ;;
+                  esac
+                done
+                echo "ok: $b lifecycle = $*"
+              }
+
+              # Artifacts: logs expire after 30d, evidence after 90d (conventions
+              # §2). Evidence referenced by a VAL claim must outlive the claim, so
+              # 90d is a floor, not an aggressive purge. Without these rules
+              # evidence had NO lifecycle guarantee (#313, #321).
+              ilm_apply factory-artifacts '{"Rules":[
+                {"ID":"log-pfactory-30d","Status":"Enabled","Expiration":{"Days":30},"Filter":{"And":{"Prefix":"pfactory/","Tags":[{"Key":"role","Value":"log"}]}}},
+                {"ID":"log-aifactory-30d","Status":"Enabled","Expiration":{"Days":30},"Filter":{"And":{"Prefix":"aifactory/","Tags":[{"Key":"role","Value":"log"}]}}},
+                {"ID":"log-tfactory-30d","Status":"Enabled","Expiration":{"Days":30},"Filter":{"And":{"Prefix":"tfactory/","Tags":[{"Key":"role","Value":"log"}]}}},
+                {"ID":"evidence-pfactory-90d","Status":"Enabled","Expiration":{"Days":90},"Filter":{"And":{"Prefix":"pfactory/","Tags":[{"Key":"role","Value":"evidence"}]}}},
+                {"ID":"evidence-aifactory-90d","Status":"Enabled","Expiration":{"Days":90},"Filter":{"And":{"Prefix":"aifactory/","Tags":[{"Key":"role","Value":"evidence"}]}}},
+                {"ID":"evidence-tfactory-90d","Status":"Enabled","Expiration":{"Days":90},"Filter":{"And":{"Prefix":"tfactory/","Tags":[{"Key":"role","Value":"evidence"}]}}}
+              ]}' log-pfactory-30d log-aifactory-30d log-tfactory-30d \
+                  evidence-pfactory-90d evidence-aifactory-90d evidence-tfactory-90d
+
               # Backup retention = ~14 dailies. Lifecycle enforces it (no prune
               # step in the CronJob); noncurrent versions reaped a week later so
               # versioning does not grow storage unbounded.
-              mc ilm rule add --expire-days 14 --noncurrentversion-expiration-days 7 fac/factory-backups 2>/dev/null || true
-              # Lifecycle: expire logs after 30d, evidence after 90d (conventions §2).
-              # evidence referenced by a VAL claim must outlive the claim, so 90d
-              # is a floor, not an aggressive purge.
-              mc ilm rule add --expire-days 30 --prefix "pfactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
-              mc ilm rule add --expire-days 30 --prefix "aifactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
-              mc ilm rule add --expire-days 30 --prefix "tfactory/" --tags "role=log" fac/factory-artifacts 2>/dev/null || true
-              # Evidence (role=evidence) retained 90d — must outlive any VAL claim
-              # that references it and the tamper-evident hash-chain built over it.
-              # Without these rules evidence had NO lifecycle guarantee (#313, #321).
-              mc ilm rule add --expire-days 90 --prefix "pfactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
-              mc ilm rule add --expire-days 90 --prefix "aifactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
-              mc ilm rule add --expire-days 90 --prefix "tfactory/" --tags "role=evidence" fac/factory-artifacts 2>/dev/null || true
+              ilm_apply factory-backups '{"Rules":[
+                {"ID":"backups-14d","Status":"Enabled","Expiration":{"Days":14},"NoncurrentVersionExpiration":{"NoncurrentDays":7},"Filter":{}}
+              ]}' backups-14d
+
               # Compliance-evidence bucket: everything in it IS evidence, so one
               # bucket-wide 90d rule (matching the 90d evidence floor above; #313
-              # #321 #324). Noncurrent versions (from versioning) reaped 30d later
-              # so tamper-recovery is retained without unbounded growth.
+              # #321 #324). Noncurrent versions reaped 30d later so
+              # tamper-recovery is retained without unbounded growth.
               # ponytail: 90d = the established floor; SOC2's 12-month observation
-              # window wants --expire-days 365 — one-line bump when an audit period
-              # is actually scoped.
-              mc ilm rule add --expire-days 90 --noncurrentversion-expiration-days 30 fac/factory-evidence 2>/dev/null || true
+              # window wants Days 365 — one-line bump when an audit period is
+              # actually scoped.
+              ilm_apply factory-evidence '{"Rules":[
+                {"ID":"evidence-90d","Status":"Enabled","Expiration":{"Days":90},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"Filter":{}}
+              ]}' evidence-90d
+
               echo "bucket ready:"; mc ls fac/
           env:
             - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
             - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+            # mc reads MC_HOST_<alias> for the `fac` alias, so the credential
+            # never reaches argv. $(VAR) is kubelet env expansion, not shell.
+            - { name: MC_HOST_fac, value: "http://$(S3_ACCESS_KEY):$(S3_SECRET_KEY)@minio.factory.svc.cluster.local:9000" }
           resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }

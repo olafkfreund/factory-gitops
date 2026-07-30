@@ -540,6 +540,34 @@ spec:
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
             - { name: RAPIDAPI_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: RAPIDAPI_KEY } } }
             - { name: CLAUDE_CODE_OAUTH_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: CLAUDE_CODE_OAUTH_TOKEN } } }
+            # OpenTelemetry export -> in-cluster OpenObserve (apps/observe,
+            # service `observe:5080`). Factory#516: until now `grep -c
+            # OTEL_EXPORTER` across the pfactory, tfactory and cfactory
+            # Deployments returned 0 — they were not misconfigured, they were
+            # unconfigured, so they logged no export failure and their silence
+            # read as health. A PARR run crosses PFactory -> AIFactory ->
+            # TFactory; with three of four untraced a trace could never span a
+            # handoff, which is the one question distributed tracing exists to
+            # answer.
+            #
+            # OpenObserve ingests OTLP/HTTP under an org-scoped base and the SDK
+            # appends /v1/{traces,metrics,logs}; org = `default`.
+            #
+            # The credential is the SAME derived Secret AIFactory reads —
+            # `otel-otlp-auth`, reconciled hourly from `observe-root` by
+            # apps/observe's observe-otlp-auth-sync — not a fourth hand-copied
+            # copy. That reconciler exists because the hand-maintained version
+            # drifted to Bearer, which OpenObserve v0.90.3 answers with `401 Not
+            # Supported`; it authenticates ingest with HTTP Basic and nothing
+            # else (Factory#465).
+            #
+            # optional=true: the Secret is created by that CronJob, so on a fresh
+            # cluster the pod must still start before the first reconcile. An
+            # absent header means no auth header, which the app's own startup
+            # probe reports as "NO SPANS WILL LAND" rather than claiming success.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://observe.factory.svc.cluster.local:5080/api/default" }
+            - { name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf" }
+            - { name: OTEL_EXPORTER_OTLP_HEADERS, valueFrom: { secretKeyRef: { name: otel-otlp-auth, key: headers, optional: true } } }
           volumeMounts:
             - { name: data,      mountPath: /home/nonroot/.tfactory }
             - { name: cc-claude, mountPath: /home/nonroot/.claude }
