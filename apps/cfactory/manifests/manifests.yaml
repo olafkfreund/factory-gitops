@@ -28,11 +28,37 @@ spec:
     spec:
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
-      securityContext: { fsGroup: 65532 }
+      # Factory#503. Every CronJob in this namespace has carried this set since
+      # it was written; the Deployments never did, so nothing VERIFIED that the
+      # control plane runs non-root. runAsUser is explicit and NUMERIC because
+      # the image's `USER nonroot` is a NAME and runAsNonRoot alone cannot
+      # resolve a name (AIFactory#848). Measured on the live image sha-7bf5bd6:
+      # `id` -> uid=65532(nonroot) gid=1000(nonroot) — so 65532 is exactly the
+      # uid this pod already runs as. NOTE the primary gid is 1000, not 65532
+      # (`useradd --user-group` picked the next free gid); writes to the PVC
+      # succeed via the fsGroup 65532 supplementary group, unchanged from today.
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: cfactory
           image: ghcr.io/olafkfreund/cfactory:0.1.0
           imagePullPolicy: IfNotPresent
+          # Factory#503. readOnlyRootFilesystem is safe HERE (unlike the agent
+          # services) because every persistent write is under workspace_root
+          # `~/.cfactory` — the PVC below: cfactory.db (db.py), plus
+          # service-endpoints.json and copilot-settings.json (config.py). Nothing
+          # else in the backend writes to disk. /tmp gets an emptyDir for
+          # tempfile / FastAPI's SpooledTemporaryFile upload rollover.
+          # Verified against the live image sha-7bf5bd6: read-only rootfs, uid
+          # 65532, app startup complete and GET /health -> 200.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports: [{ containerPort: 3111 }]
           env:
             - { name: CFACTORY_BACKEND_PORT, value: "3111" }
@@ -94,11 +120,15 @@ spec:
             # `observe` reachable. Base URL only — additive, best-effort.
             - { name: CFACTORY_OBSERVE_API_URL, value: "http://observe.factory.svc.cluster.local:5080" }
             - { name: CFACTORY_PUBLIC_API_URL, value: "https://cfactory-mcp.freundcloud.org.uk" }
-          volumeMounts: [{ name: data, mountPath: /home/nonroot/.cfactory }]
+          volumeMounts:
+            - { name: data, mountPath: /home/nonroot/.cfactory }
+            - { name: tmp,  mountPath: /tmp }
           readinessProbe: { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 20, periodSeconds: 20 }
           resources: { requests: { cpu: 50m, memory: 256Mi }, limits: { memory: 1Gi } }
-      volumes: [{ name: data, persistentVolumeClaim: { claimName: cfactory-data } }]
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: cfactory-data } }
+        - { name: tmp,  emptyDir: {} }
 ################################################################################
 # CFactory cockpit (frontend, service: cfactory-frontend, :80 -> 8080)
 # Public ingress via Cloudflare (cfactory.freundcloud.org.uk). No sidecar.
@@ -122,10 +152,41 @@ spec:
     spec:
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
+      # Factory#503. This pod had NO securityContext at all — not even fsGroup —
+      # and it is the public cockpit. 101, not 65532: the runtime base is
+      # nginxinc/nginx-unprivileged, whose user is uid 101 / gid 101 (measured:
+      # `id` -> uid=101(nginx) gid=101(nginx)). Setting 65532 here would be an
+      # instant CrashLoop, so the uid is the image's, not the fleet default.
+      # fsGroup 101 is what makes the two emptyDirs below group-writable to that
+      # uid — without it nginx cannot render its config and serves nothing.
+      securityContext:
+        fsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: frontend
           image: ghcr.io/olafkfreund/cfactory-frontend:0.1.0
           imagePullPolicy: IfNotPresent
+          # Factory#503. readOnlyRootFilesystem needs exactly two writable paths,
+          # both found by running the live image sha-7bf5bd6 read-only:
+          #   /etc/nginx/conf.d — the official entrypoint envsubsts
+          #     /etc/nginx/templates/default.conf.template into it at start
+          #     (that is how BACKEND_URL + CFACTORY_API_KEY get injected).
+          #     Without it the entrypoint logs
+          #       "ERROR: /etc/nginx/templates exists, but /etc/nginx/conf.d is
+          #        not writable"
+          #     and nginx comes up with NO server block: the process stays
+          #     Running while the port refuses connections. Measured — this is
+          #     the failure mode that looks green and is not.
+          #   /tmp — nginx-unprivileged puts client_body/proxy/fastcgi temp
+          #     paths there.
+          # With both present: nginx starts and GET / -> 200.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports: [{ containerPort: 8080 }]
           env:
             - { name: BACKEND_URL, value: "http://cfactory.factory.svc.cluster.local:3111" }
@@ -134,5 +195,11 @@ spec:
             # keystore is enforced (CFactory #75). Bare key form; same key as the
             # backend's CFACTORY_API_KEYS. Harmless no-op while the keystore is open.
             - { name: CFACTORY_API_KEY, valueFrom: { secretKeyRef: { name: cfactory-api-keys, key: api-key } } }
+          volumeMounts:
+            - { name: nginx-conf, mountPath: /etc/nginx/conf.d }
+            - { name: tmp,        mountPath: /tmp }
           readinessProbe: { httpGet: { path: /, port: 8080 }, initialDelaySeconds: 5, periodSeconds: 10 }
           resources: { requests: { cpu: 20m, memory: 32Mi }, limits: { memory: 128Mi } }
+      volumes:
+        - { name: nginx-conf, emptyDir: {} }
+        - { name: tmp,        emptyDir: {} }
