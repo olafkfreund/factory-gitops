@@ -54,7 +54,22 @@ spec:
       template:
         metadata: { labels: { app: postgres-backup } }
         spec:
-          restartPolicy: OnFailure
+          # MUST be Never, NOT OnFailure (Factory#438). OnFailure closes the same
+          # hole the TTL controller did, one layer down: the Job controller
+          # restarts the container in place and then deletes the pod once the
+          # backoff limit is exceeded, so failedJobsHistoryLimit retains ten Job
+          # objects with no readable logs. That is exactly what happened here —
+          # this job failed 4/4 runs over 5.6 days (the dash/pipefail bug above)
+          # and not one pod survived to say why; the cause had to be reproduced
+          # by hand against the live database.
+          #
+          # Trade: backoffLimit now counts pod failures rather than in-container
+          # restarts, so a failing run leaves up to 3 Error pods instead of 0.
+          # Ceiling is 3 x failedJobsHistoryLimit = 30 terminal pods, reaped with
+          # their Jobs. They hold no resources — that visibility IS the point.
+          # Secondary win: each retry gets a fresh `scratch` emptyDir, so a
+          # half-written .sql.gz from a failed attempt cannot leak into the next.
+          restartPolicy: Never
           enableServiceLinks: false
           securityContext:
             runAsNonRoot: true
