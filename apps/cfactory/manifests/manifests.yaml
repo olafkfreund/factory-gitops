@@ -120,6 +120,39 @@ spec:
             # `observe` reachable. Base URL only — additive, best-effort.
             - { name: CFACTORY_OBSERVE_API_URL, value: "http://observe.factory.svc.cluster.local:5080" }
             - { name: CFACTORY_PUBLIC_API_URL, value: "https://cfactory-mcp.freundcloud.org.uk" }
+            # OpenTelemetry export -> in-cluster OpenObserve (apps/observe,
+            # service `observe:5080`). Factory#516: until now `grep -c
+            # OTEL_EXPORTER` across the pfactory, tfactory and cfactory
+            # Deployments returned 0 — they were not misconfigured, they were
+            # unconfigured, so they logged no export failure and their silence
+            # read as health. A PARR run crosses PFactory -> AIFactory ->
+            # TFactory; with three of four untraced a trace could never span a
+            # handoff, which is the one question distributed tracing exists to
+            # answer. CFactory is the cockpit that displays the result, so its
+            # own read path belongs in the same trace.
+            #
+            # Note this is a DIFFERENT path to CFACTORY_OBSERVE_API_URL above:
+            # that one is the cockpit reading OpenObserve's health for the
+            # Services view, this one is CFactory writing its own spans into it.
+            #
+            # OpenObserve ingests OTLP/HTTP under an org-scoped base and the SDK
+            # appends /v1/{traces,metrics,logs}; org = `default`.
+            #
+            # The credential is the SAME derived Secret AIFactory reads —
+            # `otel-otlp-auth`, reconciled hourly from `observe-root` by
+            # apps/observe's observe-otlp-auth-sync — not a fourth hand-copied
+            # copy. That reconciler exists because the hand-maintained version
+            # drifted to Bearer, which OpenObserve v0.90.3 answers with `401 Not
+            # Supported`; it authenticates ingest with HTTP Basic and nothing
+            # else (Factory#465).
+            #
+            # optional=true: the Secret is created by that CronJob, so on a fresh
+            # cluster the pod must still start before the first reconcile. An
+            # absent header means no auth header, which the app's own startup
+            # probe reports as "NO SPANS WILL LAND" rather than claiming success.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://observe.factory.svc.cluster.local:5080/api/default" }
+            - { name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf" }
+            - { name: OTEL_EXPORTER_OTLP_HEADERS, valueFrom: { secretKeyRef: { name: otel-otlp-auth, key: headers, optional: true } } }
           volumeMounts:
             - { name: data, mountPath: /home/nonroot/.cfactory }
             - { name: tmp,  mountPath: /tmp }
