@@ -29,33 +29,47 @@
 # ignored NetworkPolicy could not produce that split.
 #
 # WHY TWO POLICIES AND NOT ONE
-# Job pods are labelled by their dispatcher, not by Helm, and the four builders
-# do NOT agree on a common label. There is no single selector that reaches all
-# of them:
+# Job pods are labelled by their dispatcher, not by Helm. Let
+#   A = `app in (aifactory-sandbox, tfactory-sandbox)`   (policy 1, below)
+#   B = `factory.io/kind: task`                          (policy 2, below)
 #
-#   builder                                   pod labels                             A   B
-#   AIFactory core/kube_sandbox.py            app=aifactory-sandbox, kind=task       y   y
-#   AIFactory core/job_dispatch.py            app=<service>, kind=task               n   y
-#   TFactory  tools/runners/kube_sandbox.py   app=tfactory-sandbox                   y   n
-#   TFactory  agents/verify_dispatch.py       (wraps kube_sandbox) app=tfactory-sandbox  y   n
+# The label set is MID-ROLLOUT, and that is the whole reason both exist.
+# Factory#483 moved every builder onto the vendored hub canonical
+# `job_dispatch.task_pod_labels()`, which always emits `factory.io/kind=task`.
+# Before that landed, the builders disagreed:
 #
-# where A = `app in (aifactory-sandbox, tfactory-sandbox)` and B =
-# `factory.io/kind: task`. A misses AIFactory's RFC-0016 job_dispatch builder,
-# whose `app` label is the SERVICE name (`pfactory|aifactory|tfactory`, see the
-# JobSpec docstring) rather than a fixed sandbox string. B misses both TFactory
-# builders, which set no `factory.io/kind` on the pod at all.
+#   builder                                  BEFORE Factory#483        A  B
+#   AIFactory core/kube_sandbox.py           app=aifactory-sandbox,kind=task  y  y
+#   AIFactory core/job_dispatch.py           app=<service>                    n  n
+#   TFactory  tools/runners/kube_sandbox.py  app=tfactory-sandbox             y  n
+#   TFactory  agents/verify_dispatch.py      (wraps kube_sandbox) same        y  n
 #
-# A podSelector cannot express OR across two label keys — matchExpressions are
-# ANDed — so this is two policies. NetworkPolicy is additive: a pod matched by
-# either gets that policy's allows, a pod matched by both gets the union, and
-# both carry the SAME egress rules so the outcome is identical either way. The
-# AIFactory chart template selects only B and would have left the TFactory pods
-# uncovered; selecting only A leaves AIFactory's job_dispatch pods uncovered.
-# Neither alone is correct.
+#   builder                                  AFTER (both images deployed)     A  B
+#   AIFactory core/kube_sandbox.py           app=aifactory-sandbox,kind=task  y  y
+#   AIFactory core/job_dispatch.py           app=aifactory-task,  kind=task   n  y
+#   TFactory  tools/runners/kube_sandbox.py  app=tfactory-sandbox,kind=task   y  y
+#   TFactory  agents/verify_dispatch.py      (wraps kube_sandbox) same        y  y
 #
-# Keep the two egress blocks byte-identical. `make -C apps/factory-namespace`
-# has no target for this; the check is in the PR body and is one command:
-# build the kustomization and diff the two `.spec.egress` blocks.
+# Neither column is complete on its own across BOTH rows of history, and a
+# podSelector cannot express OR across two label keys (matchExpressions are
+# ANDed). So: two policies, identical egress. NetworkPolicy is additive — a pod
+# matched by either gets that policy's allows, a pod matched by both gets the
+# union, so the outcome is the same however a given pod is labelled.
+#
+# WHICH ONE IS REMOVABLE, AND WHEN. As of the currently deployed images
+# (aifactory sha-fe6cd10, tfactory sha-6289bca — both verified to contain the
+# Factory#483 vendoring) B alone covers all four builders, and A is the
+# belt-and-braces. A is therefore the one to delete eventually — but NOT on the
+# strength of reading the source, because source and running image diverge for
+# as long as a rollout takes, and A is the only thing covering a pod built by an
+# image that predates the vendoring. The check before removing A is a live label
+# read per builder, not a grep:
+#   kubectl --context factory get pods -n factory -l 'app in (aifactory-sandbox,tfactory-sandbox)' --show-labels
+# If every such pod also carries factory.io/kind=task, A is redundant. Until
+# then it is load-bearing.
+#
+# Keep the two egress blocks byte-identical. The check is one command: build the
+# kustomization and diff the two `.spec.egress` blocks.
 #
 # SCOPE: task Job pods ONLY. The 16 control-plane Deployments and 2 StatefulSets
 # sharing this namespace are deliberately untouched — a namespace-wide
@@ -178,16 +192,27 @@ spec:
         - protocol: TCP
           port: 5081
 ---
-# Policy B — AIFactory's RFC-0016 job_dispatch builder (core/job_dispatch.py).
-# Its pods carry `app: <service>` (pfactory|aifactory|tfactory), NOT a fixed
-# sandbox string, so policy A above never matches them and they had no policy
-# at all. `factory.io/kind: task` is the one label that builder always sets.
+# Policy B — `factory.io/kind: task`, the label the vendored hub canonical
+# `job_dispatch.task_pod_labels()` emits for EVERY dispatched task pod in the
+# fleet (Factory#483). This is the selector the AIFactory chart template already
+# used, and post-vendoring it is the one that covers all four builders.
 #
-# NOTE the `app: <service>` label on those pods is independently a bug: the
-# `aifactory` Service selects `app: aifactory`, so a task Job pod joins the real
-# control-plane Service as an endpoint (Factory#476). That is a dispatcher fix,
-# not a policy fix, and is filed separately — this policy only makes sure the
-# pods are not additionally unconfined while it is outstanding.
+# It is what reaches AIFactory's RFC-0016 job_dispatch pods, whose `app` label is
+# derived from the service name (`aifactory-task`) rather than the fixed
+# `-sandbox` string policy A enumerates. Those pods were matched by nothing at
+# all until this policy existed — verified on the wire, not inferred: a pod
+# shaped like that builder's output reached the AIFactory, TFactory and CFactory
+# APIs, Keycloak, and argocd in another namespace, identically to a pod with no
+# policy.
+#
+# Historical note, because it explains why the `app` value is NOT the service
+# name: task pods used to carry `app: <service>` verbatim, and a Service selector
+# is a SUBSET match, so those pods joined the real control-plane Service as
+# endpoints and were handed live API traffic they do not serve (Factory#476).
+# Fixed at source in AIFactory#1107 / TFactory#885 and centralised into
+# task_pod_labels() by Factory#483; both fixes are in the deployed images. No
+# NetworkPolicy can fix that class of bug — it is a labelling fix — but it is
+# why neither builder's `app` value can be relied on as a stable selector.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
