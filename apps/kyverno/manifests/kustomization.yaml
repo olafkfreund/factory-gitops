@@ -73,3 +73,55 @@ patches:
     patch: |-
       - op: remove
         path: /metadata/labels
+
+  # Stop the reports-controller crash loop (Factory#501).
+  #
+  # THE DEFECT: 581 restarts over 3 days, and 621 EphemeralReports queued
+  # behind it with nothing draining them. PolicyReports have been frozen at
+  # 2026-07-26 ever since, so the audit trail this policy exists to produce
+  # has been a stale answer presented as a current one.
+  #
+  # NOT an OOM kill. The container exits 0 / Completed -- a clean shutdown
+  # after losing its leader lease. The logs say what actually happens:
+  #
+  #   failed to wait for cache sync   *v1.ClusterPolicy, *v1beta1.ValidatingPolicy,
+  #                                   *v1beta1.PolicyException, +6 more
+  #   Failed to update lease optimistically ... falling back to slow path
+  #   error="client rate limiter Wait returned an error: context deadline exceeded"
+  #   leadership lost, stopped leading
+  #
+  # No --clientRateLimitQPS is set anywhere in the args, so it runs at
+  # Kyverno's default 20 QPS / 50 burst. On startup this controller LISTs and
+  # WATCHes ~20 informer types AND has a 621-deep report backlog to aggregate.
+  # The lease renewal call queues behind that traffic on the same client-side
+  # rate limiter and times out, leadership drops mid-sync, the process exits
+  # cleanly, and it does the whole thing again five minutes later. The backlog
+  # only grows, so this cannot recover on its own.
+  #
+  # 300 QPS / 600 burst is the upstream recommendation for a cluster with a
+  # report backlog; it is client-side throttling only and does not raise load
+  # on the API server beyond what the controller genuinely needs to catch up.
+  #
+  # Memory 128Mi -> 512Mi: not the crash cause, but ~20 informer caches plus
+  # 621 reports will not fit in 128Mi, and the next failure would be a real
+  # OOM once it stops dying early enough to avoid one.
+  #
+  # Revisit once the backlog is drained; the QPS bump is safe to keep.
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: kyverno-reports-controller
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --clientRateLimitQPS=300
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --clientRateLimitBurst=600
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 512Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 256Mi
