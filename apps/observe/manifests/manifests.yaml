@@ -78,3 +78,230 @@ spec:
           # Modest for a k3d box, per design note.
           resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 1Gi } }
       volumes: [{ name: data, persistentVolumeClaim: { claimName: observe-data } }]
+---
+################################################################################
+# otel-otlp-auth reconciler (Factory#465)
+#
+# WHY THIS EXISTS AT ALL
+#
+# `otel-otlp-auth` is the Secret AIFactory's OTLP span exporter reads as
+# OTEL_EXPORTER_OTLP_HEADERS. Its entire content is a pure function of
+# `observe-root`:
+#
+#     Authorization=Basic base64(email:password)
+#
+# It was nevertheless maintained BY HAND, and it drifted: it held a Bearer
+# token. OpenObserve v0.90.3 answers Bearer with `401 Not Supported` — it
+# authenticates ingest with HTTP Basic and nothing else. So every span batch
+# was refused, once every five seconds, for the entire life of the fleet. The
+# `traces` stream count was still literally zero on 2026-07-30.
+#
+# A derived credential that a human has to re-derive after every cluster
+# rebuild is a credential that will be wrong again. So it is derived here
+# instead, from the one secret that is genuinely primary.
+#
+# WHY A CRONJOB AND NOT A ONE-SHOT JOB OR A SYNC HOOK
+#
+# Two reasons, both about the failure being noticed:
+#   - it re-derives after `observe-root` is rotated, without anyone
+#     remembering that this second Secret exists;
+#   - `job-watchdog` sweeps EVERY CronJob in this namespace rather than a
+#     hardcoded list, so this one inherits human routing (a GitHub issue on
+#     repeated failure) for free. An ArgoCD sync hook would inherit nothing.
+#
+# It writes exactly one Secret and can read exactly one, by name.
+################################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: observe-otlp-auth, namespace: factory, labels: { app: observe } }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: observe-otlp-auth, namespace: factory, labels: { app: observe } }
+rules:
+  # resourceNames pins this to the two Secrets it has business touching.
+  # Without it the Role would grant read of every Secret in the namespace —
+  # including factory-secrets — to derive one header.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["observe-root", "otel-otlp-auth"]
+    verbs: ["get", "patch"]
+  # create takes no resourceNames (the object does not exist yet), so it is
+  # kept in its own rule and limited to create.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: observe-otlp-auth, namespace: factory, labels: { app: observe } }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: observe-otlp-auth }
+subjects:
+  - { kind: ServiceAccount, name: observe-otlp-auth, namespace: factory }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: observe-otlp-auth-script, namespace: factory, labels: { app: observe } }
+data:
+  sync.py: |
+    """Derive `otel-otlp-auth` from `observe-root`. Stdlib only (Factory#465).
+
+    Idempotent and quiet: when the derived header already matches, it writes
+    nothing and says so. Exit 0 = the Secret now holds the right value,
+    whatever it held before.
+
+    Exit codes: 0 ok, 2 observe-root unreadable, 3 write refused.
+    """
+    import base64
+    import json
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+
+    NS = "factory"
+    SRC = "observe-root"
+    DST = "otel-otlp-auth"
+    API = "https://kubernetes.default.svc"
+    ROOT = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def k8s(method, path, body=None, content_type="application/json"):
+        with open(f"{ROOT}/token") as fh:
+            token = fh.read().strip()
+        req = urllib.request.Request(
+            API + path,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "authorization": f"Bearer {token}",
+                "accept": "application/json",
+                "content-type": content_type,
+            },
+            method=method,
+        )
+        ctx = ssl.create_default_context(cafile=f"{ROOT}/ca.crt")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+    def main() -> int:
+        try:
+            src = k8s("GET", f"/api/v1/namespaces/{NS}/secrets/{SRC}")
+            email = base64.b64decode(src["data"]["email"]).decode()
+            password = base64.b64decode(src["data"]["password"]).decode()
+        except Exception as e:  # noqa: BLE001 — cannot read == cannot derive
+            eprint(f"FATAL: cannot read {SRC}: {e!r}")
+            return 2
+
+        # OpenObserve v0.90.3 accepts HTTP Basic for OTLP ingest and answers
+        # Bearer with `401 Not Supported`. The scheme is not a preference.
+        basic = base64.b64encode(f"{email}:{password}".encode()).decode()
+        wanted = base64.b64encode(f"Authorization=Basic {basic}".encode()).decode()
+
+        try:
+            cur = k8s("GET", f"/api/v1/namespaces/{NS}/secrets/{DST}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                eprint(f"FATAL: cannot read {DST}: {e!r}")
+                return 3
+            cur = None
+
+        if cur and (cur.get("data") or {}).get("headers") == wanted:
+            # Never log the header itself; the scheme is the whole diagnosis.
+            print(f"ok: {DST} already derived from {SRC} (scheme=Basic)")
+            return 0
+
+        had = "absent"
+        if cur:
+            try:
+                raw = base64.b64decode((cur.get("data") or {}).get("headers", "")).decode()
+                had = raw.split("=", 1)[-1].split(" ")[0] or "<empty>"
+            except Exception:  # noqa: BLE001
+                had = "<unparseable>"
+
+        try:
+            if cur:
+                k8s(
+                    "PATCH",
+                    f"/api/v1/namespaces/{NS}/secrets/{DST}",
+                    {"data": {"headers": wanted}},
+                    content_type="application/merge-patch+json",
+                )
+            else:
+                k8s(
+                    "POST",
+                    f"/api/v1/namespaces/{NS}/secrets",
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {
+                            "name": DST,
+                            "namespace": NS,
+                            "labels": {"app": "observe"},
+                        },
+                        "type": "Opaque",
+                        "data": {"headers": wanted},
+                    },
+                )
+        except Exception as e:  # noqa: BLE001 — a refused write is the finding
+            eprint(f"FATAL: cannot write {DST}: {e!r}")
+            return 3
+
+        # Loud on change: this is the line that would have shown #465 on day one.
+        print(
+            f"REWROTE {DST} from {SRC}: auth scheme was {had}, now Basic. "
+            "Pods already running keep the old value until they restart — "
+            "env from a Secret is read once, at container start."
+        )
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: observe-otlp-auth-sync, namespace: factory, labels: { app: observe } }
+spec:
+  # Hourly. The input changes only when observe-root is rotated, so this is
+  # about bounding how long a rotation leaves traces dark, not about load.
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: { labels: { app: observe-otlp-auth-sync } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          serviceAccountName: observe-otlp-auth
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: sync
+              # Stock python; the script is stdlib-only, same as job-watchdog.
+              image: python:3.12-slim
+              command: ["python3", "/script/sync.py"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - { name: script, mountPath: /script, readOnly: true }
+          volumes:
+            - name: script
+              configMap: { name: observe-otlp-auth-script }
