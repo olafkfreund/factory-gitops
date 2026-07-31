@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - manifests.yaml
+# NOTE: the `fides-secrets` Secret is intentionally NOT listed here — it is
+# created out-of-band on the cluster (see the runbook) so no secret material
+# ever lands in git. Everything below references it by name.

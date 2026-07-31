@@ -1,0 +1,25 @@
+# Fides — compliance / provenance / evidence server, self-hosted on p510.
+# Independent of the AWS/EKS deployment: own image (built on p510, k3d-imported),
+# own Postgres, own secrets, own org. The root app-of-apps auto-syncs this.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fides
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/fides/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fides
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      # The fides-secrets Secret is created out-of-band (never committed); do not
+      # let selfHeal prune it just because it's absent from git.
+      - RespectIgnoreDifferences=true

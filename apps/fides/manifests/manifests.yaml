@@ -1,0 +1,181 @@
+# Fides on p510 k3d (namespace: fides). Adapted from the upstream EKS manifest
+# (kubernetes/fides-deploy.yaml) for a self-hosted, AWS-free install:
+#   - storageClassName gp3 -> local-path (k3d default)
+#   - image ECR -> fides-server:local (built on p510, k3d image import)
+#   - STORAGE_DRIVER s3 -> local (+ evidence PVC); SECRETS_PROVIDER aws -> unset (k8s Secret)
+#   - AI: reuse the p510 HOST ollama (systemd, 0.0.0.0:11434) via host.k3d.internal
+#   - IRSA ServiceAccount dropped (no AWS); default SA used
+#   - FIDES_RLS_ENABLED=false for MVP (app carries explicit org_id scoping; enabling
+#     RLS properly needs the least-privilege fides_app role + schema-rls.sql — follow-up)
+# The `fides-secrets` Secret is created out-of-band (see runbook) — NOT in git.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fides-db-pvc
+  namespace: fides
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fides-evidence-pvc
+  namespace: fides
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fides-db
+  namespace: fides
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # single RWO PVC — never two pods mounting it
+  selector:
+    matchLabels: { app: fides-db }
+  template:
+    metadata:
+      labels: { app: fides-db }
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: fides
+        - name: POSTGRES_USER
+          value: fides_user
+        # Password comes from the out-of-band Secret (kept OUT of git), and the
+        # same value is used inside db-dsn.
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: fides-secrets, key: postgres-password }
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: db-data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: db-data
+        persistentVolumeClaim: { claimName: fides-db-pvc }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fides-db
+  namespace: fides
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector: { app: fides-db }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fides-server
+  namespace: fides
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fides-server }
+  template:
+    metadata:
+      labels: { app: fides-server }
+    spec:
+      containers:
+      - name: app
+        image: fides-server:local          # built on p510 + `k3d image import`
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 6
+        livenessProbe:
+          httpGet: { path: /healthz, port: 8080 }
+          initialDelaySeconds: 20
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        env:
+        - name: PORT
+          value: "8080"
+        - name: DB_DRIVER
+          value: postgres
+        - name: DB_DSN
+          valueFrom:
+            secretKeyRef: { name: fides-secrets, key: db-dsn }
+        - name: FIDES_ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef: { name: fides-secrets, key: encryption-key }
+        - name: FIDES_API_TOKEN
+          valueFrom:
+            secretKeyRef: { name: fides-secrets, key: api-token }
+        # Fresh org UUID for p510 (generated in the runbook — NOT the AWS org).
+        - name: FIDES_API_ORG_ID
+          value: "f6fef630-5e5d-43fa-8d0d-afb40774402f"
+        - name: PORTAL_USERNAME
+          value: admin
+        - name: PORTAL_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: fides-secrets, key: portal-password }
+        # AI: reuse the p510 host ollama (systemd). host.k3d.internal resolves to
+        # the host from inside k3d; 172.18.0.1 also works.
+        - name: AI_PROVIDER
+          value: ollama
+        - name: AI_OLLAMA_ENDPOINT
+          value: http://host.k3d.internal:11434
+        - name: AI_MODEL
+          value: qwen2.5:7b
+        # Local filesystem evidence storage (no S3/AWS).
+        - name: STORAGE_DRIVER
+          value: local
+        - name: STORAGE_LOCAL_DIR
+          value: /data/evidence
+        - name: FIDES_RLS_ENABLED
+          value: "false"
+        - name: FIDES_MCP_ALLOWED_COMMANDS
+          value: "echo,/bin/echo,/usr/bin/echo,/usr/local/bin/fides-mcp-sensor"
+        - name: FIDES_EVENTS_ENABLED
+          value: "true"
+        # External URL for commit-status / links. Update once cloudflared host is set.
+        - name: FIDES_PUBLIC_URL
+          value: "http://localhost:8080"
+        - name: FIDES_DELEGATED_APPROVAL_ENABLED
+          value: "true"
+        volumeMounts:
+        - name: evidence
+          mountPath: /data/evidence
+        resources:
+          requests: { cpu: "100m", memory: "256Mi" }
+          limits: { memory: "1Gi" }
+      volumes:
+      - name: evidence
+        persistentVolumeClaim: { claimName: fides-evidence-pvc }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fides-server
+  namespace: fides
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector: { app: fides-server }
