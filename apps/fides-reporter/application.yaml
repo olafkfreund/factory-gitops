@@ -1,0 +1,36 @@
+# Fides Kubernetes reporter — CronJob that snapshots the cluster's running
+# workloads and reports them to the self-hosted Fides server (drift / shadow
+# changes). Chart lives in the fides repo; image is built on p510 +
+# k3d-imported (fides-k8s-reporter:local), matching how apps/fides runs the
+# server. The fides-reporter-token Secret is created out-of-band (not in git).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fides-reporter
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/fides
+    targetRevision: main
+    path: charts/fides-k8s-reporter
+    helm:
+      parameters:
+        - name: image.repository
+          value: fides-k8s-reporter
+        - name: image.tag
+          value: local
+        - name: fides.serverUrl
+          value: http://fides-server.fides.svc.cluster.local:8080
+        - name: fides.environmentId
+          value: 88d2eeb1-5bc4-4e05-89b0-8b4f09fbb703
+        - name: cronSchedule
+          value: "*/10 * * * *"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fides-reporter
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
