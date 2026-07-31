@@ -83,12 +83,23 @@ mechanism.
 
 ## The fix, in the order it matters
 
-### 1. Make the reported revision honest — add the webhook (needs a human)
+### 1. Make the reported revision honest — add the webhook (DONE 2026-07-31)
 
 This is the real fix: it removes the blind window rather than shrinking it, and
 ArgoCD's webhook handler invalidates the cached refs instead of waiting for the
 TTL. `argocd.freundcloud.org.uk` is already publicly routed by
 `infra/cloudflared/`, and `POST /api/webhook` answers.
+
+**Live since 2026-07-31** (Factory#506): hook `659390464` on
+`olafkfreund/factory-gitops`, push events, JSON, HMAC secret held in
+`argocd-secret` under `webhook.github.secret`. Deliveries return 200; the
+measured convergence is recorded in section 3 below.
+
+The commands are kept here because they are the recovery procedure, not just the
+setup: if the hook is ever deleted or the secret rotated, this is what re-creates
+it. Note the secret reaches `kubectl` and `gh` via a file rather than an argument
+in the runbook below — the inline form puts a live credential in the process
+table and in shell history.
 
 ```bash
 # 1. a shared secret, so the endpoint is not an open refresh trigger
