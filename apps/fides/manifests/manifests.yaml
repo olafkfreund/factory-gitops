@@ -179,3 +179,50 @@ spec:
   - port: 8080
     targetPort: 8080
   selector: { app: fides-server }
+---
+# Hands-off updates: fides-server pulls ghcr:latest (imagePullPolicy Always), so a
+# periodic rolling restart picks up whatever the GHCR publish workflow last pushed
+# on a merge to main. Zero-downtime (rolling surge on a 1-replica Deployment).
+# NOTE: this restarts on a timer regardless of whether the image changed; Argo CD
+# Image Updater (digest-watch) is the no-churn upgrade if that ever matters.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: fides-updater, namespace: fides }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: fides-updater, namespace: fides }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: fides-updater, namespace: fides }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: fides-updater }
+subjects:
+  - { kind: ServiceAccount, name: fides-updater, namespace: fides }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: fides-server-updater, namespace: fides }
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: fides-updater
+          restartPolicy: OnFailure
+          containers:
+            - name: kubectl
+              image: bitnami/kubectl:1.31
+              command: ["kubectl", "rollout", "restart", "deployment/fides-server", "-n", "fides"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                runAsNonRoot: true
+                capabilities: { drop: ["ALL"] }
