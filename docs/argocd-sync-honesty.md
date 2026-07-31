@@ -157,7 +157,7 @@ there, and repeating its own signal is noise.
 
 | Env | Default if unset | Effect |
 |---|---|---|
-| `DRIFT_TOLERANCE_SECONDS` | `600` | grace after a commit lands before a behind-tip app is a finding |
+| `DRIFT_TOLERANCE_SECONDS` | `600` (deployed: `180`) | grace after a commit lands before a behind-tip app is a finding |
 | `RECONCILE_TOLERANCE_SECONDS` | `900` | max age of `status.reconciledAt` before that alone is a finding |
 | `OO_STREAM` | `argocd_drift` | OpenObserve stream written to |
 | `OO_ORG` | `default` | OpenObserve organization |
@@ -165,10 +165,26 @@ there, and repeating its own signal is noise.
 | `OO_USER` / `OO_PASS` | *(none — job exits 2)* | from the `observe-root` secret |
 | `GITHUB_API` | `https://api.github.com` | override for the commit-date lookup |
 
-`DRIFT_TOLERANCE_SECONDS` **must stay above ~360s until the webhook is live**,
-because that much blindness is legitimate today and a tighter value would fire
-on every normal deploy. Once the webhook is in, 180s is generous against the
-measured 37s — and lowering it is the whole point of adding the webhook.
+`DRIFT_TOLERANCE_SECONDS` had to stay above ~360s while ArgoCD learned about
+commits only by polling, because that much blindness was legitimate and a
+tighter value would have fired on every normal deploy. **The webhook went live
+2026-07-31 (Factory#506) and the deployed value is now `180`.**
+
+The measurement that justified the change, taken on the first push after the
+hook was registered:
+
+| | pre-webhook | measured 2026-07-31 |
+|---|---|---|
+| hook delivery | *(none)* | `200 OK` in 0.29s |
+| push → ArgoCD reports the new revision | ~360s ceiling | **11s** |
+| apps converged | — | 31 of 31 tracking this repo |
+
+180s is ~16x the measured figure, so it is still generous — but it no longer
+lets ten minutes of staleness read as `ok`. If the hook is ever removed, raise
+this back to 600 in the same commit, because the blindness returns with it.
+
+The code default stays 600 deliberately: an operator running this job by hand
+against a cluster with no webhook should get the safe value, not the tuned one.
 
 #### Exit codes
 

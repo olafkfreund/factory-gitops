@@ -850,12 +850,14 @@ spec:
               env:
                 - { name: OO_STREAM, value: "argocd_drift" }
                 - { name: OO_ORG, value: "default" }
-                # 600s. The floor is the ~360s of legitimate blindness above;
-                # this leaves headroom so a normal deploy never cries wolf.
-                # LOWER IT once the GitHub webhook is live -- with the webhook
-                # the measured convergence was 37s, so 180s would be generous.
-                # Do not lower it before then: see docs/argocd-sync-honesty.md.
-                - { name: DRIFT_TOLERANCE_SECONDS, value: "600" }
+                # 180s. The webhook went live 2026-07-31 (Factory#506, hook
+                # 659390464), which removed the ~360s of legitimate blindness
+                # this used to have to tolerate: the push delivered 200 in 0.29s
+                # and every app tracking this repo reported the new revision 11s
+                # after the push. 180s is therefore ~16x the measured figure,
+                # still generous, and no longer hides ten minutes of staleness
+                # behind an `ok`. Raise it back to 600 if the hook is removed.
+                - { name: DRIFT_TOLERANCE_SECONDS, value: "180" }
                 # 5x the 180s reconciliation timeout: tolerant of one skipped
                 # burst and a slow repo-server, intolerant of a wedged
                 # controller.
