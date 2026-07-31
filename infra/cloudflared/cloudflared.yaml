@@ -53,6 +53,10 @@ data:
       # directly and does not traverse this route.
       - hostname: observe.freundcloud.org.uk
         service: http://oauth2-proxy-observe.factory.svc.cluster.local:4180
+      # Fides compliance/provenance server (self-hosted, namespace fides).
+      # Auth is Fides' own session cookie + FIDES_API_TOKEN — no oauth2-proxy.
+      - hostname: fides.freundcloud.org.uk
+        service: http://fides-server.fides.svc.cluster.local:8080
       - service: http_status:404
 ---
 apiVersion: apps/v1

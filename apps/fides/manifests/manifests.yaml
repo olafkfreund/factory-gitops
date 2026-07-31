@@ -156,7 +156,7 @@ spec:
           value: "true"
         # External URL for commit-status / links. Update once cloudflared host is set.
         - name: FIDES_PUBLIC_URL
-          value: "http://localhost:8080"
+          value: "https://fides.freundcloud.org.uk"
         - name: FIDES_DELEGATED_APPROVAL_ENABLED
           value: "true"
         volumeMounts:
