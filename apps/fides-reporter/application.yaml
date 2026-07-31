@@ -18,9 +18,11 @@ spec:
     helm:
       parameters:
         - name: image.repository
-          value: fides-k8s-reporter
+          value: ghcr.io/olafkfreund/fides-k8s-reporter
         - name: image.tag
-          value: local
+          value: latest
+        - name: image.pullPolicy
+          value: Always
         - name: fides.serverUrl
           value: http://fides-server.fides.svc.cluster.local:8080
         - name: fides.environmentId

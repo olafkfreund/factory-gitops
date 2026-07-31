@@ -97,8 +97,8 @@ spec:
     spec:
       containers:
       - name: app
-        image: fides-server:local          # built on p510 + `k3d image import`
-        imagePullPolicy: IfNotPresent
+        image: ghcr.io/olafkfreund/fides-server:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 8080
         readinessProbe:
