@@ -1,0 +1,129 @@
+# Test fixtures for require-first-party-signature-coverage.
+#
+# Factory#564. Every one of these is a case that was actually wrong at some
+# point while the rule was being built, or is a trap the fleet has already paid
+# for once. None of them is filler.
+---
+# The image that was running in `factory` matched by no rule at all.
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-odin, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/odin:sha-2749b26"}]
+---
+# THE POINT OF THE WHOLE POLICY: an image nobody has thought of yet. If this
+# case ever stops failing, the class has reopened and #564 is back.
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-future-service, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+# A digest reference is NOT matched by the glob `ghcr.io/olafkfreund/tfactory:*`
+# -- the glob wants a literal `:` -- so a digest-pinned first-party image is
+# genuinely uncovered even though its repository has a rule.
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-digest-pinned, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/tfactory@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
+---
+# An uncovered image hiding in an initContainer behind a covered app container.
+# The first draft of the JMESPath read only `spec.containers` and let this pass.
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-in-initcontainer, namespace: factory}
+spec:
+  initContainers: [{name: i, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:sha-6b116ee"}]
+---
+# One uncovered image among covered and third-party ones must still be found.
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-mixed, namespace: factory}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/aifactory:sha-6b116ee"}
+    - {name: b, image: "postgres:16.4"}
+    - {name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-aifactory, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:sha-6b116ee"}]
+---
+# AIFACTORY_BUILD_IMAGE. `:sha-<short>-nix` must still read as covered.
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-aifactory-nix, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:sha-6b116ee-nix"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-pfactory, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/pfactory:sha-2089d44"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-tfactory, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/tfactory:sha-bbd4400"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-cfactory, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/cfactory:sha-bd374f3"}]
+---
+# The `:` trap, in the direction that has already bitten this fleet once:
+# `cfactory:*` does NOT match `cfactory-frontend:*`, so `cfactory-frontend`
+# needs its own mirror entry here exactly as it needs its own glob over there.
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-cfactory-frontend, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/cfactory-frontend:sha-bd374f3"}]
+---
+# The runner glob has no `:` at all, so it must match every runner name.
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-runners, namespace: factory}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/tfactory-runner-pytest:latest"}
+    - {name: b, image: "ghcr.io/olafkfreund/tfactory-runner-nix:latest"}
+    - {name: c, image: "ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-bbd4400"}
+---
+# skillai and skillai-migrator are separate globs for the same `:` reason.
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-skillai-both, namespace: factory}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/skillai:42578c7dc32a"}
+    - {name: b, image: "ghcr.io/olafkfreund/skillai-migrator:42578c7dc32a"}
+---
+# Third-party images are out of scope BY DESIGN. If this case ever starts
+# failing, the rule has quietly grown a scope nobody agreed to.
+apiVersion: v1
+kind: Pod
+metadata: {name: thirdparty-out-of-scope, namespace: factory}
+spec:
+  containers:
+    - {name: a, image: "postgres:16.4"}
+    - {name: b, image: "busybox:1.36"}
+    - {name: c, image: "quay.io/keycloak/keycloak:26.1"}
+    - {name: d, image: "registry.k8s.io/sig-storage/nfs-provisioner:v4.0.8"}
+---
+# `^ghcr\.io/olafkfreund/` is anchored for a reason: another account's `odin`
+# on ghcr.io, and our own name on a different registry, are not ours to verify.
+apiVersion: v1
+kind: Pod
+metadata: {name: lookalikes-not-ours, namespace: factory}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/someoneelse/odin:v1"}
+    - {name: b, image: "docker.io/olafkfreund/odin:v1"}
