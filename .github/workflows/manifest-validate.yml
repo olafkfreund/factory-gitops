@@ -34,17 +34,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install kustomize and kubeconform
+      - name: Install kustomize, kubeconform and the Kyverno CLI
         run: |
           set -euo pipefail
           curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
             | tar -xz -C /usr/local/bin kustomize
           curl -sfL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz \
             | tar -xz -C /usr/local/bin kubeconform
+          # Pinned to v1.18.2 to MATCH the admission controller running in the
+          # cluster (reg.kyverno.io/kyverno/kyverno:v1.18.2). This is not the
+          # usual "pin for reproducibility" -- the whole value of the step
+          # below is that it agrees with the webhook that will judge the
+          # policy for real. A CLI on a different minor gives false confidence
+          # in both directions: a policy the webhook rejects passing here, or
+          # a policy the webhook accepts failing here.
+          curl -sfL https://github.com/kyverno/kyverno/releases/download/v1.18.2/kyverno-cli_v1.18.2_linux_x86_64.tar.gz \
+            | tar -xz -C /usr/local/bin kyverno
           # Rule 4.7: prove the tools are usable before claiming anything passed.
           # A download that 404s into a 0-byte file still leaves a file behind.
           kustomize version
           kubeconform -v
+          kyverno version
 
       - name: Build every kustomization and schema-check every manifest
         run: |
@@ -181,6 +191,140 @@ jobs:
           done
           echo "validated $loose YAML files no kustomization covers"
 
+          exit "$fail"
+
+      - name: Validate Kyverno policies with Kyverno's own policy validation
+        run: |
+          set -uo pipefail
+
+          # #111 part 2. The step above proves the Kyverno ClusterPolicy
+          # PARSES. It cannot prove the policy is VALID: kubeconform has no
+          # schema for kyverno.io/v1, so it logs `ok parsed` and checks syntax
+          # only. Every semantic rule Kyverno enforces is invisible to it.
+          #
+          # That gap is not cosmetic, because of how the failure lands.
+          # Kyverno REJECTS a keyless attestor carrying neither `rekor` nor
+          # `roots` ("Either Rekor URL or roots are required"). A rejected
+          # policy cannot be applied AT ALL, and ArgoCD then keeps serving the
+          # PREVIOUS version of the policy while reporting Synced and Healthy.
+          #
+          # That is exactly Factory#430: the cluster kept a stale copy of
+          # verify-factory-image-signatures that had lost its subjectRegExp,
+          # and for weeks it accepted a signature from ANY GitHub Actions
+          # workflow in ANY repo. Every artefact a control review looks at was
+          # green throughout. Because CI could not catch it, changes to that
+          # file (#126, #128, #130) were each validated BY HAND against the
+          # live webhook. This step is that manual check, automated.
+          #
+          # NOTE: `kyverno validate` does NOT exist in v1.18.x -- the
+          # subcommand was removed. `kyverno apply` is what runs the same
+          # policy validation the admission webhook runs.
+
+          # A resource is mandatory for `kyverno apply`, but this step is a
+          # POLICY validator, not a policy runner. The probe is a ConfigMap
+          # precisely because no policy here matches one, so no rule executes:
+          # no signature is fetched from ghcr.io, no log is fetched from
+          # rekor.sigstore.dev, and the step needs no network beyond the
+          # tool download. Policy validation happens at load time, before any
+          # resource is matched, so it runs regardless.
+          #
+          # ponytail: a future policy that matches ConfigMaps would start
+          # EXECUTING against this probe and could fail for reasons that are
+          # not validity. Change the probe kind if that day comes.
+          cat > /tmp/kyverno-probe.yaml <<'PROBE'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: kyverno-policy-validation-probe
+            namespace: default
+          data: {}
+          PROBE
+
+          # Discover by CONTENT, not by path. That is #117's lesson applied
+          # one level down: a hardcoded directory list makes the next policy
+          # file invisible rather than merely unchecked. A Kyverno policy
+          # added anywhere in this repo is validated the day it lands.
+          #
+          # Matches kyverno.io/v1 Policy and ClusterPolicy, which is what this
+          # repo uses. The v1alpha1 policy types Kyverno 1.18 also ships
+          # (ValidatingPolicy, ImageValidatingPolicy) are NOT matched -- see
+          # the ceiling note at the end of this step.
+          mapfile -t POLICIES < <(
+            git ls-files -z '*.yaml' '*.yml' | tr '\0' '\n' | sort | while read -r f; do
+              grep -qE '^apiVersion:[[:space:]]*kyverno\.io/' "$f" || continue
+              grep -qE '^kind:[[:space:]]*(Cluster)?Policy[[:space:]]*$' "$f" || continue
+              printf '%s\n' "$f"
+            done
+          )
+
+          # Rule 4.7, same shape as the zero-DIRS and zero-YAML guards above.
+          # This repo HAS Kyverno policies. Finding none means discovery
+          # broke, not that there is nothing to check.
+          if [ "${#POLICIES[@]}" -eq 0 ]; then
+            echo "::error::no Kyverno policy discovered -- this gate validated nothing"
+            exit 1
+          fi
+          echo "discovered ${#POLICIES[@]} Kyverno policy file(s)"
+
+          # The exit code is NOT the gate, and this is the whole point of the
+          # step. `kyverno apply` DETECTS all three failure classes tested and
+          # SWALLOWS two of them:
+          #
+          #   rekor/roots removed   -> exit 1, "policy validation error"
+          #   operations: CRAETE    -> exit 0, "Non-fatal parsing error"
+          #   patchesJson6901       -> exit 0, "skipping invalid YAML file"
+          #
+          # In both exit-0 cases the policy did not load at all, and the CLI
+          # says so in the one place that is content rather than wording:
+          # "Applying 0 policy rule(s)". Trusting the exit code alone would
+          # ship the exact reports-without-checking defect #111 and #117 exist
+          # to unpick, so all three signals are checked:
+          #
+          #   1. non-zero exit             -- the CLI called it invalid
+          #   2. zero rules loaded         -- the policy was dropped entirely
+          #   3. any `error=` line at -v 4 -- a policy was dropped from a file
+          #                                   that still has other policies in
+          #                                   it, so the rule count stays > 0
+          #
+          # Signal 3 is measured clean: both committed policies produce ZERO
+          # `error=` lines. If a benign one ever shows up, this fails loudly
+          # and legibly rather than passing quietly, which is the correct
+          # direction to fail for a gate guarding cluster admission.
+          #
+          # -v 4 is required: at default verbosity the CLI prints a misleading
+          # "Policies Skipped (as required variables are not provided)" and
+          # hides the actual reason.
+          fail=0
+          for f in "${POLICIES[@]}"; do
+            out=$(kyverno apply "$f" --resource /tmp/kyverno-probe.yaml -v 4 2>&1)
+            rc=$?
+            rules=$(printf '%s\n' "$out" | sed -n 's/^Applying \([0-9]\{1,\}\) policy rule(s).*/\1/p' | head -1)
+
+            if [ "$rc" -ne 0 ]; then
+              echo "::error file=$f::Kyverno rejected this policy -- the live webhook would refuse it, and ArgoCD would keep serving the PREVIOUS version while reporting Synced (Factory#430)"
+            elif [ -z "$rules" ]; then
+              echo "::error file=$f::could not read the rule count from kyverno output -- this gate cannot confirm it checked anything"
+            elif [ "$rules" -eq 0 ]; then
+              echo "::error file=$f::kyverno loaded 0 rules -- the policy was DROPPED, not validated"
+            elif printf '%s\n' "$out" | grep -q 'error='; then
+              echo "::error file=$f::kyverno reported an error while loading this policy"
+            else
+              echo "ok  kyverno    $f  ($rules rule(s) validated against Kyverno v1.18.2)"
+              continue
+            fi
+
+            printf '%s\n' "$out" | grep -E 'error=|Applying [0-9]+ policy rule' | head -10
+            fail=1
+          done
+
+          # What this still does NOT catch, so nobody reads a green tick as
+          # more than it is:
+          #   - Whether the policy does the RIGHT thing. A subjectRegExp that
+          #     is valid but wrong (Factory#430's actual payload) is accepted
+          #     here. Only #132's coverage measurement speaks to that.
+          #   - Cluster-side admission of the policy object itself: CRD schema
+          #     drift, or another controller's webhook rejecting it.
+          #   - kyverno.io v1alpha1 policy kinds, which this repo does not use.
           exit "$fail"
 
   # Second gate, deliberately NOT the required status check (branch protection
