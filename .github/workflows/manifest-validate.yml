@@ -13,7 +13,9 @@
 #
 # Rule 4.7 (Factory standards): a gate that cannot run must FAIL, not pass. Every
 # way this job can fail to do its work is an explicit exit 1 below -- missing
-# tools, zero kustomizations discovered, a build that produces no output.
+# tools, zero kustomizations discovered, zero YAML discovered, a build that
+# produces no output, a file this gate cannot validate and has not been told to
+# skip.
 name: manifest validation (blocking)
 
 on:
@@ -44,13 +46,34 @@ jobs:
           kustomize version
           kubeconform -v
 
-      - name: Build and validate every kustomization
+      - name: Build every kustomization and schema-check every manifest
         run: |
           set -uo pipefail
 
-          mapfile -t DIRS < <(find . -name kustomization.yaml -not -path './.git/*' -printf '%h\n' | sort)
+          # This gate used to discover its work by finding kustomization.yaml.
+          # That made a directory with NO kustomization.yaml invisible rather
+          # than empty -- the job reported green having validated nothing for
+          # it, and the zero-DIRS guard below could not tell the difference.
+          # Five directories had accumulated that way (#117), including the
+          # cluster-wide Kyverno signature policy (#111), the outbound tunnel,
+          # the IdP and the RWX storage provisioner.
+          #
+          # So the denominator is now every tracked YAML file, and each one
+          # lands in exactly one of three buckets:
+          #
+          #   1. inside a discovered kustomization -> `kustomize build` + schema
+          #   2. listed in is_skipped() below      -> deliberately not validated
+          #   3. everything else                   -> kubeconform directly
+          #
+          # Bucket 3 is a catch-all with no list to maintain, so the sixth
+          # invisible directory cannot happen: a new manifest directory is
+          # validated the day it lands. The only way out of the gate is
+          # is_skipped(), which is a line in a diff a reviewer sees.
 
-          # The cli-canary bug this repo just fixed (#90/#92) was a gate that
+          mapfile -t DIRS < <(find . -name kustomization.yaml -not -path './.git/*' -printf '%h\n' | sort)
+          mapfile -t ALL < <(git ls-files -z '*.yaml' '*.yml' | tr '\0' '\n' | sort)
+
+          # The cli-canary bug this repo fixed (#90/#92) was a gate that
           # compared three greps without checking any had MATCHED. Same trap
           # here: if a reorganisation moves the manifests, an unguarded loop
           # iterates zero times and the job reports success having validated
@@ -59,9 +82,36 @@ jobs:
             echo "::error::no kustomization.yaml found anywhere -- this gate validated nothing"
             exit 1
           fi
-          echo "discovered ${#DIRS[@]} kustomizations"
+          if [ "${#ALL[@]}" -eq 0 ]; then
+            echo "::error::git ls-files found no YAML at all -- this gate validated nothing"
+            exit 1
+          fi
+          echo "discovered ${#DIRS[@]} kustomizations and ${#ALL[@]} tracked YAML files"
+
+          # Not Kubernetes manifests. Every entry needs a reason, because every
+          # entry is a file this gate deliberately does not check.
+          is_skipped() {
+            case "$1" in
+              .github/workflows/*) return 0 ;;   # GitHub Actions, not Kubernetes
+              mkdocs.yml)          return 0 ;;   # MkDocs site config
+              *)                   return 1 ;;
+            esac
+          }
+
+          # A file is covered by a kustomization when it sits inside that
+          # kustomization's directory tree. Approximate on purpose: a file the
+          # kustomization does not actually list still counts as covered. That
+          # is a narrower gap than #117 and is not what this change is about.
+          is_kustomized() {
+            local f="$1" d
+            for d in "${DIRS[@]}"; do
+              case "$f" in "${d#./}"/*) return 0 ;; esac
+            done
+            return 1
+          }
 
           fail=0
+
           for d in "${DIRS[@]}"; do
             if ! built=$(kustomize build "$d" 2>&1); then
               echo "::error file=$d/kustomization.yaml::kustomize build failed: $(printf '%s' "$built" | head -1)"
@@ -87,7 +137,110 @@ jobs:
               fail=1
               continue
             fi
-            echo "ok  $d"
+            echo "ok  kustomize  $d"
           done
 
+          loose=0
+          for f in "${ALL[@]}"; do
+            is_kustomized "$f" && continue
+            if is_skipped "$f"; then
+              echo "--  skipped   $f"
+              continue
+            fi
+            loose=$((loose + 1))
+            # Same reasoning as the empty-build guard: a YAML file with no
+            # `kind:` yields zero documents, and kubeconform validating zero
+            # documents exits 0. That is the gate reporting on nothing. Whoever
+            # adds such a file writes it into is_skipped() with a reason rather
+            # than having it pass unexamined.
+            if ! grep -qE '^[[:space:]]*kind:[[:space:]]*[^[:space:]]' "$f"; then
+              echo "::error file=$f::no \`kind:\` -- not a Kubernetes manifest this gate can validate; add it to is_skipped() with a reason, or fix it"
+              fail=1
+              continue
+            fi
+            if ! out=$(kubeconform -strict -ignore-missing-schemas -summary "$f" 2>&1); then
+              echo "::error file=$f::schema validation failed"
+              printf '%s\n' "$out" | head -20
+              fail=1
+              continue
+            fi
+            # Say which of the two happened. A file whose every resource is a
+            # CRD kind with no upstream schema was parsed, not schema-checked --
+            # true of the Kyverno ClusterPolicy in #111, and worth reading in the
+            # log rather than inferring from a bare "ok".
+            case "$out" in
+              *"Valid: 0,"*"Skipped: 0"*)
+                echo "::error file=$f::kubeconform found no resources here -- this gate checked nothing"
+                fail=1
+                continue ;;
+              *"Valid: 0,"*)
+                echo "ok  parsed     $f  (CRD kind, no upstream schema -- syntax only)"
+                continue ;;
+            esac
+            echo "ok  schema     $f"
+          done
+          echo "validated $loose YAML files no kustomization covers"
+
           exit "$fail"
+
+  # Second gate, deliberately NOT the required status check (branch protection
+  # requires only "kustomize build + schema"). It currently FAILS, on purpose:
+  # apps/odin/manifests/manifests.yaml still carries two live third-party API
+  # keys as literal `value:` strings in this PUBLIC repo (#116). Rotating those
+  # keys is an action against live Sonarr/Radarr instances and is the repo
+  # owner's call, and removing the literal without rotating would make the repo
+  # look clean while the exposure is unchanged.
+  #
+  # So this job stays red until #116 is actually closed. It is not allowlisted
+  # and it is not scoped to changed files -- either of those would silence a
+  # true positive, which is the exact "reports without checking" defect #117 is
+  # about. Making it non-required is the honest compromise: the finding is loud
+  # and permanent, but it does not wedge every merge in the repo behind a
+  # decision that is not CI's to make.
+  #
+  # When #116 closes, add "no literal secrets in manifests" to the required
+  # checks in branch protection. That is the only change needed.
+  secrets:
+    name: no literal secrets in manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan manifests for credentials committed as literal values
+        run: |
+          set -uo pipefail
+
+          mapfile -t ALL < <(git ls-files -z '*.yaml' '*.yml' | tr '\0' '\n' | sort)
+          if [ "${#ALL[@]}" -eq 0 ]; then
+            echo "::error::git ls-files found no YAML at all -- this scan checked nothing"
+            exit 1
+          fi
+
+          # #116: two live API keys reached a public repo because nothing looked.
+          # A credential-shaped env var name followed by a literal `value:` is
+          # the shape. `valueFrom:` (the secretKeyRef this repo already uses for
+          # minio-creds, oauth2-proxy-* and factory-secrets) does not match.
+          #
+          # Reports the file, the line and the variable NAME. Never the value --
+          # printing it would republish the secret into the CI log.
+          awk '
+            /^[[:space:]]*-?[[:space:]]*name:[[:space:]]*"?[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?)"?[[:space:]]*$/ {
+              var = $0
+              sub(/^[^:]*:[[:space:]]*/, "", var)
+              gsub(/"/, "", var)
+              next
+            }
+            var != "" && /^[[:space:]]*value:[[:space:]]*[^[:space:]]/ {
+              if ($0 !~ /value:[[:space:]]*("" *|'"''"' *)$/) {
+                printf "::error file=%s,line=%d::%s is set with a literal value: -- use secretKeyRef (#116)\n", FILENAME, FNR, var
+                hits++
+              }
+            }
+            { var = "" }
+            END { exit (hits ? 1 : 0) }
+          ' "${ALL[@]}" || {
+            echo "::error::literal credentials found in manifests -- see #116"
+            exit 1
+          }
+
+          echo "ok  no credential-shaped env var is set with a literal value"
