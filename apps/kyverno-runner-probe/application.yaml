@@ -1,0 +1,44 @@
+# kyverno-runner-probe -- is the runner-image signature rule actually covering
+# anything? (Factory#562)
+#
+# apps/kyverno-policies carries `verify-tfactory-runner-signature`, which covers
+# the eleven `tfactory-runner-*` images -- the sandbox AI-generated code is
+# built and executed in. Runner Pods are ephemeral Job Pods, so the rule
+# produces NO standing PolicyReport results and the audit board reads green
+# whether those images verify or not. Two of them provably do not (private GHCR
+# packages, Kyverno reads ghcr.io anonymously; Factory#563).
+#
+# This app makes the coverage continuously measurable instead of inferring it
+# from silence: every six hours it pushes all eleven images plus a known-red
+# canary through the real admission path with dryRun=All and records the
+# per-image verdict, distinguishing a signature failure from a registry-auth or
+# transport failure. Factory#522 must read THIS, not the at-rest board, before
+# flipping validationFailureAction to Enforce.
+#
+# Deliberately NOT under apps/kyverno-policies: nothing here is a policy, and
+# the probe must be able to change without touching the ClusterPolicy whose
+# resourceVersion invalidates Kyverno's image-verify cache.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno-runner-probe
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/kyverno-runner-probe/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

@@ -1,0 +1,590 @@
+# Runner-image signature probe (Factory#562).
+#
+# THE DEFECT THIS CLOSES. `verify-tfactory-runner-signature` covers the eleven
+# `ghcr.io/olafkfreund/tfactory-runner-*` images -- the sandbox in which
+# AI-generated code is built and executed. Runner Pods are ephemeral Job Pods,
+# so at rest they contribute ZERO PolicyReport results:
+#
+#   namespace factory: 65 results, 65 pass, 0 fail
+#   results attributable to verify-tfactory-runner-signature: 0
+#
+# The board is green because the rule has nothing to report on, not because the
+# images verify. Two of the eleven -- tfactory-runner-nix and
+# tfactory-runner-portal-ui -- are provably UNVERIFIABLE at admission right now
+# (private GHCR packages, Kyverno reads ghcr.io anonymously; Factory#563).
+# Green means ABSENT, not COVERED, and Factory#522's stated criterion for
+# flipping the policy to Enforce is "Audit is quiet, therefore it is safe".
+# For these eleven images that inference is invalid. This CronJob is what makes
+# it checkable.
+#
+# WHAT IT DOES. Every six hours it submits ONE synthetic Pod carrying all
+# eleven runner images plus a canary through the real admission path with
+# `dryRun=All`, reads the `Warning` response headers Kyverno writes, and emits
+# one durable record per run to the OpenObserve stream `image_signature_probe`.
+# Nothing is ever scheduled or pulled -- the dry run is rejected by the API
+# server before persistence, and the admission webhook is the only thing that
+# actually executes.
+#
+# WHY dryRun=All AND NOT THE ALTERNATIVES.
+#
+#   * Read the PolicyReports.  This is the bug. There are none.
+#   * Standing synthetic Pods, one per runner image.  Would give real standing
+#     PolicyReport results, which is the most honest shape -- but it means
+#     eleven Pods pulling eleven multi-GB runner images and holding them
+#     resident forever on a single-node k3d cluster whose concurrency ceiling
+#     is already storage-bound. Two of the images cannot be pulled at all
+#     (private, no imagePullSecret), so those two would sit ImagePullBackOff
+#     and report nothing -- it would fail exactly where the coverage gap is.
+#   * Emit a metric.  There is no Prometheus, Alertmanager, kube-state-metrics
+#     or PrometheusRule CRD in this cluster (see apps/audit-anchor-alert).
+#     OpenObserve is the only telemetry backend, and it is a log/metric sink,
+#     not an alerting engine. Adding a metrics stack to close a reporting gap
+#     is the wrong trade.
+#   * Shell out to `kubectl --dry-run=server`.  Same idea, but needs a kubectl
+#     image and gives back text on stdout instead of structured headers. The
+#     stdlib does this in one POST.
+#
+# dryRun=All exercises the identical code path a real runner Pod takes -- same
+# webhook, same rule, same cosign verification, same registry and Rekor round
+# trips -- for the cost of one API call and no image pull. It is the only
+# option that reports on the two private images honestly.
+#
+# HOW IT KNOWS IT ACTUALLY RAN -- THE CANARY. This is the whole point of the
+# issue, so it is a mechanism and not a comment. A probe that reads "no warning
+# for image X" as "X passed" cannot tell a pass from a policy that was deleted,
+# suspended, or whose webhook never fired: absence of a complaint would read as
+# green, which is the exact bug being fixed one level up.
+#
+# So the probe carries a twelfth image whose verdict is KNOWN AND MUST BE RED:
+# an old, public, genuinely UNSIGNED tag of tfactory-runner-pytest, published
+# before TFactory#947/#949 added cosign signing. The contract is that it must
+# come back classified `signature` (Kyverno: `no signatures found`). If it
+# comes back silent, the rule did not run. If it comes back `registry_auth` or
+# `transport`, the probe reached the registry or Sigstore in a degraded state
+# and its greens are not evidence either. Any of those makes the WHOLE RUN
+# report `not_checked` and exit non-zero -- never green.
+#
+# The canary is deliberately a sibling tag of an image already in the list:
+# `tfactory-runner-pytest:latest` must pass while
+# `tfactory-runner-pytest:<old sha>` must fail, in the same run, from the same
+# repository. That single differential proves the probe resolves per-image
+# rather than per-repository, that registry reads work, that Fulcio/Rekor are
+# reachable, and that a genuine signature verdict is being computed -- all
+# without needing anything published specially for the probe.
+#
+# WHY THE TWO REDS DO NOT FAIL THE JOB. Exit code is reserved for "the probe
+# could not do its job" -- API server unreachable (3), canary contract broken
+# (2). A run that successfully establishes that two images are unverifiable
+# exits 0, because that is the probe WORKING. This is the same reasoning as
+# apps/job-watchdog: a watchdog that goes red on its findings is
+# indistinguishable from a watchdog that is itself broken. The findings live in
+# the record and in the printed table; the exit code answers only "is this
+# evidence trustworthy".
+#
+# The consequence is the property Factory#562 asks for: "I did not run"
+# escalates HARDER than "I ran and found two failures". apps/job-watchdog
+# already watches every CronJob in this namespace for failure and for staleness
+# (it reads lastSuccessfulTime off the CronJob object, which survives Job GC),
+# so a probe that starts failing, stops being scheduled, or is deleted becomes
+# a `job_health` record and a GitHub issue with no extra wiring here.
+#
+# ADDED COST. Twelve cosign verifications per run, four runs a day = 48
+# registry+Rekor round trips a day, ~2/hour. Factory#444 measured the existing
+# background scan at ~50/hour (~1200/day), so this adds roughly 4%. The runs
+# are six hours apart and Kyverno's image-verify cache TTL is 60m, so every run
+# is cold and every number above is fresh calls, not cache hits. Do not lower
+# the interval below 1h expecting the cache to absorb it -- the cache is
+# positive-only, so the two failures are re-verified against ghcr.io every time
+# regardless.
+#
+# READING THE RESULT.
+#   kubectl -n factory logs job/<run>            # the table, one line per image
+#   OpenObserve: SELECT * FROM "image_signature_probe" ORDER BY _timestamp DESC
+#
+# Refs Factory#562, #522, #524, #563, #430, #444.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kyverno-runner-probe
+  namespace: factory
+  labels: { app: kyverno-runner-probe }
+---
+# `create` on pods is the narrowest grant Kubernetes offers for this: RBAC has
+# no dry-run-only verb, and a dry-run create is authorized exactly like a real
+# one. Nothing else is granted -- no get, no list, no exec, no secrets, no
+# other resource -- and the Role is namespaced to `factory`.
+#
+# ponytail: namespaced Role, not a dedicated namespace. If this SA's ability to
+# create a real Pod in `factory` ever becomes a concern, move the probe to its
+# own namespace and let the synthetic Pod be dry-run there instead; the policy
+# matches on `namespaces: [factory]`, so that move requires widening the rule
+# match first and is not free.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kyverno-runner-probe
+  namespace: factory
+  labels: { app: kyverno-runner-probe }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kyverno-runner-probe
+  namespace: factory
+  labels: { app: kyverno-runner-probe }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kyverno-runner-probe
+subjects:
+  - kind: ServiceAccount
+    name: kyverno-runner-probe
+    namespace: factory
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kyverno-runner-probe-script
+  namespace: factory
+  labels: { app: kyverno-runner-probe }
+data:
+  probe.py: |
+    #!/usr/bin/env python3
+    """Measure Kyverno signature coverage on the eleven tfactory runner images.
+
+    Runner Pods are ephemeral Job Pods, so `verify-tfactory-runner-signature`
+    contributes no standing PolicyReport results and the audit board reads green
+    at rest whether the images verify or not (Factory#562). This submits one
+    synthetic Pod carrying every runner image through the real admission path
+    with dryRun=All, reads the Warning headers Kyverno writes, classifies each
+    verdict, and emits a durable record.
+
+    Two things it refuses to conflate, both of them scar tissue:
+
+    1. VERIFIED vs NOT CHECKED. Silence for an image means "passed" only if the
+       rule demonstrably ran. A canary image with a known-red verdict is carried
+       in the same Pod; if the canary does not come back red for the expected
+       reason the whole run reports `not_checked` and exits non-zero. See
+       CANARY_IMAGE / CANARY_EXPECT below.
+
+    2. BAD SIGNATURE vs CANNOT READ THE REGISTRY. Kyverno writes `unverified
+       image` for both, and that ambiguity hid a fleet-wide DNS outage for weeks
+       behind what looked like a signing problem (Factory#430). Every failure is
+       classified from the specific message text and the reason is reported.
+
+    Env:
+      IMAGES         newline/comma separated image refs (default: the eleven)
+      CANARY_IMAGE   image whose verdict is known-red (default: unsigned pytest)
+      CANARY_EXPECT  required canary classification (default "signature")
+      PROBE_NS       namespace to dry-run into (default "factory")
+      OBSERVE_URL    OpenObserve base url (default in-cluster service)
+      OO_ORG/OO_STREAM/OO_USER/OO_PASS   OpenObserve delivery, as elsewhere
+
+    Exit: 0 verdict established (even an all-red one) / 2 canary contract broken
+    / 3 the probe could not run.
+    """
+
+    import base64
+    import json
+    import os
+    import re
+    import ssl
+    import sys
+    import urllib.request
+    from datetime import datetime, timezone
+
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+    # The eleven images `verify-tfactory-runner-signature` covers, at the tags
+    # this cluster actually runs. nix and the nine framework runners are
+    # dispatched at :latest (TFactory job_dispatch.DEFAULT_NIX_IMAGE,
+    # framework_registry descriptors); portal-ui is pinned in gitops.
+    DEFAULT_IMAGES = """
+    ghcr.io/olafkfreund/tfactory-runner-pytest:latest
+    ghcr.io/olafkfreund/tfactory-runner-jest:latest
+    ghcr.io/olafkfreund/tfactory-runner-playwright:latest
+    ghcr.io/olafkfreund/tfactory-runner-vitest:latest
+    ghcr.io/olafkfreund/tfactory-runner-cypress:latest
+    ghcr.io/olafkfreund/tfactory-runner-java:latest
+    ghcr.io/olafkfreund/tfactory-runner-selenium:latest
+    ghcr.io/olafkfreund/tfactory-runner-cucumber:latest
+    ghcr.io/olafkfreund/tfactory-runner-cloud:latest
+    ghcr.io/olafkfreund/tfactory-runner-nix:latest
+    ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-bbd4400
+    """
+
+    # A PUBLIC tfactory-runner-pytest tag published before TFactory#947/#949
+    # added cosign signing. Publicly readable, so a failure here cannot be
+    # confused with the private-package problem, and genuinely unsigned, so
+    # Kyverno must answer `no signatures found`. Its sibling
+    # tfactory-runner-pytest:latest is in the list above and must PASS in the
+    # same run -- that differential is the proof the probe resolves per image.
+    #
+    # ponytail: reuses an existing tag rather than publishing a probe-only
+    # image. If GHCR retention ever prunes it the canary classifies as
+    # `registry_missing`, the run reports not_checked and goes loud -- which is
+    # the correct direction to fail. Replace CANARY_IMAGE then.
+    DEFAULT_CANARY = (
+        "ghcr.io/olafkfreund/tfactory-runner-pytest:"
+        "9c039089b1afc4d4c7f98823fbdacf9e7516ec6a"
+    )
+
+    # Ordered: the first pattern that matches wins. TRANSPORT IS FIRST ON
+    # PURPOSE. A Sigstore/DNS failure (Factory#430) can wrap text that looks
+    # like anything else, and misreading it as a signature verdict is the
+    # specific mistake that cost weeks.
+    CLASSES = [
+        ("transport", r"fulcio|tuf-repo-cdn|initializing tuf|no such host|"
+                      r"server misbehaving|dial tcp|i/o timeout|"
+                      r"connection refused|context deadline exceeded|"
+                      r"TLS handshake timeout"),
+        ("registry_auth", r"UNAUTHORIZED|authentication required|"
+                          r"DENIED: requested access|ghcr\.io/token"),
+        ("registry_missing", r"MANIFEST_UNKNOWN|NAME_UNKNOWN|manifest unknown|"
+                             r"image tag not found"),
+        ("signature", r"no signatures found|no matching signatures|"
+                      r"signature not found|not signed"),
+    ]
+
+    # Kyverno's bare follow-up warning. It names the image and gives no reason
+    # at all -- it is the raw #430 ambiguity. It must never be read as a cause.
+    UNVERIFIED = re.compile(r"^unverified image (?P<img>\S+)")
+    FAILED = re.compile(r"failed to verify image (?P<img>[^:\s]+:[^:\s]+):\s*(?P<why>.*)",
+                        re.DOTALL)
+    # Kubernetes sends `Warning: 299 - "text"`.
+    WARNHDR = re.compile(r'^\s*\d{3}\s+\S+\s+"(?P<text>.*)"\s*$', re.DOTALL)
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def classify(why: str) -> str:
+        """Map a Kyverno failure message to a cause. Never guess: `unknown`."""
+        for name, pat in CLASSES:
+            if re.search(pat, why, re.IGNORECASE):
+                return name
+        return "unknown"
+
+
+    def parse_warnings(raw: list[str]) -> list[str]:
+        """Unwrap RFC 7234 warn-value envelopes into plain messages."""
+        out = []
+        for v in raw:
+            m = WARNHDR.match(v)
+            out.append((m.group("text") if m else v).replace('\\"', '"'))
+        return out
+
+
+    def verdicts(images: list[str], warnings: list[str]) -> dict[str, dict]:
+        """Fold warnings into one verdict per image.
+
+        An image with no warning at all passed -- BUT ONLY IF THE RULE RAN, and
+        establishing that is the canary's job, not this function's. Measured on
+        kyverno v1.18.2 with twelve simultaneously-failing images: all twelve
+        were named in distinct Warning headers, so absence here is absence of a
+        complaint and not header truncation.
+        """
+        res = {i: {"image": i, "verdict": "pass", "reason": "", "message": ""} for i in images}
+        for w in warnings:
+            m = FAILED.search(w)
+            if m and m.group("img") in res:
+                why = m.group("why").strip()
+                res[m.group("img")].update(
+                    verdict="fail", reason=classify(why), message=why
+                )
+                continue
+            m = UNVERIFIED.search(w)
+            # Only downgrade to `unknown` if nothing specific was recorded --
+            # the bare message always trails a real one for the same image.
+            if m and m.group("img") in res and res[m.group("img")]["verdict"] == "pass":
+                res[m.group("img")].update(
+                    verdict="fail", reason="unknown", message=w.strip()
+                )
+        return res
+
+
+    def probe(images: list[str], ns: str) -> list[str]:
+        """Dry-run one Pod carrying every image; return Kyverno's warnings."""
+        with open(f"{SA}/token") as fh:
+            token = fh.read().strip()
+        pod = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"generateName": "runner-signature-probe-", "namespace": ns},
+            "spec": {
+                "restartPolicy": "Never",
+                # Hardened so a future restricted PodSecurity label on the
+                # namespace rejects the spec on its merits, not on ours -- a
+                # 400 here would surface as "could not run", which is loud but
+                # would be our own fault.
+                "securityContext": {
+                    "runAsNonRoot": True,
+                    "runAsUser": 65532,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
+                "containers": [
+                    {
+                        "name": f"probe-{n}",
+                        "image": img,
+                        "command": ["/bin/true"],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": True,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                    }
+                    for n, img in enumerate(images)
+                ],
+            },
+        }
+        req = urllib.request.Request(
+            "https://kubernetes.default.svc/api/v1/namespaces/"
+            f"{ns}/pods?dryRun=All&fieldManager=kyverno-runner-probe",
+            data=json.dumps(pod).encode(),
+            headers={
+                "authorization": f"Bearer {token}",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, context=ctx, timeout=180) as r:
+            return parse_warnings(r.headers.get_all("Warning") or [])
+
+
+    def notify(record: dict) -> None:
+        """Durable record into OpenObserve. Never raises.
+
+        Same stream family, credentials and /_json ingest as
+        apps/audit-siem-forward, apps/job-watchdog and apps/audit-anchor-alert
+        -- one delivery path for the namespace, not a second one to rot.
+        """
+        user, pw = os.environ.get("OO_USER", ""), os.environ.get("OO_PASS", "")
+        if not user or not pw:
+            eprint("WARN: OO_USER/OO_PASS unset -- record NOT delivered")
+            return
+        oo = os.environ.get(
+            "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
+        ).rstrip("/")
+        org = os.environ.get("OO_ORG", "default")
+        stream = os.environ.get("OO_STREAM", "image_signature_probe")
+        try:
+            req = urllib.request.Request(
+                f"{oo}/api/{org}/{stream}/_json",
+                data=json.dumps([record]).encode(),
+                headers={
+                    "authorization": "Basic "
+                    + base64.b64encode(f"{user}:{pw}".encode()).decode(),
+                    "content-type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.load(r)
+        except Exception as e:  # noqa: BLE001 -- delivery must not mask the verdict
+            eprint(f"WARN: could not deliver record to OpenObserve: {e!r}")
+            return
+        eprint(f"delivered status={record['status']} to stream '{stream}': {res}")
+
+
+    def render(rows: list[dict]) -> None:
+        width = max(len(r["image"]) for r in rows)
+        for r in rows:
+            reason = f"  [{r['reason']}]" if r["reason"] else ""
+            eprint(f"  {r['image']:<{width}}  {r['verdict'].upper():<4}{reason}")
+            if r["message"]:
+                eprint(f"      {r['message']}")
+
+
+    def main() -> int:
+        ns = os.environ.get("PROBE_NS", "factory")
+        raw = os.environ.get("IMAGES") or DEFAULT_IMAGES
+        images = [s.strip() for s in re.split(r"[\s,]+", raw) if s.strip()]
+        canary = os.environ.get("CANARY_IMAGE", DEFAULT_CANARY).strip()
+        expect = os.environ.get("CANARY_EXPECT", "signature").strip()
+
+        record = {
+            "_timestamp": int(datetime.now(timezone.utc).timestamp() * 1_000_000),
+            "source": "kyverno-runner-probe",
+            "namespace": ns,
+            "policy": "verify-factory-image-signatures",
+            "rule": "verify-tfactory-runner-signature",
+        }
+
+        try:
+            warnings = probe(images + ([canary] if canary else []), ns)
+        except Exception as e:  # noqa: BLE001 -- any failure means no evidence
+            eprint(f"ERROR: probe could not run: {e!r}")
+            record.update(status="not_checked", problem=f"probe could not run: {e!r}")
+            notify(record)
+            return 3
+
+        res = verdicts(images + ([canary] if canary else []), warnings)
+        rows = [res[i] for i in images]
+        crow = res.get(canary, {}) if canary else {}
+
+        eprint(f"probe: {len(images)} runner images via dryRun=All in ns/{ns}")
+        render(rows)
+        if canary:
+            eprint("canary (must be RED, proves the rule actually ran):")
+            render([crow])
+
+        record.update(
+            checked=len(rows),
+            passed=sum(r["verdict"] == "pass" for r in rows),
+            failed=sum(r["verdict"] == "fail" for r in rows),
+            reasons=sorted({r["reason"] for r in rows if r["reason"]}),
+            images=rows,
+            canary={
+                "image": canary,
+                "expect": expect,
+                "observed": crow.get("reason") or crow.get("verdict"),
+                "ok": bool(canary) and crow.get("reason") == expect,
+            },
+        )
+
+        # THE CONTRACT. Silence from the canary means the rule did not run, and
+        # every `pass` above is then an artefact of nothing happening -- exactly
+        # the Factory#562 failure. Any canary result other than the expected
+        # cause invalidates the whole run, including the greens.
+        if canary and crow.get("reason") != expect:
+            got = crow.get("reason") or "SILENT (no warning at all)"
+            eprint(
+                f"ERROR: canary contract broken -- expected {expect!r}, got {got!r}. "
+                "The rule did not run, or ran degraded. The verdicts above are "
+                "NOT evidence."
+            )
+            record["status"] = "not_checked"
+            record["problem"] = f"canary expected {expect}, got {got}"
+            notify(record)
+            return 2
+
+        record["status"] = "fail" if record["failed"] else "pass"
+        eprint(
+            f"VERDICT {record['status'].upper()}: {record['passed']}/{record['checked']} "
+            f"verified, {record['failed']} failed {record['reasons']}"
+        )
+        notify(record)
+        # Exit 0 even on findings: the exit code answers "is this evidence
+        # trustworthy", not "is the fleet healthy". See the manifest header.
+        return 0
+
+
+    def _selftest() -> int:
+        auth = (
+            "failed to verify image ghcr.io/olafkfreund/tfactory-runner-nix:latest: "
+            ".attestors[0].entries[0].keyless: GET https://ghcr.io/token?scope="
+            "repository%3Aolafkfreund%2Ftfactory-runner-nix%3Apull&service=ghcr.io: "
+            "UNAUTHORIZED: authentication required"
+        )
+        sig = (
+            "failed to verify image ghcr.io/olafkfreund/tfactory-runner-pytest:old: "
+            ".attestors[0].entries[0].keyless: no signatures found"
+        )
+        # Factory#430, verbatim: read as a signing problem for weeks; it was DNS.
+        dns = (
+            "failed to verify image ghcr.io/olafkfreund/aifactory:sha-6b116ee: "
+            ".attestors[0].entries[0].keyless: failed to get roots from fulcio: "
+            'initializing tuf: Get "https://tuf-repo-cdn.sigstore.dev/13.root.json": '
+            "lookup tuf-repo-cdn.sigstore.dev on 10.43.0.10:53: server misbehaving"
+        )
+        gone = (
+            "failed to verify image ghcr.io/olafkfreund/tfactory-runner-pytest:nope: "
+            ".attestors[0].entries[0].keyless: image tag not found: GET "
+            "https://ghcr.io/v2/olafkfreund/tfactory-runner-pytest/manifests/nope: "
+            "MANIFEST_UNKNOWN: manifest unknown"
+        )
+        assert classify(auth) == "registry_auth"
+        assert classify(sig) == "signature"
+        assert classify(dns) == "transport", "a DNS outage must NEVER read as a signature verdict"
+        assert classify(gone) == "registry_missing"
+        assert classify("something nobody has seen before") == "unknown"
+
+        nix = "ghcr.io/olafkfreund/tfactory-runner-nix:latest"
+        ok = "ghcr.io/olafkfreund/tfactory-runner-jest:latest"
+        v = verdicts([nix, ok], [auth, f"unverified image {nix}"])
+        assert v[nix]["verdict"] == "fail" and v[nix]["reason"] == "registry_auth", v[nix]
+        assert v[ok]["verdict"] == "pass", "an image nobody complained about passed"
+        # The bare message alone carries no cause and must not be dressed up as
+        # one -- that conflation IS Factory#430.
+        v = verdicts([nix], [f"unverified image {nix}"])
+        assert v[nix]["reason"] == "unknown", v[nix]
+        # Warn-value envelope unwrapping.
+        assert parse_warnings(['299 - "hello \\"x\\""']) == ['hello "x"']
+        assert parse_warnings(["bare text"]) == ["bare text"]
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kyverno-runner-probe
+  namespace: factory
+  labels: { app: kyverno-runner-probe }
+spec:
+  # Every six hours, offset off the hour so it does not land on the reports
+  # controller's own background sweep. Four runs a day x 12 verifications =
+  # ~2 registry+Rekor calls an hour against the ~50/hour Factory#444 measured.
+  schedule: "17 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Enough failed runs to reconstruct a coverage regression; a failure here
+  # means the evidence itself was untrustworthy, which is the interesting case.
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: { labels: { app: kyverno-runner-probe } }
+        spec:
+          restartPolicy: Never
+          serviceAccountName: kyverno-runner-probe
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: probe
+              # Stock python; the script is stdlib-only, so no custom image and
+              # nothing new for the signature policy itself to have to cover.
+              image: python:3.12-slim
+              command: ["python3", "/script/probe.py"]
+              env:
+                - { name: OO_STREAM, value: "image_signature_probe" }
+                - { name: OO_ORG, value: "default" }
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: kyverno-runner-probe-script
