@@ -1,0 +1,228 @@
+# Every first-party image running in `factory` must be COVERED by a signature
+# rule -- not merely pass the rule that happens to name it.
+#
+# Factory#564. `verify-factory-image-signatures` verifies an image only if that
+# image matches one of its `imageReferences` globs. `required: true` there means
+# "a MATCHED image must have a signature"; it does NOT mean "every image must
+# match a rule". An image no glob names is admitted unverified and produces no
+# result at all -- not a pass, not a fail, nothing.
+#
+# When #564 was filed, fourteen distinct images ran in the `factory` namespace
+# that no rule matched, two of them first-party (`odin`, `skillai`) and both
+# unsigned. `skillai` had in fact been used as the known-UNSIGNED control in the
+# #522 deny experiment while running in this namespace. The audit board read
+# "65 pass / 0 fail", and that was true and useless: it meant "every image that
+# happened to match a glob verified", not "the namespace is verified".
+#
+# This is the same green-from-absence shape as Factory#562, one level up. There,
+# a rule matched but left no standing result. Here, no rule exists. In both
+# cases "the audit is clean" is read off a report that was never asked the
+# question. Fourteen accumulated because nothing objected.
+#
+# THE PRIZE IS THE CLASS, NOT TODAY'S TWO IMAGES. Signing `odin` and `skillai`
+# fixes two instances. This rule makes the NEXT unmatched first-party image
+# fail on its own, the day it lands, without anybody remembering to look.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS A SEPARATE POLICY AND NOT A SIXTH RULE IN verify-factory-image-
+# signatures
+# ---------------------------------------------------------------------------
+#
+# 1. It needs `pod-policies.kyverno.io/autogen-controllers: none`, and that
+#    annotation is POLICY-WIDE. The five verifyImages rules depend on autogen --
+#    most of their ~66 results come from autogen'd ReplicaSets and Deployments --
+#    so setting it there would gut the existing board. Here it is wanted: a Pod
+#    is what actually runs, and one result per Pod beats one per Pod plus one
+#    per ReplicaSet plus one per Deployment saying the same thing.
+#
+# 2. It keeps the two tallies separable. Factory#522's Enforce criterion is
+#    phrased in terms of the signature board being quiet; folding a coverage
+#    control into that same policy name would make "how many signature results
+#    are green" unanswerable without picking rules apart by hand.
+#
+# ---------------------------------------------------------------------------
+# WHY validate/deny AND NOT verifyImages -- THIS WAS MEASURED, NOT ASSUMED
+# ---------------------------------------------------------------------------
+#
+# The obvious shape is a catch-all verifyImages rule:
+#
+#   imageReferences: ["ghcr.io/olafkfreund/*"]
+#   required: true            # and deliberately NO attestors
+#
+# That is schema-valid (Kyverno v1.18.2 accepts `required: true` with no
+# attestor) and at ADMISSION it works beautifully: it warns
+# `unverified image ghcr.io/olafkfreund/odin:sha-2749b26` with no registry call
+# at all, because with no attestor there is nothing to fetch.
+#
+# It was rejected because IT PRODUCES NO STANDING RESULT. `required: true` is
+# evaluated against the `kyverno.io/verify-images` annotation that Kyverno
+# writes onto the resource at admission time. On a background scan of an
+# already-running Pod that annotation is absent, and the reports controller
+# logs, verbatim:
+#
+#   missing image metadata in annotation key=kyverno.io/verify-images
+#   policy.name=... rule.name=first-party-image-is-covered-by-no-signature-rule
+#
+# and emits nothing. Measured on this cluster: the catch-all verifyImages form
+# warned correctly on five out of five uncovered images at admission and added
+# EXACTLY ZERO rows to the PolicyReports over a full background scan. It would
+# have left the board reading "66 pass / 0 fail" -- the precise defect #564 was
+# filed about, reintroduced by the fix for it.
+#
+# A second reason, independent of the first: with no attestor the message is
+# clean, but any attestor at all means Kyverno must READ the image. `odin` is a
+# private GHCR package, so that read fails `UNAUTHORIZED: authentication
+# required` -- and Factory#430 is the record of how expensive it is when a
+# transport failure is reported in the same words as a signature verdict. The
+# validate form never touches the registry, so it cannot produce that
+# ambiguity.
+#
+# ---------------------------------------------------------------------------
+# WHAT `skip` MEANS HERE, AND WHY THERE ARE A LOT OF THEM
+# ---------------------------------------------------------------------------
+#
+# A Kyverno validate rule whose preconditions are not met records `skip`, not
+# silence. So every Pod in `factory` with no uncovered first-party image gets a
+# `skip` row: roughly one per Pod, and this namespace runs ~140 Pods including
+# retained Job Pods.
+#
+# That is verbose and it is deliberate. `skip` says "this rule looked here and
+# had nothing to say". Silence -- which is what a `pass`-emitting shape or the
+# verifyImages shape would give -- is indistinguishable from the rule not
+# running, and that indistinguishability IS the bug being fixed. Read this
+# policy's board as: `fail` = a real gap, `skip` = checked and clean. There is
+# no `pass`, because this rule never verifies anything itself.
+#
+# ---------------------------------------------------------------------------
+# KNOWN LIMITATION -- Factory#574. THIS RULE EMITS NO ADMISSION WARNING.
+# ---------------------------------------------------------------------------
+#
+# Measured on kyverno v1.18.2: at `validationFailureAction: Audit`, a
+# `verifyImages` rule returns BOTH a `Warning` header and a standing report
+# result, but a `validate` rule returns ONLY the standing report result. So a
+# `kubectl apply --dry-run=server` of a Pod carrying an uncovered image comes
+# back clean even though the rule would fail that Pod in its PolicyReport.
+#
+# Consequence: an uncovered first-party image used ONLY by ephemeral Job Pods
+# is caught by neither channel -- no standing result because the Pod is gone
+# (Factory#562), no warning because of the rule type. Long-running workloads,
+# which is how every first-party image is used today, are fully covered.
+#
+# Do NOT "fix" this by switching to verifyImages. That trade was measured above
+# and it loses the standing board result, which is the entire point. Both
+# channels needs both rule types. Factory#574 tracks extending the #562 runner
+# probe instead, which already submits a synthetic Pod every six hours.
+#
+# ---------------------------------------------------------------------------
+# THE COVERED LIST BELOW MIRRORS THE GLOBS IN verify-factory-image-signatures.
+# KEEP THEM IN STEP. When a rule is added there, add its glob here in the same
+# commit, or this rule will report a false gap for an image that is in fact
+# covered. Re-check the mirror against the live webhook with:
+#
+#   kubectl apply --dry-run=server -f <a Pod carrying the image in question>
+#
+# and against the policy pair offline with the same Kyverno version the cluster
+# runs:
+#
+#   kyverno apply require-first-party-signature-coverage.yaml --resource <pods>
+#
+# The failure direction matters. A glob added HERE but not THERE reopens the
+# silent hole this policy exists to close, so when in doubt leave an entry out:
+# an extra `fail` gets investigated, a missing one does not.
+# ---------------------------------------------------------------------------
+#
+# THIRD-PARTY IMAGES ARE OUT OF SCOPE BY DESIGN, NOT BY OVERSIGHT.
+#
+# Twelve third-party images run here (postgres, redis, keycloak, minio,
+# oauth2-proxy, cloudflared, busybox, python, pgvector, openobserve,
+# nfs-provisioner, minio mc). We cannot sign them and they do not publish
+# cosign signatures under an identity we could pin, so no attestor honest
+# enough to be worth writing exists for them. Inventing one would be theatre.
+# The control that is genuinely appropriate for them is digest pinning, so a
+# tag cannot be repointed under a running cluster; that is a separate policy
+# against a separate set of manifests, and it is tracked in Factory#573 rather
+# than smuggled in here. This rule is scoped to `ghcr.io/olafkfreund/*` so
+# that its silence about third-party images is a stated boundary rather than an
+# accident of which globs someone happened to write.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-first-party-signature-coverage
+  annotations:
+    policies.kyverno.io/title: Require Signature-Rule Coverage For First-Party Images
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Reports any ghcr.io/olafkfreund image running in the `factory` namespace
+      that no verifyImages rule in verify-factory-image-signatures names, and
+      which is therefore admitted with no signature check and produces no
+      result there. AUDIT mode: reported, never denied.
+    # Pods only. See the note above: this rule wants one row per running Pod,
+    # not the same finding repeated across Deployment, ReplicaSet and Pod.
+    pod-policies.kyverno.io/autogen-controllers: none
+spec:
+  # AUDIT/WARN ONLY. Do NOT flip this to Enforce. Factory#522 tracks the flip
+  # for the signature policy with its own blockers, and this control shares the
+  # decisive one: nothing has yet been observed denying on a real workload. At
+  # Enforce today this would deny `odin`, which is a running dashboard.
+  validationFailureAction: Audit
+  # If Kyverno is down, admit. This is a reporting control, not a gate.
+  failurePolicy: Ignore
+  webhookTimeoutSeconds: 30
+  # Factory#444's reasoning applies here too: without background scanning a
+  # result is a snapshot of the last rollout rather than a statement about the
+  # cluster now. It costs nothing -- this rule performs no registry or Rekor
+  # call, it only reads the Pod spec.
+  background: true
+  rules:
+    - name: first-party-image-must-be-covered-by-a-signature-rule
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [factory]
+      context:
+        # Every image on the Pod -- containers, initContainers AND
+        # ephemeralContainers -- that is first-party and is NOT named by any
+        # glob in verify-factory-image-signatures.
+        #
+        # initContainers is not optional padding: a Pod whose app container is
+        # covered but whose init container is not would otherwise pass silently.
+        # This is verified by a test case (`must-warn-in-initcontainer`).
+        #
+        # Note the covered patterns end in a literal `:` where the rule they
+        # mirror ends in `:*`. That is exact, not sloppy: the glob
+        # `ghcr.io/olafkfreund/tfactory:*` does not match a digest reference
+        # `ghcr.io/olafkfreund/tfactory@sha256:...`, so a digest-pinned
+        # first-party image is genuinely uncovered today and this rule reports
+        # it. `tfactory-runner-` has no `:` because the glob it mirrors has
+        # none either -- and that same missing `:` is why `cfactory:*` does NOT
+        # match `cfactory-frontend:*` and both must be listed over there.
+        - name: uncovered
+          variable:
+            jmesPath: >-
+              request.object.spec.[containers, initContainers, ephemeralContainers][].image
+              | [?regex_match('^ghcr\.io/olafkfreund/', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|skillai:|skillai-migrator:|tfactory-runner-)', @)]
+            # A Pod with no containers matching cannot produce a null here.
+            default: []
+      preconditions:
+        all:
+          - key: "{{ uncovered | length(@) }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          IMAGE COVERAGE GAP (Factory#564): {{ uncovered | join(', ', @) }}.
+          These are first-party ghcr.io/olafkfreund images that NO verifyImages
+          rule in verify-factory-image-signatures names, so admission never
+          checks their signature and they produce no pass and no fail there.
+          `required: true` on those rules means "a matched image must have a
+          signature"; it does not mean "every image must match a rule". The fix
+          is in this order and only this order -- add cosign signing plus an
+          anchored-identity verify self-test to the image's publishing workflow,
+          confirm it against the live registry, and only then add a rule with a
+          pinned subjectRegExp. A rule in front of an unsigned image produces
+          nothing but Audit noise. See docs/image-signature-admission.md.
+        deny: {}
