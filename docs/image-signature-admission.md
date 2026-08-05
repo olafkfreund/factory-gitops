@@ -341,12 +341,55 @@ kubectl get policyreport -n factory -o wide
 # Detail for the signature policy
 kubectl describe clusterpolicyreport | grep -A5 verify-factory-image-signatures
 
-# A fail is ambiguous — always read the reason before acting on it.
-# "no signatures found" is a real verdict; anything mentioning tuf / fulcio /
-# rekor / DNS is a transport failure, not an unsigned image.
+# Always read the reason before acting on a fail. Since Factory#444 turned on
+# `background: true` the stored result message carries the specific reason, so
+# this is usually enough on its own — see "Triage: the message is specific now".
+kubectl get policyreport -n factory -o jsonpath='{range .items[*].results[?(@.result=="fail")]}{.rule}{": "}{.message}{"\n"}{end}'
+
+# Fallback, and still the only source for an admission-time (non-background)
+# verdict.
 kubectl -n kyverno logs deploy/kyverno-admission-controller \
   | grep 'failed to verify image'
 ```
+
+### Triage: the message is specific now (correction to Factory#430)
+
+The manifest header and an earlier revision of this page both said the report
+does not distinguish "the signature is bad" from "Kyverno could not reach the
+registry or Sigstore", and that you must read the admission-controller log to
+tell them apart. **That is no longer true of the stored report.** It was true of
+the summary columns and of the flattened admission warning, and it was measured
+before `background: true`.
+
+Verified 2026-08-05 under Factory#522 (see "Observing a deny", below). Three
+different causes, three different `results[].message` values in the PolicyReport
+written by the background scan:
+
+| Cause | `results[].message` |
+| --- | --- |
+| Signed, but by an identity the rule does not accept | `subject mismatch: expected <regexp>, received <actual subject>` |
+| No signature at all | `no signatures found` |
+| Registry unreadable (private package, anonymous Kyverno) | `GET https://ghcr.io/token?scope=...: UNAUTHORIZED: authentication required` |
+
+The first two are signature verdicts. The third is a transport failure. The
+Factory#430 DNS outage is also a transport failure and names `tuf` / `fulcio` /
+`rekor` in the same position.
+
+The `subject mismatch` message is the most useful of the three: it prints both
+the pinned regexp and the subject actually presented, which makes an identity
+typo self-diagnosing rather than a bisect.
+
+What *is* still flattened is the admission-time warning pair. Creating a Pod
+under Audit emits **two** warnings for one failure — the specific one and a
+generic one:
+
+```
+Warning: policy ...probe-deny-unsigned: failed to verify image ghcr.io/olafkfreund/skillai:42578c7dc32a: .attestors[0].entries[0].keyless: no signatures found
+Warning: policy ...probe-deny-unsigned: unverified image ghcr.io/olafkfreund/skillai:42578c7dc32a
+```
+
+Read the first. `unverified image` on its own carries no cause and is the line
+that produced the Factory#430 ambiguity.
 
 To replay verification for a specific image without deploying anything, submit
 a throwaway Pod through admission with a server-side dry run. Kyverno evaluates
@@ -370,6 +413,176 @@ A clean `pod/sig-probe created (server dry run)` with no warning is a pass.
 
 An all-`pass` report for aifactory/pfactory/tfactory/cfactory Pods is the green
 light for the next phase.
+
+## Observing a deny (Factory#522)
+
+Factory#522 requires the policy be *seen denying* before it is trusted to deny:
+"Audit -> Enforce should not be a one-line change taken on trust." A policy that
+has only ever been observed passing has never demonstrated the half of its
+behaviour that the flip actually turns on.
+
+The obstacle is that **an Audit policy cannot deny**. Running the dry-run probe
+above against an unsigned image returns a *warning* and `created (server dry
+run)`. That is the policy declining to block, which is not evidence that it
+would block.
+
+### Experiment
+
+Run 2026-08-05. A temporary `Enforce` copy of the policy, scoped to a throwaway
+namespace, carrying the **same attestor configuration** as the real rules, with
+`useCache: false` so every case was a real registry and Rekor round trip rather
+than a cached verdict.
+
+Scoping, which is the load-bearing safety property — an over-broad Enforce
+policy wedges the fleet:
+
+- `match.any[].resources.namespaces: [sigpolicy-probe]` on every rule, so it
+  could not match anything in `factory`.
+- `kinds: [Pod]` only, and `pod-policies.kyverno.io/autogen-controllers: none`
+  so Kyverno generated no Deployment/ReplicaSet variants.
+- `background: false` for the Enforce phase, so it wrote no PolicyReports.
+- Created directly with `kubectl`, never committed, and deliberately **not**
+  labelled for ArgoCD, so the `kyverno-policies` app (which runs
+  `prune: true, selfHeal: true`) did not track it and could not act on it.
+
+Four cases, chosen so that each isolates one variable:
+
+| Case | Image | Attestor | Expected |
+| --- | --- | --- | --- |
+| A | `aifactory:sha-6b116ee` | real AIFactory rule, verbatim | admit |
+| B | `pfactory:sha-2089d44` | real PFactory rule with the ref changed to `refs/heads/attacker-branch` | deny, signature verdict |
+| C | `skillai:42578c7dc32a` | AIFactory rule | deny, signature verdict |
+| D | `tfactory-runner-nix:latest` | real runner rule, verbatim | deny, transport verdict |
+
+Case C uses `ghcr.io/olafkfreund/skillai` because it is public (so Kyverno can
+read it anonymously) and carries no cosign signature — the same registry and the
+same anonymous auth path as case A, so the only variable is the signature.
+
+Case B is the scenario the Factory#522 `subjectRegExp` anchoring exists to
+close: a correctly signed image, from the right repo and the right workflow, on
+the wrong ref.
+
+### Result: it denies
+
+Case B — wrong identity. A genuine rejection, not a warning:
+
+```
+$ kubectl apply --dry-run=server -f pod-b.yaml
+Error from server: error when creating "pod-b.yaml": admission webhook
+"mutate.kyverno.svc-ignore" denied the request:
+
+resource Pod/sigpolicy-probe/probe-b-wrong-identity was blocked due to the following policies
+
+tmp-sigpolicy-deny-probe:
+  probe-deny-wrong-identity: 'failed to verify image ghcr.io/olafkfreund/pfactory:sha-2089d44:
+    .attestors[0].entries[0].keyless: subject mismatch: expected ^https://github\.com/olafkfreund/PFactory/\.github/workflows/deploy\.yml@refs/heads/attacker-branch$,
+    received https://github.com/olafkfreund/PFactory/.github/workflows/deploy.yml@refs/heads/main'
+```
+
+Case C — no signature at all:
+
+```
+$ kubectl apply --dry-run=server -f pod-c.yaml
+Error from server: error when creating "pod-c.yaml": admission webhook
+"mutate.kyverno.svc-ignore" denied the request:
+
+resource Pod/sigpolicy-probe/probe-c-unsigned was blocked due to the following policies
+
+tmp-sigpolicy-deny-probe:
+  probe-deny-unsigned: 'failed to verify image ghcr.io/olafkfreund/skillai:42578c7dc32a:
+    .attestors[0].entries[0].keyless: no signatures found'
+```
+
+### Result: it admits
+
+A gate that denies everything is not a working gate. Case A, the real AIFactory
+attestor against the real running image, under the same Enforce policy:
+
+```
+$ kubectl apply --dry-run=server -f pod-a.yaml
+pod/probe-a-admit created (server dry run)
+```
+
+That on its own is weak — a rule that never matched would look identical. So the
+same rule was also run under an Audit copy with `background: true`, which records
+what it actually did:
+
+```
+rule   : probe-admit-correct-identity
+result : pass
+message: 'verified image signatures for ghcr.io/olafkfreund/aifactory:sha-6b116ee'
+```
+
+The rule evaluated, fetched, and verified. The admit is a verification, not a
+non-match.
+
+### Result: the two failure modes are distinguishable
+
+This is the Factory#430 lesson, and the experiment puts both modes on the record
+side by side. Case D is a correctly signed image that Kyverno cannot read:
+
+```
+$ kubectl apply --dry-run=server -f pod-d.yaml
+Error from server: error when creating "pod-d.yaml": admission webhook
+"mutate.kyverno.svc-ignore" denied the request:
+
+resource Pod/sigpolicy-probe/probe-d-unreadable was blocked due to the following policies
+
+tmp-sigpolicy-deny-probe:
+  probe-deny-unreadable: 'failed to verify image ghcr.io/olafkfreund/tfactory-runner-nix:latest:
+    .attestors[0].entries[0].keyless: GET https://ghcr.io/token?scope=repository%3Aolafkfreund%2Ftfactory-runner-nix%3Apull&service=ghcr.io:
+    UNAUTHORIZED: authentication required'
+```
+
+Same policy, same anchored identity, same `Enforce` — and the image *is*
+correctly signed. `cosign verify` on a workstation that holds a GHCR read
+credential returns its signature with subject
+`.../TFactory/.github/workflows/nix-runner-image.yml@refs/heads/main`. The
+in-cluster failure is purely that Kyverno reads ghcr.io anonymously.
+
+So: **cases B and C are signature verdicts and mean the image is untrustworthy.
+Case D is a transport verdict and means the verifier is blind.** Both deny under
+Enforce, and the difference is only visible in the message. Never triage a red
+without reading it.
+
+The experiment also reproduced the ambiguity by accident, which is the best
+evidence that it is a live hazard and not a historical footnote. Case C first
+pointed at `ghcr.io/olafkfreund/odin`, chosen as an unsigned image because
+`cosign verify` on a workstation reported `no signatures found`. In-cluster it
+denied with `UNAUTHORIZED: authentication required` instead: `odin` is a
+**private** package, and the workstation had a credential the cluster does not.
+The local tool and the cluster disagreed about the same image for reasons that
+had nothing to do with signing. Case C was repointed at `skillai`, which is
+public, to get an actual signature verdict.
+
+Practical rule from that: verifying with `cosign` on a workstation does not
+predict what Kyverno will do, because your Docker config is not Kyverno's.
+Reproduce with `docker logout ghcr.io` or a clean `DOCKER_CONFIG`.
+
+### Cleanup
+
+The temporary policy and namespace were deleted and the cluster confirmed back
+at baseline, not assumed:
+
+```
+$ kubectl get cpol
+NAME                              ADMISSION   BACKGROUND   READY   AGE   MESSAGE
+verify-factory-image-signatures   true        true         True    10d   Ready
+
+$ kubectl get ns | grep -c probe
+0
+
+$ kubectl get cpol verify-factory-image-signatures \
+    -o jsonpath='{.spec.validationFailureAction} {.spec.background} {.spec.failurePolicy}'
+Audit true Ignore
+
+# board tally, all results across all namespaces
+{'pass': 65} total 65
+reports per namespace: {'factory': 65}
+```
+
+One ClusterPolicy, still `Audit`, still five rules, 65 results all passing, all
+in `factory` — identical to the pre-experiment baseline.
 
 ## Evidence model: how fresh is a report?
 
@@ -614,11 +827,124 @@ Do NOT skip a phase. Each is a separate, small PR.
    required` until those two GHCR packages are made public. That visibility
    flip is a manual step and is the only remaining blocker on this line.
 
-4. **Enforce.** Only then flip `validationFailureAction: Audit` -> `Enforce`.
-   Consider also tightening `failurePolicy: Ignore` -> `Fail` at this point so a
-   verification outage blocks rather than admits — but weigh that against
-   availability, and keep the `factory` namespace scope so a Sigstore outage can
-   never wedge system namespaces. From this point unsigned images are denied at
+3c. **Observe a deny (Factory#522).** **Done 2026-08-05.** The policy has been
+   seen rejecting a wrong-identity image and an unsigned image, admitting a
+   correctly signed one, and distinguishing a signature verdict from a transport
+   failure — all under a scoped, temporary `Enforce` copy carrying the real
+   attestor configuration. Full method, exact output and cleanup verification in
+   [Observing a deny](#observing-a-deny-factory522).
+
+4. **Enforce.** Flip `validationFailureAction: Audit` -> `Enforce`.
+
+   **Not yet.** Three preconditions remain, and only one of the four is met.
+
+   | # | Precondition | State |
+   | --- | --- | --- |
+   | 0 | The policy has been observed denying and admitting | **Met**, 2026-08-05 |
+   | 1 | Every image a rule matches is readable by Kyverno | Open — Factory#563 |
+   | 2 | Runner coverage is actually evidenced | Open — Factory#562 |
+   | 3 | The DNS repair behind Factory#430 is declarative | Open — olafkfreund/nixos_config#1232 |
+
+   **1. Two runner packages are private (Factory#563).**
+   `tfactory-runner-nix` and `tfactory-runner-portal-ui` are private GHCR
+   packages. Kyverno holds no registry credential and reads ghcr.io
+   anonymously, so it gets `UNAUTHORIZED: authentication required` — the exact
+   case D deny quoted above. Under Enforce that denies **every build and verify
+   Job in the fleet**, because those two images are `AIFACTORY_SANDBOX_IMAGE`,
+   `TFACTORY_NIX_RUNNER_IMAGE`, `TFACTORY_VAL3_K8S_JOB_IMAGE` and
+   `PORTAL_UI_IMAGE`. Both images are correctly signed; this is purely a read
+   permission. The decision is to make both public, matching the other nine
+   runners and all five service packages. GitHub exposes no REST endpoint for
+   container package visibility (`PATCH` 404s), so it is a manual step in the
+   web UI and is pending. The alternative — wiring a read-only GHCR credential
+   into the `kyverno` namespace — is strictly more machinery for the same
+   result.
+
+   **2. A green board is not evidence of runner coverage (Factory#562).**
+   This one directly undermines the rollout criterion this document has used
+   since phase 1, and it should be said plainly: **"Audit is quiet" does not
+   mean "Enforce is safe."**
+
+   Runner Pods are ephemeral Job Pods. They are created, they run, they are
+   collected. They contribute **zero standing PolicyReport results**, so the
+   board reads 65 pass / 0 fail *while two runner images are unverifiable* —
+   the very condition that would deny every Job under Enforce. The board is
+   green precisely because the failing workloads are not there to be counted.
+
+   Phases 1 and 3 above tell you to wait for a sustained all-`pass` sweep. That
+   criterion is sound for the five long-lived service Deployments and blind for
+   the eleven runner images, which are the more security-relevant half — they
+   are the sandbox generated code is built and executed in. Do not read a green
+   board as coverage. Until Factory#562 gives runner verification a standing
+   signal, the only evidence for the runner rule is direct: `cosign verify`
+   against each of the eleven tags, plus a scoped Enforce probe of the kind
+   described above.
+
+   **3. The DNS repair is not declarative (olafkfreund/nixos_config#1232).**
+   Factory#430's root cause was that no Pod could resolve external names, so
+   Kyverno could not fetch the Sigstore TUF root. The repair is applied **by
+   hand inside the node containers**. A `k3d cluster delete && create` reopens
+   it, silently, and the first symptom under Enforce would be a fleet-wide
+   admission failure rather than a report turning red. Enforcing on a control
+   whose dependency is repaired manually and undeclared is how the gate takes
+   the cluster down. This should be declarative before the flip, or the flip
+   should be accompanied by a documented, rehearsed rollback.
+
+   ### `failurePolicy`: keep `Ignore`
+
+   An earlier revision of this section suggested tightening
+   `failurePolicy: Ignore` -> `Fail` at the flip "so a verification outage
+   blocks rather than admits". **That reasoning is wrong in both directions**,
+   and the Factory#522 experiment shows why.
+
+   `failurePolicy` governs only what the API server does when the webhook call
+   itself fails — Kyverno unreachable, non-200, or past
+   `webhookTimeoutSeconds: 30`. It does **not** govern what happens when
+   Kyverno is reached, runs, and reports that it could not verify an image.
+   That is a successful webhook call returning a deny.
+
+   Case D is the proof. The image was unverifiable for a pure transport reason,
+   and the request was rejected by the webhook named `mutate.kyverno.svc-ignore`
+   — the `failurePolicy: Ignore` webhook denied it anyway:
+
+   ```
+   admission webhook "mutate.kyverno.svc-ignore" denied the request
+   ```
+
+   So there are two distinct regimes:
+
+   - **Verifier reachable, verification fails** (bad signature, DNS failure that
+     returns an error, registry 401). Kyverno denies. `failurePolicy` is not
+     consulted. Under Enforce the fleet is blocked either way. This is the
+     common case and the one that matters.
+   - **Webhook unreachable or times out** (Kyverno down, upgrading, a Sigstore
+     hang exceeding 30s). Only here does `failurePolicy` decide: `Ignore`
+     admits, `Fail` blocks.
+
+   `Fail` therefore buys coverage of a narrow slice — the *slow* subset of
+   transport outages — while converting every Kyverno restart, upgrade or
+   eviction into a cluster-wide deployment outage. Given precondition 3, where
+   the DNS dependency can regress without warning, that is trading a small
+   amount of theoretical bypass for a large amount of real, self-inflicted
+   downtime.
+
+   **Recommendation: keep `failurePolicy: Ignore` at the flip.** The concern
+   that "under Enforce with Ignore a DNS outage admits everything unverified" is
+   not what the evidence shows — a DNS outage that produces an error produces a
+   *deny*, as Factory#430 did. Revisit `Fail` only once the DNS dependency is
+   declarative and Kyverno itself is highly available; it is a separate change
+   with its own blast radius, not a rider on the Enforce flip.
+
+   ### Also worth knowing before the flip
+
+   The policy verifies an image only if that image matches a rule glob.
+   `required: true` means "a matched image must carry a signature", not "every
+   image must match a rule". 14 images currently run in `factory` that no rule
+   names, including two unsigned first-party ones (`odin`, `skillai`). Under
+   Enforce they are admitted unverified. Tracked in Factory#564. Not a blocker,
+   but a second reason the green board over-claims.
+
+   From the point of the flip, unsigned images matching a rule are denied at
    admission.
 
 ## Notes
