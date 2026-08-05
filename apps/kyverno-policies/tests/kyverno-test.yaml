@@ -1,0 +1,57 @@
+# Kyverno CLI test for require-first-party-signature-coverage (Factory#564).
+#
+# Run it with the SAME Kyverno version the cluster runs (v1.18.2 today, check
+# with `kubectl -n kyverno get deploy kyverno-admission-controller -o
+# jsonpath='{.spec.template.spec.containers[0].image}'`) -- glob and JMESPath
+# behaviour is version-sensitive, and a test that passes on a different engine
+# proves nothing about admission:
+#
+#   kyverno test apps/kyverno-policies/tests/
+#
+# This is deliberately an offline test of the RULE LOGIC only. It cannot and
+# does not test signature verification: no case here reaches a registry, and
+# `verify-factory-image-signatures` is not under test. For the live half, see
+# docs/image-signature-admission.md -- policy files must additionally survive
+# `kubectl apply --dry-run=server` against the real webhook, because a file
+# Kyverno rejects is a file ArgoCD cannot apply, and ArgoCD then keeps serving
+# the previous version while reporting healthy. That is Factory#430.
+#
+# `skip` is the expected non-failing result, not `pass`. This rule verifies
+# nothing itself, so it has no notion of passing: it either finds an uncovered
+# first-party image (fail) or has nothing to say (skip).
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: require-first-party-signature-coverage
+policies:
+  - ../manifests/require-first-party-signature-coverage.yaml
+resources:
+  - resources.yaml
+results:
+  # --- MUST FAIL: a first-party image no glob in verify-factory-image-signatures names
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-by-a-signature-rule
+    kind: Pod
+    result: fail
+    resources:
+      - uncovered-odin
+      - uncovered-future-service
+      - uncovered-digest-pinned
+      - uncovered-in-initcontainer
+      - uncovered-mixed
+  # --- MUST NOT FAIL: covered first-party, third-party, and lookalikes
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-by-a-signature-rule
+    kind: Pod
+    result: skip
+    resources:
+      - covered-aifactory
+      - covered-aifactory-nix
+      - covered-pfactory
+      - covered-tfactory
+      - covered-cfactory
+      - covered-cfactory-frontend
+      - covered-runners
+      - covered-skillai-both
+      - thirdparty-out-of-scope
+      - lookalikes-not-ours
