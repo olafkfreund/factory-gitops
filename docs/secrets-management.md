@@ -72,6 +72,63 @@ controllers, not the app-seeding path): `kedaorg-certs` (KEDA operator TLS),
 - Only `factory-cli-creds`' Claude token self-heals. Every other credential is a
   manual, undocumented-until-now rotation.
 
+## The last-applied-configuration annotation
+
+Client-side `kubectl apply` copies the **entire submitted manifest** — including
+every plaintext value in `.data` — into the annotation
+`kubectl.kubernetes.io/last-applied-configuration`. ArgoCD's default sync does
+the same. `kubectl create`, `kubectl patch` and `kubectl apply --server-side` do
+not.
+
+This defeats the redaction people rely on. `kubectl describe secret` redacts
+`.data` but **prints annotations**, and RBAC/audit tooling is routinely written
+treating `.data` as the sensitive field and metadata as safe. Anyone who can
+`get` or `describe` a Secret reads the value.
+
+A sweep on 2026-08-05 found **25 Secrets / 83 keys** leaking this way, including
+`factory-secrets` (the fleet credential bundle), `argocd-secret` (ArgoCD's own
+signing material), and `ghcr-pull` (a near-admin GitHub PAT). An earlier one-time
+sweep had been undone within a day by a single `kubectl apply`, because the cause
+is the write path, not any individual Secret.
+
+**This is now enforced, not remembered.** The Kyverno ClusterPolicy
+`strip-last-applied-configuration-from-secrets`
+(`apps/kyverno-policies/manifests/`) removes the annotation from every Secret on
+CREATE and UPDATE, in every namespace except `kube-system` and `kyverno`. It is
+`failurePolicy: Ignore` on purpose: a Kyverno outage must degrade the stripping,
+never block Secret writes cluster-wide. Read the header comment in that file
+before changing it.
+
+Two consequences to expect, both benign:
+
+- Every `kubectl apply` onto an existing Secret now prints a warning that the
+  annotation is missing and will be patched automatically. That warning is the
+  policy working. The apply succeeds.
+- Client-side apply uses this annotation to decide which fields to **delete**.
+  With it always absent, apply falls back to a two-way merge, so a key removed
+  from a manifest is no longer removed from the live Secret. Use
+  `kubectl apply --server-side` if you need that, or delete the key explicitly.
+
+Audit at any time — this must print nothing:
+
+```bash
+kubectl --context factory get secrets -A -o json | jq -r '
+  .items[]
+  | select(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")
+  | select(.type != "kubernetes.io/service-account-token")
+  | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+Remove it from an existing Secret in place, without recreating it or touching
+`.data`:
+
+```bash
+kubectl -n <ns> annotate secret <name> \
+  kubectl.kubernetes.io/last-applied-configuration-
+```
+
+Refs Factory#565, Factory#448.
+
 ## Rotation runbook
 
 General shape for the manual (agenix) secrets:
@@ -80,10 +137,20 @@ General shape for the manual (agenix) secrets:
 2. `cd ~/.config/nixos && ./scripts/manage-secrets.sh edit <agenix-name>` on the
    machine holding the agenix recipients; paste the new value.
 3. `just quick-deploy p510` so the bootstrap re-materialises the Secret, OR
-   patch it directly for a hot rotation:
-   `kubectl -n factory create secret generic <name> --from-literal=... --dry-run=client -o yaml | kubectl apply -f -`
-   (use `--dry-run | apply` to **merge**, never a bare recreate that clobbers
-   sibling keys).
+   patch it directly for a hot rotation — **merge one key, never a bare recreate
+   that clobbers sibling keys**:
+
+   ```bash
+   kubectl -n factory patch secret <name> --type=merge \
+     -p "{\"stringData\":{\"<KEY>\":\"$(cat /dev/shm/newvalue)\"}}"
+   ```
+
+   Do NOT use the older `create --dry-run=client -o yaml | kubectl apply -f -`
+   pipeline that used to be documented here. Client-side `kubectl apply` writes
+   the **complete submitted manifest, including the plaintext value**, into the
+   `kubectl.kubernetes.io/last-applied-configuration` annotation — see
+   "The last-applied-configuration annotation" below. `kubectl patch` merges
+   sibling keys correctly and never writes that annotation.
 4. Bounce the consumers so they pick up the new env/mount:
    `kubectl -n factory rollout restart deploy/<svc> statefulset/<svc>`.
 5. Where the credential is external (GitHub PAT, an LLM API key), revoke the old
