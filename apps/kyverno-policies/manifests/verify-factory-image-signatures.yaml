@@ -54,6 +54,35 @@
 # The failure is also sticky per process: once the Sigstore root fetch fails,
 # that admission-controller Pod keeps failing after connectivity is restored
 # until it is restarted. See docs/image-signature-admission.md.
+#
+# Factory#444 (2026-08-05). `background: true` is now set. Until it was, a Pod
+# was verified exactly once -- at admission -- and its PolicyReport was frozen
+# at that verdict for the life of the Pod. That made "Audit is quiet" a
+# statement about the last rollout, not about the cluster now.
+#
+# Two things about this that are easy to get wrong:
+#
+# 1. The scan is run by the REPORTS controller, not the deployment called
+#    `kyverno-background-controller`. `--backgroundScan=true`,
+#    `--backgroundScanInterval=1h`, `--backgroundScanWorkers=2` are all flags on
+#    kyverno-reports-controller; the background-controller handles generate and
+#    mutateExisting rules and touches nothing here. Factory#561 (background- and
+#    cleanup-controller restart loops) therefore does not affect these reports.
+#
+# 2. `useCache` is TRUE (Kyverno's default, pinned explicitly below). The image
+#    verify cache is positive-only, in-process, and keyed on
+#    `policyUID;policyResourceVersion;ruleName;imageRef` with a 60m TTL
+#    (--imageVerifyCacheTTLDuration, unset here so the 60m default applies).
+#    Consequence: a background scan can serve a `pass` that was computed up to
+#    60 minutes earlier, so with a 1h scan interval a revoked signature or a
+#    repointed tag is detected within roughly one to two hours rather than
+#    exactly one. It is a bounded lag, not a frozen report -- and any edit to
+#    this file changes the policy resourceVersion, which invalidates every
+#    entry. If that window ever needs to be tighter, lower
+#    --imageVerifyCacheTTLDuration on kyverno-reports-controller; do NOT set
+#    useCache: false, because the same field also governs the admission hot
+#    path and would put a full Rekor round trip in front of every build and
+#    verify Job Pod.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -80,7 +109,21 @@ spec:
   # block. Signature verification is a report signal here, not a gate.
   failurePolicy: Ignore
   webhookTimeoutSeconds: 30
-  background: false
+  # Factory#444. Re-evaluate matched resources on the reports controller's
+  # background scan interval (1h) instead of only at admission, so a report is
+  # live state rather than a snapshot of the last rollout. Turned on only after
+  # Factory#430 and #441 made the audit genuinely green -- with the fleet
+  # unverifiable this would have produced continuous noise.
+  #
+  # Cost, measured in the `factory` namespace: the scan walks every matched
+  # resource each interval (~130 Pods, ~100 Jobs, ~20 pod controllers), but a
+  # registry+Rekor call happens only for an image reference that matches a glob
+  # below, and the cache above collapses repeats to one call per
+  # (rule, image reference). Five distinct factory images are running, each
+  # evaluated under both its Pod rule and its autogen controller rule, so the
+  # ceiling is about ten cosign verifications an hour against ghcr.io and
+  # rekor.sigstore.dev. Nowhere near either service's rate limits.
+  background: true
   rules:
     - name: verify-aifactory-signature
       match:
@@ -96,6 +139,9 @@ spec:
           verifyDigest: false
           mutateDigest: false
           required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
           attestors:
             - count: 1
               entries:
@@ -126,6 +172,9 @@ spec:
           verifyDigest: false
           mutateDigest: false
           required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
           attestors:
             - count: 1
               entries:
@@ -152,6 +201,9 @@ spec:
           verifyDigest: false
           mutateDigest: false
           required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
           attestors:
             - count: 1
               entries:
@@ -204,6 +256,9 @@ spec:
           verifyDigest: false
           mutateDigest: false
           required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
           attestors:
             - count: 1
               entries:
