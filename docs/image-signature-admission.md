@@ -209,12 +209,13 @@ lost if the cluster is ever recreated.
      secrets: [kyverno-ghcr-pull]     # must exist in the kyverno namespace
    ```
 
-2. **`background: false` freezes every report at admission.** The `aifactory`
-   Deployment is on generation 212; its PolicyReport is dated 2026-07-26 and
-   has never been recomputed. A long-lived Pod is evaluated once, ever, and a
-   report can stay green across arbitrarily many image changes. Audit results
-   are therefore not a live signal today — they are a snapshot of whenever the
-   Pod was last admitted.
+2. **`background: false` froze every report at admission.** A long-lived Pod was
+   evaluated once, ever, and its report stayed green across arbitrarily many
+   image changes. Audit results were a snapshot of whenever the Pod was last
+   admitted, not a live signal.
+
+   **Fixed 2026-08-05 (Factory#444)** — see [Evidence model: how fresh is a
+   report?](#evidence-model-how-fresh-is-a-report) below.
 
 ## What this PR adds
 
@@ -305,6 +306,112 @@ A clean `pod/sig-probe created (server dry run)` with no warning is a pass.
 An all-`pass` report for aifactory/pfactory/tfactory/cfactory Pods is the green
 light for the next phase.
 
+## Evidence model: how fresh is a report?
+
+Since 2026-08-05 the policy runs `background: true` (Factory#444). Before that,
+a resource was verified exactly once — at admission — and its PolicyReport held
+that verdict until the resource was replaced. "Audit is quiet" was a statement
+about the last rollout, not about the cluster now.
+
+### Do not read `metadata.creationTimestamp`
+
+The PolicyReport object is created once per resource UID and then **updated in
+place**. Its `creationTimestamp` is the age of the object, not the age of the
+verdict, and it never advances. Five Deployment-scoped reports in `factory`
+still carry creation dates of 2026-07-26 through 07-31 while holding results
+recomputed the same hour you read them.
+
+The field that actually advances is `results[].timestamp`, and
+`results[].properties.process` says which mechanism produced it —
+`admission review` or `background scan`:
+
+```bash
+kubectl --context factory -n factory get policyreport -o json | jq -r '
+  .items[] | "\(.scope.kind)/\(.scope.name)  \(.results[0].result)  " +
+  "\(.results[0].properties.process)  " +
+  (.results[0].timestamp.seconds | todate)'
+```
+
+### Which controller does the work
+
+The background scan is run by **`kyverno-reports-controller`**, not by the
+deployment named `kyverno-background-controller`. The relevant flags all live on
+the reports controller:
+
+```
+--backgroundScan=true
+--backgroundScanInterval=1h
+--backgroundScanWorkers=2
+--enableReporting=validate,mutate,mutateExisting,imageVerify,generate
+```
+
+`kyverno-background-controller` handles `generate` and `mutateExisting` rules and
+has nothing to do with this policy. Factory#561 (background- and
+cleanup-controller restart loops) therefore does not make these reports
+unreliable. What *would* is the reports controller restarting; watch that one:
+
+```bash
+kubectl --context factory -n kyverno get pod \
+  -l app.kubernetes.io/component=reports-controller
+```
+
+### The `useCache` ceiling
+
+`useCache: true` is pinned on every rule (it is also Kyverno's default). The
+image verify cache is:
+
+- **positive-only** — only a `pass` is cached, a failure is never remembered;
+- **in-process** — the admission controller and the reports controller keep
+  separate caches, and a restart empties them;
+- keyed on `policyUID;policyResourceVersion;ruleName;imageRef`, so **any edit to
+  the policy file invalidates every entry**;
+- expiring on `--imageVerifyCacheTTLDuration`, unset here, so the **60m default**
+  applies.
+
+Consequence, stated plainly: a background scan can serve a `pass` computed up to
+60 minutes earlier. With a 1h scan interval, a revoked signature or a repointed
+tag surfaces within roughly **one to two hours**, not exactly one. That is a
+bounded lag, not a frozen report — the difference from `background: false`,
+where the lag was unbounded.
+
+Note the key is the **image reference**, not the digest, because this policy
+runs `verifyDigest: false`. A tag repointed to a different digest keeps the same
+cache key, which is precisely the case the TTL bounds.
+
+If that window ever needs to be tighter, lower
+`--imageVerifyCacheTTLDuration` on `kyverno-reports-controller`. Do **not** set
+`useCache: false`: the same field governs the admission hot path, and turning it
+off puts a full Rekor round trip in front of every AIFactory build Job and
+TFactory verify Job Pod.
+
+### Cost
+
+Measured in the `factory` namespace on 2026-08-05:
+
+| Quantity                                          | Value |
+|---------------------------------------------------|-------|
+| Resources walked per scan (Pods + Jobs + controllers) | ~250 |
+| Distinct factory images running                   | 5 |
+| Rules matching each (Pod rule + autogen rule)      | 2 |
+| **Upper bound on cosign verifications per hour**   | **~10** |
+| Upper bound per day, ghcr.io and rekor.sigstore.dev | ~240 |
+
+A registry call happens only for an image reference matching one of the globs;
+the ~110 `python:3.12-slim` CronJob Pods match nothing and cost a `skip`. The
+cache collapses repeats to one call per `(rule, image reference)`, so the cost is
+driven by distinct images and not by Pod count. Both numbers are far below
+either service's rate limits.
+
+### DNS fragility, now continuous
+
+With `background: false` a Sigstore outage produced one bad report per admission.
+With `background: true` it produces failing reports across the whole namespace,
+every scan interval, until connectivity returns. That is the correct behaviour —
+it is a live signal — but it means olafkfreund/nixos_config#1232 (the
+non-declarative resolv.conf repair behind Factory#430) now shows up as sustained
+fleet-wide red rather than a quiet one-off. Before treating a red sweep as a
+signing problem, check the transport first, exactly as the manifest header says.
+
 ## Phased path to Enforce
 
 Do NOT skip a phase. Each is a separate, small PR.
@@ -359,8 +466,14 @@ Do NOT skip a phase. Each is a separate, small PR.
 
    First clean sweep observed 2026-08-05 (above). Phase 1's "sustained period
    across real runs" is deliberately not claimed yet — one sweep is a start,
-   not a record. Note also that Factory#444 (stale reports, `background: false`)
-   means a green report is only as current as the last admission.
+   not a record.
+
+   Factory#444 is now closed, so a green report is recomputed every hour rather
+   than dating from the last admission. That is what makes a *record* possible:
+   the evidence for this phase is consecutive clean background sweeps, read via
+   `results[].timestamp` and `results[].properties.process` as described in
+   [Evidence model](#evidence-model-how-fresh-is-a-report), never via
+   `creationTimestamp`.
 
 4. **Enforce.** Only then flip `validationFailureAction: Audit` -> `Enforce`.
    Consider also tightening `failurePolicy: Ignore` -> `Fail` at this point so a
