@@ -115,14 +115,20 @@ spec:
   # Factory#430 and #441 made the audit genuinely green -- with the fleet
   # unverifiable this would have produced continuous noise.
   #
-  # Cost, measured in the `factory` namespace: the scan walks every matched
-  # resource each interval (~130 Pods, ~100 Jobs, ~20 pod controllers), but a
-  # registry+Rekor call happens only for an image reference that matches a glob
-  # below, and the cache above collapses repeats to one call per
-  # (rule, image reference). Five distinct factory images are running, each
-  # evaluated under both its Pod rule and its autogen controller rule, so the
-  # ceiling is about ten cosign verifications an hour against ghcr.io and
-  # rekor.sigstore.dev. Nowhere near either service's rate limits.
+  # Cost, measured on the first sweep after the flip (2026-08-05T14:50:47Z):
+  # 65 resources produce a result -- 55 ReplicaSets, 5 Deployments, 5 Pods --
+  # of which 52 were fresh cosign verifications and 13 came from the cache,
+  # across 45 distinct (rule, image reference) pairs. Call it ~50 registry+Rekor
+  # calls an hour, ~1200 a day. Far below either service's limits.
+  #
+  # The cost is NOT the five running images. Autogen rules match every pod
+  # controller and kyverno-reports-controller runs --skipResourceFilters=true,
+  # so the [ReplicaSet,*,*] entry in the kyverno ConfigMap's resourceFilters
+  # does not apply to background scans. Every retained ReplicaSet is verified
+  # each interval on the historical sha-* tag it was created with: 41 distinct
+  # image references. The ceiling is set by revisionHistoryLimit (10, the
+  # default, on all five services) -- 5 x 11 = 55 ReplicaSets -- not by how
+  # often anything deploys. Raise revisionHistoryLimit and this rises linearly.
   background: true
   rules:
     - name: verify-aifactory-signature
