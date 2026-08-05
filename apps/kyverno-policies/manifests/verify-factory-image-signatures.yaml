@@ -86,11 +86,12 @@
 #
 # Factory#524 (2026-08-05). The eleven `tfactory-runner-*` images -- the
 # sandbox that generated code is built and executed in -- are now covered by
-# `verify-tfactory-runner-signature` below. TWO OF THEM ARE EXPECTED TO REPORT
-# `fail` (tfactory-runner-nix, tfactory-runner-portal-ui) because they are
-# private GHCR packages that Kyverno cannot read anonymously. That is a
-# registry-auth failure, not a signature verdict. Read the comment on that rule
-# before triaging it as a signing problem.
+# `verify-tfactory-runner-signature` below. Two of them (tfactory-runner-nix,
+# tfactory-runner-portal-ui) are PRIVATE GHCR packages and used to report
+# `fail` because Kyverno read ghcr.io anonymously. Factory#563 gave Kyverno a
+# read:packages credential, so all eleven now verify. If those two go red
+# again it is a registry-auth failure, not a signature verdict -- read the
+# comment on that rule before triaging it as a signing problem.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -309,13 +310,23 @@ spec:
     # runner-images.yml are three separate publishing workflows, and dropping
     # any one of them stops a real Job from verifying.
     #
-    # EXPECTED FAILURES -- READ THIS BEFORE TRIAGING A RED.
+    # PRIVATE PACKAGES -- READ THIS BEFORE TRIAGING A RED.
     #
     # `tfactory-runner-nix` and `tfactory-runner-portal-ui` are PRIVATE GHCR
-    # packages; the other nine are public. Kyverno reads ghcr.io anonymously
-    # (no imagePullSecret in the kyverno namespace, see the note on the
-    # cfactory rule), so it cannot retrieve a signature it cannot read. These
-    # two therefore report `fail` while every other runner reports `pass`.
+    # packages; the other nine are public. Kyverno used to read ghcr.io
+    # anonymously -- no imagePullSecret in the kyverno namespace -- so it could
+    # not retrieve a signature it could not read, and these two reported `fail`
+    # while every other runner reported `pass`.
+    #
+    # FIXED by Factory#563: kyverno-admission-controller and
+    # kyverno-reports-controller now run with
+    # `--imagePullSecrets=kyverno-ghcr-pull`, a read:packages-only ghcr.io
+    # credential. See apps/kyverno/manifests/kustomization.yaml for why both
+    # controllers hold it and why the Secret is not in this repo. If these two
+    # go red again, check that the Secret still exists in the kyverno namespace
+    # before suspecting the signatures:
+    #
+    #   kubectl -n kyverno get secret kyverno-ghcr-pull
     #
     # That fail is a REGISTRY-AUTH failure, not a signature verdict. This is
     # exactly the Factory#430 ambiguity, so the distinguishing evidence is
@@ -332,13 +343,16 @@ spec:
     # with a real signature verdict, which reads `no matching signatures` or
     # `no signatures found` and never names ghcr.io/token.
     #
-    # The fix is to make both packages public, matching the nine framework
-    # runners and all five service packages. GitHub exposes no REST endpoint
-    # for container package visibility, so it is a manual step and is PENDING.
-    # It is NOT fixed by excluding these two images from the rule: an accurate
-    # red that names a real gap is the point, and Factory#522 must not flip
-    # this policy to Enforce while it stands -- at Enforce this denies every
-    # build and verify Job in the fleet.
+    # Factory#563 originally proposed making both packages public. Container
+    # package visibility has no REST endpoint (PATCH returns 404) and the UI
+    # toggle would not commit, so the credential path was taken instead -- and
+    # it is the better end state: it covers any factory package that goes
+    # private in future, whereas a visibility flip has to be repeated per
+    # package and can be undone silently.
+    #
+    # It was NOT fixed by excluding these two images from the rule. An
+    # exclusion would have permanently unverified the sandbox that generated
+    # code is built and executed in, which is the opposite of the point.
     - name: verify-tfactory-runner-signature
       match:
         any:
