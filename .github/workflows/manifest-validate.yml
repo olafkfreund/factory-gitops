@@ -249,10 +249,17 @@ jobs:
           # repo uses. The v1alpha1 policy types Kyverno 1.18 also ships
           # (ValidatingPolicy, ImageValidatingPolicy) are NOT matched -- see
           # the ceiling note at the end of this step.
+          #
+          # The optional quotes are not decoration. YAML permits
+          # `apiVersion: "kyverno.io/v1"`, and a discovery regex that missed
+          # that form would make the policy INVISIBLE to this gate rather than
+          # merely unchecked -- #117's failure mode reproduced inside its own
+          # fix. Both committed policies use the unquoted form; the quoted one
+          # is accepted so that writing it can never silently disable the gate.
           mapfile -t POLICIES < <(
             git ls-files -z '*.yaml' '*.yml' | tr '\0' '\n' | sort | while read -r f; do
-              grep -qE '^apiVersion:[[:space:]]*kyverno\.io/' "$f" || continue
-              grep -qE '^kind:[[:space:]]*(Cluster)?Policy[[:space:]]*$' "$f" || continue
+              grep -qE '^apiVersion:[[:space:]]*"?kyverno\.io/' "$f" || continue
+              grep -qE '^kind:[[:space:]]*"?(Cluster)?Policy"?[[:space:]]*$' "$f" || continue
               printf '%s\n' "$f"
             done
           )
