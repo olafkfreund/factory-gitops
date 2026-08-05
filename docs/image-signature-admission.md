@@ -386,21 +386,53 @@ TFactory verify Job Pod.
 
 ### Cost
 
-Measured in the `factory` namespace on 2026-08-05:
+Measured on the first background sweep after the flip, 2026-08-05T14:50:47Z:
 
-| Quantity                                          | Value |
-|---------------------------------------------------|-------|
-| Resources walked per scan (Pods + Jobs + controllers) | ~250 |
-| Distinct factory images running                   | 5 |
-| Rules matching each (Pod rule + autogen rule)      | 2 |
-| **Upper bound on cosign verifications per hour**   | **~10** |
-| Upper bound per day, ghcr.io and rekor.sigstore.dev | ~240 |
+| Quantity | Value |
+|---|---|
+| Resources walked per scan (whole namespace) | ~250 |
+| Resources producing a result | 65 |
+| — of which ReplicaSet / Deployment / Pod | 55 / 5 / 5 |
+| Results served from cache within the sweep | 13 |
+| Fresh cosign verifications | 52 |
+| Distinct `(rule, image reference)` pairs verified | 45 |
+| **Registry + Rekor calls per hour** | **~50** |
+| Per day, ghcr.io and rekor.sigstore.dev | ~1,200 |
 
-A registry call happens only for an image reference matching one of the globs;
-the ~110 `python:3.12-slim` CronJob Pods match nothing and cost a `skip`. The
-cache collapses repeats to one call per `(rule, image reference)`, so the cost is
-driven by distinct images and not by Pod count. Both numbers are far below
-either service's rate limits.
+Both numbers are far below either service's limits, but note where the cost
+actually comes from — it is **not** the five running images.
+
+**ReplicaSets dominate.** Kyverno's autogen rules match every pod controller, and
+`kyverno-reports-controller` runs with `--skipResourceFilters=true`, so the
+`[ReplicaSet,*,*]` entry in the `kyverno` ConfigMap's `resourceFilters` does not
+apply to background scans. Every retained ReplicaSet of every service is
+therefore verified each interval, each on the historical `sha-*` tag it was
+created with — 41 distinct image references, not 5.
+
+**The load is bounded by `revisionHistoryLimit`, not by traffic.** All five
+services run the default 10, so the ceiling is 5 x (10 old + 1 current) = 55
+ReplicaSets, plus 5 Deployments and 5 Pods = 65, which is exactly what is
+observed. Raising `revisionHistoryLimit` raises this linearly; a service that
+deploys more often does not.
+
+The ~110 `python:3.12-slim` CronJob Pods match no glob and produce no report and
+no registry call.
+
+### Watching the cache work
+
+Kyverno says which path it took, in the report message itself:
+
+```bash
+kubectl --context factory -n factory get policyreport -o json \
+  | jq -r '.items[].results[].message' | sort | uniq -c | sort -rn | head
+```
+
+- `verified image signatures for ghcr.io/olafkfreund/<image>:<tag>` — a real
+  round trip to GHCR and Rekor happened.
+- `verified from cache` — served from the TTL cache described above.
+
+That is the instrument for the ceiling: if a sweep is entirely
+`verified from cache`, nothing was actually re-verified that hour.
 
 ### DNS fragility, now continuous
 
