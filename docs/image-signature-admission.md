@@ -345,6 +345,14 @@ the reports controller:
 --enableReporting=validate,mutate,mutateExisting,imageVerify,generate
 ```
 
+Each resource re-queues itself for `--backgroundScanInterval` after its own
+reconcile, so a "sweep" is a rolling band of about six minutes rather than an
+instant, and resources drift onto their own phase. Writing to the policy
+short-circuits all of it: a change to the ClusterPolicy re-enqueues every
+matched resource immediately, which is why an ArgoCD sync of this file is
+followed within seconds by a full recompute — and, because the cache key
+contains the policy `resourceVersion`, by a fully cold cache.
+
 `kyverno-background-controller` handles `generate` and `mutateExisting` rules and
 has nothing to do with this policy. Factory#561 (background- and
 cleanup-controller restart loops) therefore does not make these reports
@@ -368,11 +376,35 @@ image verify cache is:
 - expiring on `--imageVerifyCacheTTLDuration`, unset here, so the **60m default**
   applies.
 
-Consequence, stated plainly: a background scan can serve a `pass` computed up to
-60 minutes earlier. With a 1h scan interval, a revoked signature or a repointed
-tag surfaces within roughly **one to two hours**, not exactly one. That is a
-bounded lag, not a frozen report — the difference from `background: false`,
-where the lag was unbounded.
+The theoretical consequence is that a background scan could serve a `pass`
+computed up to 60 minutes earlier, pushing detection of a revoked signature out
+towards two intervals.
+
+**Measured, it does not.** TTL (60m) is not longer than the scan interval (60m),
+so an entry set during one sweep has expired by the next. Three consecutive
+sweeps on 2026-08-05, the third with no policy write in between so the cache was
+genuinely warm:
+
+| Sweep | Window (UTC) | Fresh | From cache | Distinct images verified |
+|---|---|---|---|---|
+| 1 | 14:50:45–14:51:04 | 52 | 13 | 45 |
+| 2 | 15:22:47–15:28:34 | 42 | 23 | 45 |
+| 3 | 16:22:47–16:28:35 | **53** | **12** | 46 |
+
+Sweep 3 followed sweep 2 by exactly one hour with nothing touching the policy,
+and still re-verified 53 of 65 results against GHCR and Rekor. The dozen cache
+hits are *intra*-sweep: the same image reference sits on several retained
+ReplicaSets, and the first one to be scanned populates the entry for the rest.
+Nothing carries across a sweep boundary.
+
+So `useCache: true` behaves as deduplication within a scan, not as a mechanism
+that keeps a stale positive alive across one. A revoked signature or a repointed
+tag surfaces on the next sweep, within the hour.
+
+This holds only while the TTL is not raised above the scan interval. If anyone
+sets `--imageVerifyCacheTTLDuration` higher than `--backgroundScanInterval`, the
+theoretical staleness above becomes real, and the check for it is the
+fresh-versus-cached split below.
 
 Note the key is the **image reference**, not the digest, because this policy
 runs `verifyDigest: false`. A tag repointed to a different digest keeps the same
@@ -398,6 +430,9 @@ Measured on the first background sweep after the flip, 2026-08-05T14:50:47Z:
 | Distinct `(rule, image reference)` pairs verified | 45 |
 | **Registry + Rekor calls per hour** | **~50** |
 | Per day, ghcr.io and rekor.sigstore.dev | ~1,200 |
+
+Confirmed in steady state: the third sweep, an hour later with a warm cache, did
+53 fresh verifications. The rate is not a cold-start artefact.
 
 Both numbers are far below either service's limits, but note where the cost
 actually comes from — it is **not** the five running images.
