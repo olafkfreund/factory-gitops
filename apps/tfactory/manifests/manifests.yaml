@@ -68,11 +68,40 @@ subjects:
   - { kind: ServiceAccount, name: tfactory-sandbox, namespace: factory }
 ---
 # Deploy-lane dry-run SA (#603 gap 2) — the SERVICE ACCOUNT the deploy verify Job
-# runs as for `kubectl apply --dry-run=server` (VAL-2). Namespaced Role: get/list
-# + create on the common app kinds in `factory` (create authorizes dryRun=All; a
-# real apply is still blocked by deploy_runner.assert_dry_run). Scoped to
-# namespaced resources — cluster-scoped kinds stay an honest not_run. Named to
-# the control plane via TFACTORY_DEPLOY_DRYRUN_SA (below).
+# runs as for `kubectl create --dry-run=server` (VAL-2). Named to the control
+# plane via TFACTORY_DEPLOY_DRYRUN_SA (below). Scoped to namespaced resources —
+# cluster-scoped kinds stay an honest not_run.
+#
+# Factory#569 — WHY `create` IS THE ONLY VERB. This SA's token is mounted into
+# the one Job in this cluster that executes MODEL-GENERATED content (the deploy
+# descriptors, plus `tofu init`/`plan`, which runs provider code). Until #569 the
+# Role carried `get`/`list` on `secrets` with no resourceNames, so anything that
+# ran in that Job could read `factory-secrets`, the `factory-db-*` DATABASE_URLs,
+# `minio-creds` and the oauth2-proxy client secrets. `assert_dry_run` does not
+# mitigate that — it constrains writes, and this was a read.
+#
+# The verbs below are MEASURED against the live k3d API server by impersonating
+# this SA, not assumed:
+#   * `kubectl apply --dry-run=server` GETs every object first to compute its
+#     merge patch, so it needs `get` on EVERY kind in the descriptor — including
+#     `secrets`. Denying `get secrets` under `apply` breaks the rung with
+#     "error when retrieving current configuration of ... Kind=Secret".
+#     That is why the obvious narrowing (drop secrets, keep create) does NOT work
+#     on its own, and why TFactory moved the rung to `create` first.
+#   * `kubectl create --dry-run=server` POSTs straight to the API with
+#     dryRun=All and needs `create` ALONE. Measured green on a Secret, ConfigMap,
+#     Deployment, Service, Job and Ingress descriptor with an identity holding no
+#     read verb whatsoever.
+#   * `list` was never exercised by either spelling — `apply -f`/`create -f` GET
+#     or POST by name and never enumerate.
+# So: no `get`, no `list`, on any kind. This token can now read NOTHING in the
+# namespace. `create` still authorizes dryRun=All; a real write is blocked by
+# deploy_runner.assert_dry_run (which, as of #569, also refuses a bare
+# `kubectl create` — dropping the flag is no longer a silent real apply).
+#
+# ORDERING: this Role REQUIRES the TFactory image to be running the `create`
+# spelling (TFactory#953). It ships only once that image is deployed; landing it
+# against an `apply` build breaks the VAL-2 rung on every kind, not just Secrets.
 apiVersion: v1
 kind: ServiceAccount
 metadata: { name: tfactory-deploy-dryrun, namespace: factory, labels: { app: tfactory } }
@@ -83,22 +112,22 @@ metadata: { name: tfactory-deploy-dryrun, namespace: factory, labels: { app: tfa
 rules:
   - apiGroups: [""]
     resources: ["pods", "services", "configmaps", "secrets", "serviceaccounts", "persistentvolumeclaims"]
-    verbs: ["get", "list", "create"]
+    verbs: ["create"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-    verbs: ["get", "list", "create"]
+    verbs: ["create"]
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list", "create"]
+    verbs: ["create"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses", "networkpolicies"]
-    verbs: ["get", "list", "create"]
+    verbs: ["create"]
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
-    verbs: ["get", "list", "create"]
+    verbs: ["create"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
-    verbs: ["get", "list", "create"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
