@@ -88,10 +88,16 @@
 # sandbox that generated code is built and executed in -- are now covered by
 # `verify-tfactory-runner-signature` below. Two of them (tfactory-runner-nix,
 # tfactory-runner-portal-ui) are PRIVATE GHCR packages and used to report
-# `fail` because Kyverno read ghcr.io anonymously. Factory#563 gave Kyverno a
-# read:packages credential, so all eleven now verify. If those two go red
-# again it is a registry-auth failure, not a signature verdict -- read the
-# comment on that rule before triaging it as a signing problem.
+# `fail` because Kyverno read ghcr.io anonymously. Factory#563 wired a
+# read:packages credential into both verifying controllers; all eleven verify
+# once the `kyverno-ghcr-pull` Secret exists in the kyverno namespace. If those
+# two are red, that is a registry-auth failure, not a signature verdict -- read
+# the comment on that rule before triaging it as a signing problem.
+#
+# Factory#566: once that Secret exists, a WRONG or EXPIRED credential in it
+# unverifies ALL SIXTEEN covered images, not just the two private ones. There
+# is no fallback to the anonymous path. Check the Secret before anything else
+# when the whole board goes red at once.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -323,10 +329,14 @@ spec:
     # `--imagePullSecrets=kyverno-ghcr-pull`, a read:packages-only ghcr.io
     # credential. See apps/kyverno/manifests/kustomization.yaml for why both
     # controllers hold it and why the Secret is not in this repo. If these two
-    # go red again, check that the Secret still exists in the kyverno namespace
-    # before suspecting the signatures:
+    # go red, check the Secret before suspecting the signatures:
     #
     #   kubectl -n kyverno get secret kyverno-ghcr-pull
+    #
+    # Factory#566, measured: if that Secret exists but holds a wrong or expired
+    # credential, ALL SIXTEEN covered images fail, not just these two. The
+    # keychain has no fallback to the anonymous path. A whole-board red is the
+    # credential; a two-image red is the missing credential.
     #
     # That fail is a REGISTRY-AUTH failure, not a signature verdict. This is
     # exactly the Factory#430 ambiguity, so the distinguishing evidence is
