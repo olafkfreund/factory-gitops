@@ -83,6 +83,14 @@
 #    useCache: false, because the same field also governs the admission hot
 #    path and would put a full Rekor round trip in front of every build and
 #    verify Job Pod.
+#
+# Factory#524 (2026-08-05). The eleven `tfactory-runner-*` images -- the
+# sandbox that generated code is built and executed in -- are now covered by
+# `verify-tfactory-runner-signature` below. TWO OF THEM ARE EXPECTED TO REPORT
+# `fail` (tfactory-runner-nix, tfactory-runner-portal-ui) because they are
+# private GHCR packages that Kyverno cannot read anonymously. That is a
+# registry-auth failure, not a signature verdict. Read the comment on that rule
+# before triaging it as a signing problem.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -273,6 +281,85 @@ spec:
                     # No alternation: CFactory has no release.yml and no
                     # build-nix.yml. deploy.yml is its only publisher.
                     subjectRegExp: "^https://github\\.com/olafkfreund/CFactory/\\.github/workflows/deploy\\.yml@refs/heads/main$"
+                    # Same Kyverno v1.18 requirement as the rules above: a
+                    # keyless attestor with neither `rekor` nor `roots` is
+                    # rejected outright and ArgoCD cannot apply the file.
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+    # Factory#524, phase 2 (2026-08-05). The four rules above cover the five
+    # SERVICE images -- the control plane. They cover none of the eleven RUNNER
+    # images, which is the worse half: those are the sandbox in which generated
+    # code is built and executed.
+    #
+    #   AIFACTORY_SANDBOX_IMAGE       tfactory-runner-nix
+    #   TFACTORY_VAL3_K8S_JOB_IMAGE   tfactory-runner-nix
+    #   TFACTORY_NIX_RUNNER_IMAGE     tfactory-runner-nix
+    #   PORTAL_UI_IMAGE               tfactory-runner-portal-ui
+    #   lane dispatch                 tfactory-runner-{pytest,jest,playwright,
+    #                                 vitest,cypress,java,selenium,cucumber,cloud}
+    #
+    # TFactory#947/#949 (phase 1) added cosign signing to all three publishing
+    # workflows. One rule covers all eleven: unlike `cfactory` /
+    # `cfactory-frontend`, nothing here is stopped by a literal `:`, and
+    # `tfactory-runner-*` was confirmed against kyverno v1.18.2 -- the cluster's
+    # exact version -- to match `ghcr.io/olafkfreund/tfactory-runner-<x>:<tag>`.
+    #
+    # The three-way alternation is load-bearing in the same way the AIFactory
+    # one is: nix-runner-image.yml, portal-ui-runner-image.yml and
+    # runner-images.yml are three separate publishing workflows, and dropping
+    # any one of them stops a real Job from verifying.
+    #
+    # EXPECTED FAILURES -- READ THIS BEFORE TRIAGING A RED.
+    #
+    # `tfactory-runner-nix` and `tfactory-runner-portal-ui` are PRIVATE GHCR
+    # packages; the other nine are public. Kyverno reads ghcr.io anonymously
+    # (no imagePullSecret in the kyverno namespace, see the note on the
+    # cfactory rule), so it cannot retrieve a signature it cannot read. These
+    # two therefore report `fail` while every other runner reports `pass`.
+    #
+    # That fail is a REGISTRY-AUTH failure, not a signature verdict. This is
+    # exactly the Factory#430 ambiguity, so the distinguishing evidence is
+    # recorded here rather than left to be re-derived. Kyverno v1.18.2 against
+    # this rule with an empty credential store, which is what Kyverno does:
+    #
+    #   failed to verify image ghcr.io/olafkfreund/tfactory-runner-nix:latest:
+    #   .attestors[0].entries[0].keyless: GET https://ghcr.io/token?scope=
+    #   repository%3Aolafkfreund%2Ftfactory-runner-nix%3Apull&service=ghcr.io:
+    #   UNAUTHORIZED: authentication required
+    #
+    # The same image, same anchored identity, WITH a read credential:
+    # `cosign verify` passes. Both images are correctly signed. Contrast that
+    # with a real signature verdict, which reads `no matching signatures` or
+    # `no signatures found` and never names ghcr.io/token.
+    #
+    # The fix is to make both packages public, matching the nine framework
+    # runners and all five service packages. GitHub exposes no REST endpoint
+    # for container package visibility, so it is a manual step and is PENDING.
+    # It is NOT fixed by excluding these two images from the rule: an accurate
+    # red that names a real gap is the point, and Factory#522 must not flip
+    # this policy to Enforce while it stands -- at Enforce this denies every
+    # build and verify Job in the fleet.
+    - name: verify-tfactory-runner-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [factory]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/olafkfreund/tfactory-runner-*"
+          verifyDigest: false
+          mutateDigest: false
+          required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/olafkfreund/TFactory/\\.github/workflows/(nix-runner-image|portal-ui-runner-image|runner-images)\\.yml@refs/heads/main$"
                     # Same Kyverno v1.18 requirement as the rules above: a
                     # keyless attestor with neither `rekor` nor `roots` is
                     # rejected outright and ArgoCD cannot apply the file.

@@ -209,6 +209,46 @@ lost if the cluster is ever recreated.
      secrets: [kyverno-ghcr-pull]     # must exist in the kyverno namespace
    ```
 
+   **Reopened for the runner images, Factory#524 (2026-08-05).** Two of the
+   eleven `tfactory-runner-*` packages — `tfactory-runner-nix` and
+   `tfactory-runner-portal-ui` — *are* private, so they hit exactly the
+   condition above. They are correctly signed and still unverifiable by
+   Kyverno.
+
+   This is the Factory#430 ambiguity in the flesh, so the distinguishing
+   evidence is recorded rather than left to be re-derived. Kyverno v1.18.2
+   against this rule with an empty credential store (what Kyverno actually
+   has):
+
+   ```
+   failed to verify image ghcr.io/olafkfreund/tfactory-runner-nix:latest:
+   .attestors[0].entries[0].keyless: GET https://ghcr.io/token?scope=
+   repository%3Aolafkfreund%2Ftfactory-runner-nix%3Apull&service=ghcr.io:
+   UNAUTHORIZED: authentication required
+   ```
+
+   Same image, same anchored identity, **with** a read credential:
+
+   ```
+   $ cosign verify --certificate-oidc-issuer=... \
+       --certificate-identity-regexp='<the rule regexp>' \
+       --registry-username=olafkfreund --registry-password="$(gh auth token)" \
+       ghcr.io/olafkfreund/tfactory-runner-nix:latest
+   The following checks were performed on each of these signatures: ...
+   ```
+
+   Both pass. The failure is a registry-auth failure, not a signature verdict —
+   a real signature verdict reads `no matching signatures` / `no signatures
+   found` and never names `ghcr.io/token`.
+
+   The fix is to make both packages public, matching the nine framework runners
+   and all five service packages. GitHub exposes no REST endpoint for container
+   package visibility (`PATCH` returns 404), so it is a manual step and is
+   **PENDING**. The rule deliberately does *not* exclude these two images to
+   keep the board green: an accurate red naming a real gap is the point, and
+   Factory#522 must not flip to Enforce while it stands — at Enforce this
+   denies every build and verify Job in the fleet.
+
 2. **`background: false` froze every report at admission.** A long-lived Pod was
    evaluated once, ever, and its report stayed green across arbitrarily many
    image changes. Audit results were a snapshot of whenever the Pod was last
@@ -257,12 +297,37 @@ old repo-prefix form was not good enough.
 | `ghcr.io/olafkfreund/pfactory:*`           | `^https://github\.com/olafkfreund/PFactory/\.github/workflows/(deploy\|release)\.yml@refs/heads/main$`             |
 | `ghcr.io/olafkfreund/tfactory:*`           | `^https://github\.com/olafkfreund/TFactory/\.github/workflows/(deploy\|release)\.yml@refs/heads/main$`             |
 | `ghcr.io/olafkfreund/cfactory:*`, `cfactory-frontend:*` | `^https://github\.com/olafkfreund/CFactory/\.github/workflows/deploy\.yml@refs/heads/main$`           |
+| `ghcr.io/olafkfreund/tfactory-runner-*`    | `^https://github\.com/olafkfreund/TFactory/\.github/workflows/(nix-runner-image\|portal-ui-runner-image\|runner-images)\.yml@refs/heads/main$` |
 
 The alternation is load-bearing: `release.yml` publishes `:vX.Y.Z`,
 `deploy.yml` publishes `:sha-<short>` (what every running Pod is on), and
 `build-nix.yml` publishes `:sha-<short>-nix` (AIFactory's build image). Drop
 one and real deployments stop verifying. CFactory publishes only from
 `deploy.yml`.
+
+### Runner images (Factory#524)
+
+The first four rules cover the five **service** images — the control plane.
+`verify-tfactory-runner-signature` covers the eleven **runner** images, which
+are the sandbox that generated code is built and executed in:
+
+| env var / consumer            | image                                                                                  |
+|-------------------------------|----------------------------------------------------------------------------------------|
+| `AIFACTORY_SANDBOX_IMAGE`     | `tfactory-runner-nix`                                                                    |
+| `TFACTORY_VAL3_K8S_JOB_IMAGE` | `tfactory-runner-nix`                                                                    |
+| `TFACTORY_NIX_RUNNER_IMAGE`   | `tfactory-runner-nix`                                                                    |
+| `PORTAL_UI_IMAGE`             | `tfactory-runner-portal-ui`                                                              |
+| lane dispatch                 | `tfactory-runner-{pytest,jest,playwright,vitest,cypress,java,selenium,cucumber,cloud}`    |
+
+One rule covers all eleven. Unlike `cfactory` / `cfactory-frontend`, nothing
+here is stopped by a literal `:`, and the bare `tfactory-runner-*` glob was
+confirmed against kyverno **v1.18.2** — the cluster's exact version — to match
+`ghcr.io/olafkfreund/tfactory-runner-<x>:<tag>`.
+
+**Two of the eleven are expected to report `fail`.** `tfactory-runner-nix` and
+`tfactory-runner-portal-ui` are private GHCR packages; the other nine are
+public. Kyverno reads ghcr.io anonymously, so it cannot retrieve a signature it
+cannot read. See [Blockers after this change](#blockers-after-this-change).
 
 ## Reading the audit results
 
@@ -541,6 +606,13 @@ Do NOT skip a phase. Each is a separate, small PR.
    `results[].timestamp` and `results[].properties.process` as described in
    [Evidence model](#evidence-model-how-fresh-is-a-report), never via
    `creationTimestamp`.
+
+3b. **Cover the runner images (Factory#524).** **Done.**
+   `verify-tfactory-runner-signature` covers all eleven `tfactory-runner-*`
+   images. Nine report `pass`; `tfactory-runner-nix` and
+   `tfactory-runner-portal-ui` report `fail` with `UNAUTHORIZED: authentication
+   required` until those two GHCR packages are made public. That visibility
+   flip is a manual step and is the only remaining blocker on this line.
 
 4. **Enforce.** Only then flip `validationFailureAction: Audit` -> `Enforce`.
    Consider also tightening `failurePolicy: Ignore` -> `Fail` at this point so a
