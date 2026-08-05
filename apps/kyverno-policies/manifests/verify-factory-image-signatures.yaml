@@ -30,6 +30,30 @@
 # Until Factory#430 only release.yml signed, so every running Pod (all on
 # sha-* tags from deploy.yml) failed verification. Signing was added to the
 # CD workflows; do not remove it.
+#
+# Factory#430, second finding (2026-08-05). After the CD workflows were signing
+# correctly, the audit STILL failed 100%. The cause was not signing and not the
+# identity above -- it was that no Pod in the cluster could resolve any external
+# name, so Kyverno could not fetch the Sigstore TUF root:
+#
+#   failed to verify image ghcr.io/olafkfreund/aifactory:sha-6b116ee:
+#   .attestors[0].entries[0].keyless: failed to get roots from fulcio:
+#   initializing tuf: ... Get "https://tuf-repo-cdn.sigstore.dev/13.root.json":
+#   lookup tuf-repo-cdn.sigstore.dev on 10.43.0.10:53: server misbehaving
+#
+# THE REPORT DOES NOT DISTINGUISH THE TWO CASES. Kyverno writes the same
+# `fail: unverified image` result whether the image carries no valid signature
+# or whether Kyverno could not reach Sigstore/GHCR at all. Before acting on a
+# fail -- and especially before Factory#522 flips this to Enforce -- read the
+# admission-controller log for that image and confirm the reason is a signature
+# verdict, not a transport error:
+#
+#   kubectl -n kyverno logs deploy/kyverno-admission-controller \
+#     | grep 'failed to verify image'
+#
+# The failure is also sticky per process: once the Sigstore root fetch fails,
+# that admission-controller Pod keeps failing after connectivity is restored
+# until it is restarted. See docs/image-signature-admission.md.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -151,15 +175,22 @@ spec:
     # attestor. The `cfactory:*` glob does not match `cfactory-frontend:*` —
     # the literal `:` after `cfactory` stops it — so both need listing.
     #
-    # READ BEFORE FLIPPING TO ENFORCE (Factory#522): unlike the other three,
-    # the `cfactory` and `cfactory-frontend` GHCR packages are still PRIVATE.
-    # Kyverno has no registry credential for ghcr.io (the admission controller
-    # runs with `--registryCredentialHelpers=default,google,amazon,azure,github`
-    # and there is no imagePullSecret in the kyverno namespace), so it reads
-    # them anonymously and cannot retrieve the signature. Under Audit that is a
-    # warning; under Enforce it denies every cockpit Pod. Either those two
-    # packages go public like the other three, or Kyverno gets a credential.
-    # That is a decision for a human, not something to work around here.
+    # All five factory GHCR packages (aifactory, pfactory, tfactory, cfactory,
+    # cfactory-frontend) are PUBLIC as of 2026-08-05. An earlier version of this
+    # comment said cfactory and cfactory-frontend were private and therefore
+    # unreadable by Kyverno; that is no longer true, and Factory#430 confirmed
+    # it -- Kyverno now fetches and verifies both anonymously, and both report
+    # `pass` in their Pod PolicyReports.
+    #
+    # Still true, and load-bearing for Factory#522: Kyverno has NO registry
+    # credential for ghcr.io. It runs with
+    # `--registryCredentialHelpers=default,google,amazon,azure,github` and there
+    # is no imagePullSecret in the kyverno namespace, so it reads GHCR
+    # anonymously. If any of these packages is ever flipped back to private,
+    # verification breaks immediately -- a warning under Audit, a denial of
+    # every Pod using it under Enforce. Making a factory package private
+    # requires wiring a read-only GHCR credential into the kyverno namespace
+    # first.
     - name: verify-cfactory-signature
       match:
         any:
