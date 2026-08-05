@@ -98,6 +98,40 @@
 # unverifies ALL SIXTEEN covered images, not just the two private ones. There
 # is no fallback to the anonymous path. Check the Secret before anything else
 # when the whole board goes red at once.
+#
+# Factory#564 (2026-08-05). THE RULES IN THIS FILE ONLY EVER SPEAK ABOUT IMAGES
+# THEIR GLOBS NAME. `required: true` below means "a MATCHED image must have a
+# signature"; it does NOT mean "every image must match a rule". An image no
+# glob names is admitted unverified and produces no result at all -- not a
+# pass, not a fail, nothing. Fourteen such images were running in `factory`
+# when #564 was filed, and the board still read "65 pass / 0 fail", which was
+# true and useless.
+#
+# Two consequences to keep in mind when reading this file:
+#
+# 1. `verify-skillai-signature` was added here for `skillai` and
+#    `skillai-migrator`, whose publishing workflow now signs (SkillAi#303).
+#    NOTE ITS REF ANCHOR: that repository publishes from
+#    `refs/heads/core-mvp-foundation`, its default branch, NOT from main. Every
+#    other rule in this file anchors on main. Copying one of them for a new
+#    SkillAi image would silently reject its signature.
+#
+# 2. `odin` is deliberately NOT given a rule here even though it is signed as
+#    of Odin#4 and verifies against the live registry. The `odin` GHCR package
+#    is PRIVATE and `kyverno-ghcr-pull` does not exist yet, so a rule would
+#    report the Factory#430 registry-auth ambiguity rather than a signature
+#    verdict -- a permanent misleading red that costs #522 its criterion. Its
+#    absence is not silent: `require-first-party-signature-coverage` reports it
+#    accurately as an uncovered first-party image until a rule can honestly be
+#    written. Tracked in Factory#572.
+#
+# The general defect -- coverage by omission -- is closed by a separate policy,
+# `require-first-party-signature-coverage.yaml` in this directory, which fails
+# on ANY `ghcr.io/olafkfreund/*` image in `factory` that no glob here names.
+# When you add a rule to this file, add its glob to that policy's mirror list
+# IN THE SAME COMMIT. Read the long comment at the top of that file first; it
+# records why the obvious catch-all shape (a sixth verifyImages rule with
+# `required: true` and no attestor) was measured and rejected.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -384,6 +418,58 @@ spec:
                 - keyless:
                     issuer: "https://token.actions.githubusercontent.com"
                     subjectRegExp: "^https://github\\.com/olafkfreund/TFactory/\\.github/workflows/(nix-runner-image|portal-ui-runner-image|runner-images)\\.yml@refs/heads/main$"
+                    # Same Kyverno v1.18 requirement as the rules above: a
+                    # keyless attestor with neither `rekor` nor `roots` is
+                    # rejected outright and ArgoCD cannot apply the file.
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+    # Factory#564 (2026-08-05). `skillai` ran in this namespace matched by no
+    # rule at all, so it produced no result -- and it was simultaneously the
+    # known-UNSIGNED control used in the #522 deny experiment. It is now signed
+    # (SkillAi#303) and this rule is the second half of that fix.
+    #
+    # ORDER MATTERS AND WAS FOLLOWED: signing landed first, was confirmed
+    # against the live registry with the anchored identity below, and only then
+    # was this rule written. A rule in front of an unsigned image produces
+    # nothing but Audit noise.
+    #
+    # TWO THINGS HERE DIFFER FROM EVERY OTHER RULE IN THIS FILE.
+    #
+    # 1. THE REF IS NOT main. SkillAi's default branch -- and the only branch
+    #    its deploy-image.yml publishes from, and the one ArgoCD tracks in
+    #    apps/skillai/application.yaml -- is `core-mvp-foundation`. Anchoring
+    #    this on refs/heads/main would reject every signature SkillAi produces.
+    #
+    # 2. BOTH IMAGES ARE LISTED. `skillai-migrator` runs as a Job in this
+    #    namespace, and `ghcr.io/olafkfreund/skillai:*` does NOT match
+    #    `skillai-migrator:*` -- the literal `:` after `skillai` stops it. Same
+    #    trap as `cfactory` / `cfactory-frontend` above. Both GHCR packages are
+    #    public, so Kyverno can read them anonymously today.
+    - name: verify-skillai-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [factory]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/olafkfreund/skillai:*"
+            - "ghcr.io/olafkfreund/skillai-migrator:*"
+          verifyDigest: false
+          mutateDigest: false
+          required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    # No alternation: deploy-image.yml is SkillAi's only
+                    # publisher of these two images. See point 1 above for the
+                    # non-main ref.
+                    subjectRegExp: "^https://github\\.com/olafkfreund/SkillAi/\\.github/workflows/deploy-image\\.yml@refs/heads/core-mvp-foundation$"
                     # Same Kyverno v1.18 requirement as the rules above: a
                     # keyless attestor with neither `rekor` nor `roots` is
                     # rejected outright and ArgoCD cannot apply the file.

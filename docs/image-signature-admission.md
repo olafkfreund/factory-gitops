@@ -480,6 +480,181 @@ confirmed against kyverno **v1.18.2** — the cluster's exact version — to mat
 public. Kyverno reads ghcr.io anonymously, so it cannot retrieve a signature it
 cannot read. See [Blockers after this change](#blockers-after-this-change).
 
+### Coverage: the rules only speak about images their globs name (Factory#564)
+
+**User story.** I am on call, I open the signature board, and it says
+`65 pass / 0 fail`. I want to know whether that sentence means the namespace is
+verified. It did not. It meant *every image that happened to match a glob
+verified*, and fourteen images were running that matched nothing at all.
+
+`required: true` on a `verifyImages` rule means **a matched image must have a
+signature**. It does *not* mean **every image must match a rule**. An image no
+`imageReferences` glob names is admitted unverified and produces **no result at
+all** — not a pass, not a fail, nothing. Under Enforce that is a silent bypass:
+anything published under a name outside the globs is admitted without
+verification.
+
+This is the same green-from-absence shape as Factory#562, one level up. There,
+a rule matched but ephemeral Job Pods left no standing result. Here, no rule
+exists. In both cases "the audit is clean" is read off a report that was never
+asked the question.
+
+#### The fourteen, and what was done about each
+
+| image | class | disposition |
+|-------|-------|-------------|
+| `ghcr.io/olafkfreund/skillai` | first-party, was unsigned | signed (SkillAi#303), rule `verify-skillai-signature` added |
+| `ghcr.io/olafkfreund/skillai-migrator` | first-party, was unsigned | signed (SkillAi#303), same rule |
+| `ghcr.io/olafkfreund/odin` | first-party, was unsigned | signed (Odin#4); **no rule yet**, see below |
+| `busybox`, `postgres`, `pgvector/pgvector`, `redis`, `python`, `quay.io/keycloak/keycloak`, `quay.io/minio/minio`, `quay.io/minio/mc`, `quay.io/oauth2-proxy/oauth2-proxy`, `docker.io/cloudflare/cloudflared`, `public.ecr.aws/zinclabs/openobserve`, `registry.k8s.io/sig-storage/nfs-provisioner` | third-party | out of scope by design, see below |
+
+`skillai` deserves a note: it was the known-**unsigned** control used in the
+Factory#522 deny experiment, chosen precisely because it was public, readable
+and carried no signature — while running in this namespace the whole time.
+
+#### Why `odin` is signed but has no rule
+
+`ghcr.io/olafkfreund/odin` is signed and verifies against the live registry:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/olafkfreund/Odin/\.github/workflows/deploy\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  ghcr.io/olafkfreund/odin:sha-2749b26
+```
+
+It still has **no** rule in `verify-factory-image-signatures`, deliberately. The
+`odin` GHCR package is **private**, and the `kyverno-ghcr-pull` Secret that
+Factory#563 wired the controllers to use does not exist yet:
+
+```bash
+$ curl -s "https://ghcr.io/token?scope=repository%3Aolafkfreund%2Fodin%3Apull&service=ghcr.io"
+{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}
+
+$ kubectl -n kyverno get secret kyverno-ghcr-pull
+Error from server (NotFound): secrets "kyverno-ghcr-pull" not found
+```
+
+A rule added today would therefore report a **registry-auth** failure in the
+same words as a signature verdict — the exact Factory#430 ambiguity — and leave
+a permanent misleading red on the board that Factory#522's Enforce criterion is
+phrased against. Adding an accurate control later beats adding a confusing one
+now. Tracked in Factory#572.
+
+Its absence is not silent. The coverage policy below reports `odin` accurately,
+as an uncovered first-party image, which is what it is.
+
+#### The control that closes the class: `require-first-party-signature-coverage`
+
+Signing `odin` and `skillai` fixes two instances. The reason fourteen
+accumulated is that **nothing objected**, so the fix that matters is the one
+that makes the *next* unmatched first-party image fail on its own.
+
+`apps/kyverno-policies/manifests/require-first-party-signature-coverage.yaml`
+is a separate ClusterPolicy that reports any `ghcr.io/olafkfreund/*` image
+running in `factory` that no glob in `verify-factory-image-signatures` names.
+
+Read its board as:
+
+| result | meaning |
+|--------|---------|
+| `fail` | a real coverage gap — this image is admitted with no signature check |
+| `skip` | this Pod was checked and has no uncovered first-party image |
+| `pass` | never emitted; this rule verifies nothing itself |
+
+There are a lot of `skip` rows — roughly one per Pod, and this namespace runs
+about 140 including retained Job Pods. That is deliberate. `skip` says "this
+rule looked here and had nothing to say"; silence is indistinguishable from the
+rule not running, and that indistinguishability *is* the bug being fixed.
+
+**Known limitation (Factory#574): this rule emits no admission warning.** At
+`Audit`, a `verifyImages` rule returns both a `Warning` header and a standing
+report result; a `validate` rule returns only the standing result. So
+`kubectl apply --dry-run=server` of a Pod carrying an uncovered image comes back
+clean even though the rule fails that Pod in its PolicyReport. An uncovered
+first-party image used *only* by ephemeral Job Pods is therefore caught by
+neither channel — no standing result because the Pod is gone (Factory#562), no
+warning because of the rule type. Every first-party image today is used by a
+long-running workload, which is fully covered. Do not "fix" this by switching
+the rule to `verifyImages`; that loses the standing result, which is the point.
+
+**Options considered, and why this shape.**
+
+| option | verdict |
+|--------|---------|
+| A sixth `verifyImages` rule in the existing policy: `imageReferences: ghcr.io/olafkfreund/*`, `required: true`, no attestor | **Rejected, measured.** It is schema-valid and works beautifully at admission (warns `unverified image ...` with no registry call). But `required: true` reads the `kyverno.io/verify-images` annotation Kyverno writes at admission time, which absent Pods do not have on a background scan. The reports controller logs `missing image metadata in annotation key=kyverno.io/verify-images` and emits nothing. Measured on this cluster: five of five uncovered images warned at admission, and **zero** rows were added to the PolicyReports over a full scan. It would have left the board reading `66 pass / 0 fail` — the exact defect, reintroduced by its own fix. |
+| The same, with any real attestor | **Rejected.** Any attestor means Kyverno must read the image. `odin` is private, so the failure would read `UNAUTHORIZED: authentication required` — Factory#430 all over again. The `validate` form never touches a registry, so it cannot produce that ambiguity. |
+| An explicit allowlist rule naming the twelve third-party images | **Rejected.** A rule that lists twelve images and then does nothing is ceremony: it creates a maintenance burden and the appearance of coverage without any. The declaration belongs in this document, which is where it now is. |
+| Digest-pinning third-party images | **Right control, wrong change.** It is genuinely valuable — a pinned digest cannot be repointed under a running cluster — but it is a different policy against manifests owned elsewhere, and it would add twelve standing Audit failures that nobody intends to clear soon, directly harming Factory#522. Tracked in Factory#573. |
+| Do nothing and document the limit | **Rejected.** Cheapest, but leaves the board over-claiming, which is the whole complaint. |
+
+**Why a separate policy rather than a sixth rule in the same file.** It needs
+`pod-policies.kyverno.io/autogen-controllers: none`, and that annotation is
+policy-wide. The five `verifyImages` rules depend on autogen — most of their 66
+results come from autogen'd ReplicaSets and Deployments — so setting it there
+would gut the existing board. It also keeps the two tallies separable, which
+matters because Factory#522's criterion is phrased in terms of the signature
+board specifically.
+
+#### Third-party images are out of scope by design, not by oversight
+
+Twelve third-party images run in `factory`. We cannot sign them, and they do not
+publish cosign signatures under an identity we could pin, so no attestor honest
+enough to be worth writing exists for them. Inventing one would be theatre: a
+rule that passes because it asks nothing is exactly the failure mode this issue
+is about.
+
+The coverage policy is therefore scoped to `ghcr.io/olafkfreund/*` **so that its
+silence about third-party images is a stated boundary rather than an accident of
+which globs someone happened to write.** The appropriate control for them is
+digest pinning (Factory#573), not signature verification.
+
+#### When you add a rule, update the mirror in the same commit
+
+The coverage policy carries a regex mirroring the globs in
+`verify-factory-image-signatures`. It is duplication and it can drift.
+
+- A glob added **there** but not **here** produces a false `fail` for an image
+  that is in fact covered. Noisy, self-correcting, someone investigates.
+- A glob added **here** but not **there** reopens the silent hole. This is the
+  dangerous direction. When in doubt, leave an entry out.
+
+Both directions are covered by the test suite. It runs offline against the same
+Kyverno version the cluster runs:
+
+```bash
+kubectl -n kyverno get deploy kyverno-admission-controller \
+  -o jsonpath='{.spec.template.spec.containers[0].image}'   # match this version
+kyverno test apps/kyverno-policies/tests/
+```
+
+That test proves rule *logic* only; it reaches no registry and does not test
+signature verification. Policy files must additionally survive the live webhook,
+because a file Kyverno rejects is a file ArgoCD cannot apply — and ArgoCD then
+keeps serving the previous version while reporting healthy, which is how
+Factory#430 lost its `subjectRegExp` for weeks:
+
+```bash
+kubectl apply --dry-run=server -f apps/kyverno-policies/manifests/
+```
+
+Confirm that check is not vacuous before trusting it. Delete the `rekor:` block
+from a keyless attestor and re-run: the webhook must answer
+`Either Rekor URL or roots are required`. If it does not, you are validating
+nothing.
+
+#### A note on the SkillAi ref anchor
+
+`verify-skillai-signature` anchors on `refs/heads/core-mvp-foundation`, not
+`refs/heads/main`. That is SkillAi's default branch, the only branch its
+`deploy-image.yml` publishes from, and what ArgoCD tracks in
+`apps/skillai/application.yaml`. Every other rule in the file anchors on main;
+copying one of them for a new SkillAi image would silently reject its signature.
+
+`skillai` and `skillai-migrator` are listed as two globs for the same reason
+`cfactory` and `cfactory-frontend` are: the literal `:` in
+`ghcr.io/olafkfreund/skillai:*` stops it matching `skillai-migrator:*`.
+
 ## Reading the audit results
 
 After merge and sync, check what would have been denied:
