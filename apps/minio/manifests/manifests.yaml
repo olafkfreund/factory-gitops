@@ -85,7 +85,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
+          image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
           # readOnlyRootFilesystem is MEASURED. This exact tag run read-only as
           # uid 1000 with --cap-drop ALL and no-new-privileges, /data writable:
           #   API: http://.../ WebUI: http://...
@@ -187,7 +187,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: mc
-          image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z
+          image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z@sha256:69fb6e6ca209008ae3cacf9f63c2524f68a1322dc921c8992ba2cc99c5bef3c6
           command: ["/bin/sh", "-c"]
           args:
             - |

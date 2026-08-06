@@ -559,7 +559,7 @@ spec:
             - name: probe
               # Stock python; the script is stdlib-only, so no custom image and
               # nothing new for the signature policy itself to have to cover.
-              image: python:3.12-slim
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
               command: ["python3", "/script/probe.py"]
               env:
                 - { name: OO_STREAM, value: "image_signature_probe" }

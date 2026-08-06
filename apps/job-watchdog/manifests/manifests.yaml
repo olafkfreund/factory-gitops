@@ -1292,7 +1292,7 @@ spec:
           containers:
             - name: watchdog
               # Stock python; the script is stdlib-only so no custom image.
-              image: python:3.12-slim
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
               command: ["python3", "/script/watchdog.py"]
               env:
                 - { name: FAIL_THRESHOLD, value: "2" }
