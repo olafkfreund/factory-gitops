@@ -1,0 +1,6 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# No `namespace:` transformer: the single resource here carries its own
+# namespace (kube-system), which is k3s's, not this repo's.
+resources:
+  - manifests.yaml
