@@ -94,7 +94,7 @@
 # no `pass`, because this rule never verifies anything itself.
 #
 # ---------------------------------------------------------------------------
-# KNOWN LIMITATION -- Factory#574. THIS RULE EMITS NO ADMISSION WARNING.
+# THIS RULE EMITS NO ADMISSION WARNING, AND WHAT COVERS THAT -- Factory#574
 # ---------------------------------------------------------------------------
 #
 # Measured on kyverno v1.18.2: at `validationFailureAction: Audit`, a
@@ -104,14 +104,35 @@
 # back clean even though the rule would fail that Pod in its PolicyReport.
 #
 # Consequence: an uncovered first-party image used ONLY by ephemeral Job Pods
-# is caught by neither channel -- no standing result because the Pod is gone
-# (Factory#562), no warning because of the rule type. Long-running workloads,
-# which is how every first-party image is used today, are fully covered.
+# would be caught by neither channel -- no standing result because the Pod is
+# gone (Factory#562), no warning because of the rule type.
 #
 # Do NOT "fix" this by switching to verifyImages. That trade was measured above
-# and it loses the standing board result, which is the entire point. Both
-# channels needs both rule types. Factory#574 tracks extending the #562 runner
-# probe instead, which already submits a synthetic Pod every six hours.
+# and it loses the standing board result, which is the entire point.
+#
+# THAT HOLE IS NOW COVERED, BY A THIRD CHANNEL THAT NEEDED NO POLICY AT ALL.
+# apps/kyverno-runner-probe already dry-runs a synthetic Pod carrying every
+# first-party Job image through the real admission path every six hours. It now
+# also reads the `kyverno.io/verify-images` annotation Kyverno writes onto the
+# object it admits -- a map of every image a verifyImages rule EXAMINED. An
+# image absent from that map was named by no glob, which is precisely this
+# rule's question, answered from the webhook rather than from a second copy of
+# the matching logic. So:
+#
+#   long-running Pods  -> this rule, standing PolicyReport `fail`
+#   ephemeral Job Pods -> the probe, `reason=not_covered` in the
+#                         `image_signature_probe` OpenObserve stream
+#
+# Adding a catch-all `verifyImages` rule for the warning channel was built and
+# measured first, and rejected: it emits at most ONE warning per rule per
+# request regardless of how many images are uncovered, and names the image only
+# when some other image on the same Pod verified. It cannot attribute.
+#
+# THE TWO CHANNELS CROSS-CHECK EACH OTHER. Both must name `odin` today
+# (Factory#572). If this rule's mirror list below drifts from the globs in
+# verify-factory-image-signatures, the probe -- which reads those globs'
+# effects and not this list -- will disagree, and it carries a canary that
+# makes the disagreement loud rather than silent.
 #
 # ---------------------------------------------------------------------------
 # THE COVERED LIST BELOW MIRRORS THE GLOBS IN verify-factory-image-signatures.
