@@ -311,7 +311,7 @@ spec:
           # Step 1: HTTP collection (CFactory audit + kube API) -> scratch JSON.
           initContainers:
             - name: collect
-              image: python:3.12-slim
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
               command: ["python3", "/script/collect.py"]
               env:
                 - { name: OUT_DIR, value: "/scratch/out" }
@@ -335,7 +335,7 @@ spec:
           # Step 2: S3 work — capture backup markers, then upload the dated snapshot.
           containers:
             - name: upload
-              image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z
+              image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z@sha256:69fb6e6ca209008ae3cacf9f63c2524f68a1322dc921c8992ba2cc99c5bef3c6
               command: ["/bin/sh", "-c"]
               args:
                 - |

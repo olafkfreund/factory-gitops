@@ -66,7 +66,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: redis
-          image: redis:7.4.2-alpine
+          image: redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952
           # readOnlyRootFilesystem is MEASURED. redis:7.4.2-alpine run read-only
           # as uid 999 with --cap-drop ALL and no-new-privileges, /data writable:
           #   * Creating AOF base file appendonly.aof.1.base.rdb on server start

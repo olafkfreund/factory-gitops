@@ -52,7 +52,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: oauth2-proxy
-          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0@sha256:9ed7eaf720508640e1dce523f85f1e81743633d858175a9a26469978386ae05b
           # readOnlyRootFilesystem measured: read-only + uid 65532 + cap-drop ALL
           # answers GET /ping -> 200, which is the probe path below. Every input
           # here is an env var from a Secret; cookie-backed sessions, no disk.

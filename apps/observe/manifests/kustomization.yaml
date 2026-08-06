@@ -3,7 +3,16 @@ kind: Kustomization
 namespace: factory
 resources:
 - manifests.yaml
-images:
-- name: public.ecr.aws/zinclabs/openobserve
-  newName: public.ecr.aws/zinclabs/openobserve
-  newTag: v0.90.3
+
+# No `images:` transformer here, deliberately (Factory#573).
+#
+# There used to be one, and it was a no-op that had teeth: `newName` equalled
+# `name` and `newTag` equalled the tag already in manifests.yaml, so it changed
+# nothing -- but it REWROTE the ref on every build, which silently stripped the
+# `@sha256:...` digest pin off the openobserve image and rendered it back to a
+# mutable tag. kustomize cannot express `tag@digest`: setting `digest:` drops
+# the tag, and setting `newTag:` drops the digest. Pinning in manifests.yaml and
+# leaving the transformer out is the only shape that keeps both.
+#
+# To change the openobserve version, edit the ref in manifests.yaml and resolve
+# the new digest with `crane digest public.ecr.aws/zinclabs/openobserve:<tag>`.

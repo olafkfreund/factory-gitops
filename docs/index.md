@@ -13,6 +13,7 @@ cluster itself lives in [olafkfreund/nixos_config](https://github.com/olafkfreun
 - **[Operating guide](operating.md)** — day-2 ops, rotation, reset
 - **[Encryption at rest](encryption-at-rest.md)** — MinIO SSE (shipped) + etcd/LUKS runbooks
 - **[Secrets management](secrets-management.md)** — inventory, rotation runbook, SOPS/ESO plan
+- **[Image digest pinning](image-digest-pinning.md)** — third-party pins, how to bump one, and what maintains them (nothing)
 
 ## Cross-repo references
 

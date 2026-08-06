@@ -48,7 +48,7 @@ spec:
       containers:
         - name: openobserve
           # Pinned, NOT latest. public.ecr.aws/zinclabs is the official ECR mirror.
-          image: public.ecr.aws/zinclabs/openobserve:v0.90.3
+          image: public.ecr.aws/zinclabs/openobserve:v0.90.3@sha256:f77856199bff2097e0355d66e59d5792064ff8ff831ea5f580b3650fa5457136
           imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 5080, name: http }
@@ -291,7 +291,7 @@ spec:
           containers:
             - name: sync
               # Stock python; the script is stdlib-only, same as job-watchdog.
-              image: python:3.12-slim
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
               command: ["python3", "/script/sync.py"]
               securityContext:
                 allowPrivilegeEscalation: false
