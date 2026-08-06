@@ -204,25 +204,76 @@ roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: fides-updater 
 subjects:
   - { kind: ServiceAccount, name: fides-updater, namespace: fides }
 ---
+# This CronJob had never once succeeded (Factory#567). It wedged on 2026-07-31
+# and stayed wedged for six days, and it took THREE independent defects to do
+# it. Each of the three settings below closes one of them; none of them is
+# decoration.
+#
+# 1. THE IMAGE WAS GONE. `bitnami/kubectl:1.31` stopped resolving when Bitnami
+#    retired their public Docker Hub catalogue -- the same retirement that
+#    broke Kyverno's cleanup CronJobs (see apps/kyverno/manifests/). The
+#    replacement is upstream's own `registry.k8s.io/kubectl`, published by the
+#    Kubernetes release process itself, needing no registry credential and with
+#    nobody's commercial catalogue policy between us and it. v1.31.14 is the
+#    final 1.31 patch, matching this cluster's k3s v1.31.5 server exactly.
+#    Digest-pinned per factory-gitops#140 -- `apps/fides` was out of scope
+#    there, so this closes that gap too.
+#
+#    runAsUser IS LOAD-BEARING: unlike the Bitnami image (uid 1001), the
+#    upstream image declares `USER 0`, so `runAsNonRoot: true` alone would have
+#    traded ImagePullBackOff for CreateContainerConfigError -- a second wedge
+#    wearing a different error string. 65532 is the distroless nonroot uid.
+#    Verified in-cluster before merge: `kubectl version --client` -> v1.31.14,
+#    and `rollout restart` against this exact SA -> "deployment.apps/
+#    fides-server restarted".
+#
+# 2. `Forbid` LET THE DEAD JOB HOLD THE SLOT. An ImagePullBackOff Job is Active
+#    forever, and Forbid will not start a new Job while one is Active, so the
+#    single 2026-07-31 failure suppressed all 290 schedules after it. `Replace`
+#    evicts the stale Job and runs the new one: a failure costs one cycle, not
+#    every subsequent one.
+#
+# 3. THE CONTROLLER HAD ALREADY GIVEN UP COUNTING. With no
+#    startingDeadlineSeconds, the CronJob controller counts every missed start
+#    since lastScheduleTime and aborts past 100. Six days at */30 is ~290, and
+#    the cluster was emitting it before this landed:
+#      Warning TooManyMissedTimes  cronjob-controller
+#      too many missed start times. Set or decrease .spec.startingDeadlineSeconds
+#    So fixing the image and the concurrency policy alone would still have
+#    scheduled NOTHING. 300s bounds the count to at most one missed cycle.
+#
+# activeDeadlineSeconds bounds a Job that cannot make progress to two minutes
+# (the real run takes ~2s), so it reaches a terminal Failed state instead of
+# sitting Active. That is what makes the failure countable by job-watchdog --
+# the reason this went unseen was not only the namespace gap, it was that a
+# permanently-Active Job produces no *new* failures to alert on.
+#
+# backoffLimit is deliberately left at the default: activeDeadlineSeconds is
+# the stronger bound on exactly the failure mode that wedged this (a pod that
+# never starts burns wall-clock, not attempts), and a second knob capping the
+# same thing would only be another number to get wrong.
 apiVersion: batch/v1
 kind: CronJob
 metadata: { name: fides-server-updater, namespace: fides }
 spec:
   schedule: "*/30 * * * *"
-  concurrencyPolicy: Forbid
+  concurrencyPolicy: Replace
+  startingDeadlineSeconds: 300
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
+      activeDeadlineSeconds: 120
       template:
         spec:
           serviceAccountName: fides-updater
           restartPolicy: OnFailure
           containers:
             - name: kubectl
-              image: bitnami/kubectl:1.31
+              image: registry.k8s.io/kubectl:v1.31.14@sha256:74a458e9b800947f4bd1875be5213e8f31f4f2d1e6639548bf05145387ad07bb
               command: ["kubectl", "rollout", "restart", "deployment/fides-server", "-n", "fides"]
               securityContext:
                 allowPrivilegeEscalation: false
                 runAsNonRoot: true
+                runAsUser: 65532
                 capabilities: { drop: ["ALL"] }
