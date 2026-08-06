@@ -1,11 +1,17 @@
 # Job-watchdog — CronJob failure and staleness detection (Factory#381).
 #
-# A CronJob in this namespace could fail every run for weeks with nobody told:
-# cred-broker did exactly that for ~7 weeks. This watchdog reads every CronJob
-# and its Jobs every 30 minutes and writes a durable health record per CronJob
-# into the OpenObserve stream `job_health`, so both explicit failure AND silence
-# (stale, unscheduled, never-succeeded, Jobs garbage collected) are queryable
-# instead of waiting for someone to run `kubectl get jobs`.
+# A CronJob could fail every run for weeks with nobody told: cred-broker did
+# exactly that for ~7 weeks. This watchdog reads every CronJob and its Jobs every
+# 30 minutes and writes a durable health record per CronJob into the OpenObserve
+# stream `job_health`, so both explicit failure AND silence (stale, unscheduled,
+# never-succeeded, Jobs garbage collected) are queryable instead of waiting for
+# someone to run `kubectl get jobs`.
+#
+# CLUSTER-WIDE since Factory#571. It used to watch only the `factory` namespace,
+# which meant every CronJob elsewhere had no monitor at all AND the watchdog
+# still reported a clean run — `fides/fides-server-updater` sat wedged for over
+# five days (Factory#567) and was never mentioned by anything. A monitor with an
+# unwatched edge reports health for ground it is not standing on.
 #
 # App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
 # the manifests/ kustomization into the `factory` namespace.

@@ -120,14 +120,25 @@ metadata:
   namespace: factory
   labels: { app: job-watchdog }
 ---
-# Least privilege, following the apps/cred-broker precedent: namespaced Role, no
-# ClusterRole, read-only, and only the two resource kinds the watchdog reads.
-# It never needs to create, patch or delete anything.
+# Read-only, and still only the two resource kinds the watchdog reads — it never
+# needs to create, patch or delete anything.
+#
+# WHY THIS IS A ClusterRole AND NOT THE NAMESPACED Role IT USED TO BE (Factory#571).
+# A namespaced Role scoped the watchdog to `factory`, which quietly meant the
+# CronJobs in every OTHER namespace had no monitor at all. That is not a
+# hypothetical: `fides/fides-server-updater` sat wedged for over five days
+# (Factory#567) and `fides-reporter` failed repeatedly, and the watchdog reported
+# neither, because it could not see them. A monitor with an invisible edge
+# reports "all healthy" for the part of the cluster it is not looking at, which
+# is the same false green this app exists to abolish.
+#
+# Least privilege is preserved where it counts: list/get on two resource kinds,
+# no write verb anywhere, no secrets, no pods, no exec. The scope widens; the
+# power does not.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: job-watchdog
-  namespace: factory
   labels: { app: job-watchdog }
 rules:
   - apiGroups: ["batch"]
@@ -135,17 +146,16 @@ rules:
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: job-watchdog
-  namespace: factory
   labels: { app: job-watchdog }
 subjects:
   - kind: ServiceAccount
     name: job-watchdog
     namespace: factory
 roleRef:
-  kind: Role
+  kind: ClusterRole
   name: job-watchdog
   apiGroup: rbac.authorization.k8s.io
 ---
@@ -158,7 +168,7 @@ metadata:
 data:
   watchdog.py: |
     #!/usr/bin/env python3
-    """Report the health of every CronJob in the namespace to OpenObserve (#381).
+    """Report the health of every CronJob in the CLUSTER to OpenObserve (#381).
 
     For each CronJob it emits one record to the `job_health` stream carrying:
     consecutive failure count, age of the last SUCCESS, age of the last SCHEDULE,
@@ -189,7 +199,6 @@ data:
     unprovable liveness is ever a logged warning.
 
     Env:
-      NAMESPACE             namespace to watch (default "factory")
       FAIL_THRESHOLD        consecutive failures before status=failing (2)
       OBSERVE_URL           OpenObserve base url (default in-cluster service)
       OO_ORG                OpenObserve organization (default "default")
@@ -749,7 +758,6 @@ data:
 
 
     def main() -> int:
-        ns = os.environ.get("NAMESPACE", "factory")
         threshold = int(os.environ.get("FAIL_THRESHOLD", "2"))
         oo = os.environ.get(
             "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
@@ -775,9 +783,16 @@ data:
                    "path to a human, which is the defect this app exists to fix")
             return 2
 
+        # CLUSTER-WIDE, not one namespace (Factory#571). These are the
+        # all-namespaces collection endpoints. The previous per-namespace paths
+        # meant every CronJob outside `factory` had no monitor at all and the
+        # watchdog still reported a clean run, which is how fides/#567 stayed
+        # invisible for five days. Every record already carries its namespace and
+        # the issue de-duplication marker is already keyed `{ns}/{name}`, so
+        # widening the query needed no change to the reporting path.
         try:
-            cronjobs = k8s_get(f"/apis/batch/v1/namespaces/{ns}/cronjobs")["items"]
-            jobs = k8s_get(f"/apis/batch/v1/namespaces/{ns}/jobs")["items"]
+            cronjobs = k8s_get("/apis/batch/v1/cronjobs")["items"]
+            jobs = k8s_get("/apis/batch/v1/jobs")["items"]
         except Exception as e:  # noqa: BLE001 — cannot see == cannot report
             eprint(f"FATAL: kubernetes API unreachable: {e!r}")
             return 3
@@ -786,14 +801,21 @@ data:
         owned = group_jobs(cronjobs, jobs)
         records = [
             assess(c, owned.get((c.get("metadata") or {}).get("uid"), []), now, threshold)
-            for c in sorted(cronjobs, key=lambda c: c["metadata"]["name"])
+            for c in sorted(
+                cronjobs,
+                key=lambda c: (c["metadata"].get("namespace", ""), c["metadata"]["name"]),
+            )
         ]
 
+        # Namespace-qualified now that the watch is cluster-wide: two namespaces
+        # may hold same-named CronJobs, and a bare name would make the operator's
+        # first view of an incident ambiguous.
         for r in records:
+            who = f"{r['namespace']}/{r['cronjob']}"
             if r["status"] == "ok":
-                eprint(f"ok       {r['cronjob']}")
+                eprint(f"ok       {who}")
             else:
-                eprint(f"UNHEALTHY {r['cronjob']} [{r['status']}]")
+                eprint(f"UNHEALTHY {who} [{r['status']}]")
                 for p in r["problems"]:
                     eprint(f"          - {p}")
 
@@ -803,7 +825,7 @@ data:
             eprint(f"FATAL: cannot emit to OpenObserve stream '{stream}': {e!r}")
             return 4
 
-        bad = [r["cronjob"] for r in records if r["status"] != "ok"]
+        bad = [f"{r['namespace']}/{r['cronjob']}" for r in records if r["status"] != "ok"]
         eprint(
             f"reported {len(records)} CronJob(s) to '{stream}': "
             f"{len(records) - len(bad)} ok, {len(bad)} unhealthy"
@@ -1189,11 +1211,46 @@ data:
         # itself healthy while telling nobody anything.
         src = open(__file__).read() if os.path.exists(__file__) else ""
         if src:
-            body_of_main = src.split("def main() -> int:", 1)[1]
+            # Sliced at _selftest, not to end-of-file: the assertions below name
+            # the very strings they forbid, so an unbounded slice matches its own
+            # source and the check reports a failure it invented itself.
+            body_of_main = src.split("def main() -> int:", 1)[1].split(
+                "def _selftest", 1)[0]
             assert body_of_main.index("sent = notify(") < body_of_main.index(
                 "stamp = heartbeat("), "heartbeat must be stamped AFTER notify"
             assert body_of_main.index("emit(oo,") < body_of_main.index(
                 "sent = notify("), "emit still comes first; a dropped record is a blind spot"
+
+            # THE SCOPE CONSTRAINT, also asserted on the source (Factory#571).
+            # The watchdog must list CronJobs and Jobs from the all-namespaces
+            # collection endpoints. A per-namespace path silently shrinks what is
+            # watched WITHOUT failing anything: the run still goes green, the
+            # stream still fills, the heartbeat is still stamped, and the
+            # CronJobs outside the scope simply have no monitor. That is exactly
+            # how fides/#567 stayed invisible for five days, and it is invisible
+            # by construction, so it gets a test rather than a comment.
+            assert "/apis/batch/v1/cronjobs" in body_of_main, \
+                "must list CronJobs cluster-wide"
+            assert "/apis/batch/v1/jobs" in body_of_main, \
+                "must list Jobs cluster-wide"
+            assert "/apis/batch/v1/namespaces/" not in body_of_main, \
+                "a per-namespace list re-creates the unwatched-namespace blind spot"
+
+        # Same-named CronJobs in two namespaces must stay two findings, not one.
+        # Cluster-wide listing makes name collisions reachable for the first
+        # time; if the issue marker collided, the second namespace's outage would
+        # be silently absorbed into the first one's issue and never reported.
+        a = dict(cj("reporter", "*/10 * * * *", last_ok="2026-06-01T00:00:00Z"))
+        b = dict(cj("reporter", "*/10 * * * *", last_ok="2026-06-01T00:00:00Z"))
+        a["metadata"] = {**a["metadata"], "namespace": "fides", "uid": "uid-a"}
+        b["metadata"] = {**b["metadata"], "namespace": "fides-reporter", "uid": "uid-b"}
+        ra, rb = assess(a, [], now, 2), assess(b, [], now, 2)
+        assert ra["namespace"] == "fides" and rb["namespace"] == "fides-reporter"
+        assert ra["cronjob"] == rb["cronjob"] == "reporter"
+        assert MARKER.format(ns=ra["namespace"], name=ra["cronjob"]) != \
+            MARKER.format(ns=rb["namespace"], name=rb["cronjob"]), \
+            "same-named CronJobs in different namespaces must not share an issue"
+        assert severity_of(ra) is not None, "a long-stale CronJob must still be a finding"
 
         print("selftest OK")
         return 0
@@ -1238,7 +1295,6 @@ spec:
               image: python:3.12-slim
               command: ["python3", "/script/watchdog.py"]
               env:
-                - { name: NAMESPACE, value: "factory" }
                 - { name: FAIL_THRESHOLD, value: "2" }
                 - { name: OO_STREAM, value: "job_health" }
                 - { name: OO_ORG, value: "default" }
