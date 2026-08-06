@@ -88,6 +88,73 @@
 # so a probe that starts failing, stops being scheduled, or is deleted becomes
 # a `job_health` record and a GitHub issue with no extra wiring here.
 #
+# COVERAGE, AND WHY IT COSTS NOTHING -- Factory#574.
+#
+# Everything above measures whether a NAMED image verifies. It cannot see an
+# image that no `imageReferences` glob names at all: such an image is admitted
+# unexamined, produces no warning and no report row, and -- until this -- was
+# reported here as `pass`, because the probe read silence as success. That is
+# green-from-absence, the same defect as Factory#562 and #564, one level down
+# and inside the very thing built to catch it.
+#
+# `require-first-party-signature-coverage` (apps/kyverno-policies) closes that
+# class for long-running workloads via a standing PolicyReport row. It CANNOT
+# close it for ephemeral Job Pods, because it is a `validate` rule and those
+# emit no admission warning at Audit -- measured on kyverno v1.18.2:
+#
+#   rule type       admission Warning     standing PolicyReport result
+#   verifyImages    yes                   yes
+#   validate+deny   NO                    yes
+#
+# So for a first-party image used only by Jobs, neither channel says anything.
+#
+# THE ANSWER IS ALREADY IN THE RESPONSE WE ALREADY READ. Kyverno mutates the
+# admitted object with `kyverno.io/verify-images`, a map of every image a
+# verifyImages rule EXAMINED to `pass`/`fail`. A dry-run create returns the
+# mutated object, so that map arrives in the same response as the Warning
+# headers. Measured live on the probe's own Pod:
+#
+#   {"ghcr.io/olafkfreund/skillai:5ecfd51ba504":"pass",
+#    "ghcr.io/olafkfreund/tfactory-runner-nix:latest":"fail",
+#    "ghcr.io/olafkfreund/tfactory-runner-pytest:latest":"pass"}
+#
+# Present (either value) = a rule named it, so it is COVERED and its signature
+# verdict is the separate axis measured above. ABSENT = no rule named it. That
+# is Factory#574's question, answered by the webhook itself.
+#
+# THREE SHAPES WERE BUILT AND MEASURED BEFORE THIS ONE. Do not re-litigate them
+# without re-measuring:
+#
+#   * A second catch-all `verifyImages` rule purely for the warning channel
+#     (Factory#574 option 2). Built, applied to this cluster, measured. It is
+#     UNATTRIBUTABLE: it emits at most ONE warning per rule per request no
+#     matter how many images are uncovered, and it names the image only when
+#     some OTHER image on the same Pod verified -- otherwise the message is the
+#     bare `image is not verified`, naming nothing. Five uncovered images on one
+#     Pod produced one nameless warning. Recovering per-image attribution needs
+#     one Pod per image, and it also adds an admission-time PolicyReport row
+#     that background never re-checks. Strictly worse than reading the map.
+#   * Re-implementing Kyverno's glob matching in this script against the globs
+#     read from the live ClusterPolicy. No policy change, but it answers from a
+#     second matcher that can disagree with the webhook -- and `skillai:*` not
+#     matching `skillai-migrator:*` is exactly the trap that produced #564.
+#   * A `validationFailureActionOverrides` Enforce in a throwaway namespace, so
+#     the existing validate rule denies and returns its full message. Cleanest
+#     signal, but it flips a shared ClusterPolicy to Enforce, which is Factory
+#     #522 and explicitly out of scope.
+#
+# TWO CANARIES, BECAUSE THEY CATCH OPPOSITE LIES. The signature canary above is
+# also the coverage POSITIVE control: it is a `tfactory-runner-*` image, so it
+# can only report `signature` while that glob exists. Delete the glob and it
+# reports `not_covered`, which breaks its contract instead of quietly
+# reclassifying eleven images. COVERAGE_CANARY is the negative control: an
+# image nothing names, which must come back `not_covered`; if it ever reads
+# covered, a glob has been widened to match everything, manufacturing the
+# appearance of coverage. Neither is sufficient alone -- verified by running
+# this probe into a namespace no rule matches, where the coverage canary was
+# SATISFIED (`not_covered`, as demanded) while the signature canary correctly
+# voided the run.
+#
 # ADDED COST. Twelve cosign verifications per run, four runs a day = 48
 # registry+Rekor round trips a day, ~2/hour. Factory#444 measured the existing
 # background scan at ~50/hour (~1200/day), so this adds roughly 4%. The runs
@@ -97,11 +164,20 @@
 # positive-only, so the two failures are re-verified against ghcr.io every time
 # regardless.
 #
+# The coverage check adds ZERO to that. It reads a field of a response the
+# probe already receives, and the two images added for it (`odin` and the
+# coverage canary) are named by no rule, so Kyverno fetches nothing for them --
+# being unexamined is the whole point of carrying them. Total remains ~4%.
+#
 # READING THE RESULT.
 #   kubectl -n factory logs job/<run>            # the table, one line per image
 #   OpenObserve: SELECT * FROM "image_signature_probe" ORDER BY _timestamp DESC
 #
-# Refs Factory#562, #522, #524, #563, #430, #444.
+# `reason=not_covered` is a coverage gap, not a signature verdict: nothing
+# looked at that image. `reason=signature` is the opposite -- something looked
+# and it is genuinely unsigned. Do not read the first as the second.
+#
+# Refs Factory#562, #574, #564, #522, #524, #563, #572, #430, #444.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -177,11 +253,18 @@ data:
        behind what looked like a signing problem (Factory#430). Every failure is
        classified from the specific message text and the reason is reported.
 
+    3. UNSIGNED vs UNEXAMINED. An image no `imageReferences` glob NAMES is not
+       verified, it is unlooked-at -- silent in both reporting channels, and
+       reported here as `pass` until Factory#574. The verify-images annotation
+       Kyverno returns on the same response says which images a rule actually
+       examined; anything missing from it is `not_covered`, never `pass`.
+
     Env:
-      IMAGES         newline/comma separated image refs (default: the eleven)
-      CANARY_IMAGE   image whose verdict is known-red (default: unsigned pytest)
-      CANARY_EXPECT  required canary classification (default "signature")
-      PROBE_NS       namespace to dry-run into (default "factory")
+      IMAGES           newline/comma separated image refs (default: the eleven)
+      CANARY_IMAGE     image whose verdict is known-red (default: unsigned pytest)
+      CANARY_EXPECT    required canary classification (default "signature")
+      COVERAGE_CANARY  image that must be covered by NO rule (Factory#574)
+      PROBE_NS         namespace to dry-run into (default "factory")
       OBSERVE_URL    OpenObserve base url (default in-cluster service)
       OO_ORG/OO_STREAM/OO_USER/OO_PASS   OpenObserve delivery, as elsewhere
 
@@ -216,7 +299,39 @@ data:
     ghcr.io/olafkfreund/tfactory-runner-cloud:latest
     ghcr.io/olafkfreund/tfactory-runner-nix:latest
     ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-bbd4400
+    ghcr.io/olafkfreund/odin:sha-2749b26
     """
+
+    # Factory#574. An image no verifyImages rule NAMES is not "verified", it is
+    # unexamined -- and it is silent in both reporting channels, which is the
+    # bug this list of images cannot see on its own. See COVERAGE below.
+    #
+    # ghcr.io/olafkfreund/odin is in the list above for exactly that reason. It
+    # is not a runner and not a Job image; it is the one first-party image known
+    # to be covered by NO rule today (Factory#572 -- signed, but its GHCR
+    # package is private and `kyverno-ghcr-pull` does not exist, so a rule would
+    # report UNAUTHORIZED in the same words a signature failure uses). It is
+    # carried here so this record states the true first-party position rather
+    # than a runner-only slice of it, and so the honest red is in the evidence.
+    # DO NOT remove it to make the verdict green; remove it when #572 closes and
+    # odin has a rule, at which point it will report `pass` on its own.
+    #
+    # The tag does not need chasing when odin redeploys. Coverage is decided by
+    # the repository globs, and NO glob names `odin` at any tag, so the verdict
+    # is `not_covered` whatever is pinned here. It is set to the tag actually
+    # running only so the record names something real -- Factory#568 recorded
+    # sha-50b5932, the cluster has since moved to sha-2749b26, and the verdict
+    # was identical for both.
+    FIRST_PARTY = re.compile(r"^ghcr\.io/olafkfreund/")
+
+    # The negative half of the coverage contract. First-party, and named by no
+    # rule that exists or could sanely be written, so it MUST come back
+    # uncovered. If it ever reads covered, some glob has been widened to
+    # something like `ghcr.io/olafkfreund/*` -- which manufactures the
+    # appearance of coverage without any, the exact failure mode of Factory#564
+    # -- and the whole run is void. Costs nothing: no rule matches it, so
+    # Kyverno makes no registry or Rekor call for it.
+    COVERAGE_CANARY = "ghcr.io/olafkfreund/kyverno-coverage-canary-never-covered:v0"
 
     # A PUBLIC tfactory-runner-pytest tag published before TFactory#947/#949
     # added cosign signing. Publicly readable, so a failure here cannot be
@@ -238,6 +353,10 @@ data:
     # PURPOSE. A Sigstore/DNS failure (Factory#430) can wrap text that looks
     # like anything else, and misreading it as a signature verdict is the
     # specific mistake that cost weeks.
+    #
+    # `not_covered` is deliberately NOT in this table. It is not derived from a
+    # message, because there is no message -- it is the absence of any rule
+    # having looked. See verdicts().
     CLASSES = [
         ("transport", r"fulcio|tuf-repo-cdn|initializing tuf|no such host|"
                       r"server misbehaving|dial tcp|i/o timeout|"
@@ -281,16 +400,35 @@ data:
         return out
 
 
-    def verdicts(images: list[str], warnings: list[str]) -> dict[str, dict]:
-        """Fold warnings into one verdict per image.
+    def verdicts(images: list[str], warnings: list[str], verified: dict) -> dict[str, dict]:
+        """Fold warnings and the verify-images annotation into one verdict.
 
         An image with no warning at all passed -- BUT ONLY IF THE RULE RAN, and
         establishing that is the canary's job, not this function's. Measured on
         kyverno v1.18.2 with twelve simultaneously-failing images: all twelve
         were named in distinct Warning headers, so absence here is absence of a
         complaint and not header truncation.
+
+        FACTORY#574. That is true of images a rule NAMES. For an image no glob
+        names, silence means nobody looked -- and reading that as `pass` is
+        green-from-absence, the identical defect one level down from the one
+        this probe exists to close. `verified` is Kyverno's own answer to
+        "which images did a rule examine", so an image missing from it is
+        reported `not_covered` and never `pass`.
         """
         res = {i: {"image": i, "verdict": "pass", "reason": "", "message": ""} for i in images}
+        for i in images:
+            if FIRST_PARTY.match(i) and i not in verified:
+                res[i].update(
+                    verdict="fail",
+                    reason="not_covered",
+                    message=(
+                        "no verifyImages rule in verify-factory-image-signatures "
+                        "names this image, so admission never checked its "
+                        "signature and it produces no pass and no fail there "
+                        "(Factory#564)"
+                    ),
+                )
         for w in warnings:
             m = FAILED.search(w)
             if m and m.group("img") in res:
@@ -309,8 +447,21 @@ data:
         return res
 
 
-    def probe(images: list[str], ns: str) -> list[str]:
-        """Dry-run one Pod carrying every image; return Kyverno's warnings."""
+    # Kyverno writes this onto the resource it admits: a map of every image a
+    # verifyImages rule EXAMINED to `pass`/`fail`. A dry-run create returns the
+    # mutated object, so the map comes back in the same response as the Warning
+    # headers, for no extra call. An image absent from it was named by no rule
+    # at all -- which is the Factory#574 question, answered by the webhook
+    # itself rather than by re-implementing Kyverno's glob matching here.
+    VERIFY_ANN = "kyverno.io/verify-images"
+
+
+    def probe(images: list[str], ns: str) -> tuple[list[str], dict]:
+        """Dry-run one Pod carrying every image.
+
+        Returns Kyverno's warnings and its verify-images annotation. Both come
+        from the one POST; see VERIFY_ANN.
+        """
         with open(f"{SA}/token") as fh:
             token = fh.read().strip()
         pod = {
@@ -355,7 +506,18 @@ data:
         )
         ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
         with urllib.request.urlopen(req, context=ctx, timeout=180) as r:
-            return parse_warnings(r.headers.get_all("Warning") or [])
+            warnings = parse_warnings(r.headers.get_all("Warning") or [])
+            body = json.load(r)
+        ann = (body.get("metadata") or {}).get("annotations") or {}
+        # A malformed or absent annotation must read as "nothing was examined",
+        # never as "everything is fine" -- {} makes every first-party image
+        # report not_covered, and the coverage canary contract then voids the
+        # run rather than letting it stand as a wall of misleading reds.
+        try:
+            verified = json.loads(ann.get(VERIFY_ANN) or "{}")
+        except ValueError:
+            verified = {}
+        return warnings, (verified if isinstance(verified, dict) else {})
 
 
     def notify(record: dict) -> None:
@@ -408,6 +570,7 @@ data:
         images = [s.strip() for s in re.split(r"[\s,]+", raw) if s.strip()]
         canary = os.environ.get("CANARY_IMAGE", DEFAULT_CANARY).strip()
         expect = os.environ.get("CANARY_EXPECT", "signature").strip()
+        cov_canary = os.environ.get("COVERAGE_CANARY", COVERAGE_CANARY).strip()
 
         record = {
             "_timestamp": int(datetime.now(timezone.utc).timestamp() * 1_000_000),
@@ -417,23 +580,28 @@ data:
             "rule": "verify-tfactory-runner-signature",
         }
 
+        submitted = images + [i for i in (canary, cov_canary) if i]
         try:
-            warnings = probe(images + ([canary] if canary else []), ns)
+            warnings, verified = probe(submitted, ns)
         except Exception as e:  # noqa: BLE001 -- any failure means no evidence
             eprint(f"ERROR: probe could not run: {e!r}")
             record.update(status="not_checked", problem=f"probe could not run: {e!r}")
             notify(record)
             return 3
 
-        res = verdicts(images + ([canary] if canary else []), warnings)
+        res = verdicts(submitted, warnings, verified)
         rows = [res[i] for i in images]
         crow = res.get(canary, {}) if canary else {}
+        covrow = res.get(cov_canary, {}) if cov_canary else {}
 
-        eprint(f"probe: {len(images)} runner images via dryRun=All in ns/{ns}")
+        eprint(f"probe: {len(images)} first-party images via dryRun=All in ns/{ns}")
         render(rows)
         if canary:
             eprint("canary (must be RED, proves the rule actually ran):")
             render([crow])
+        if cov_canary:
+            eprint("coverage canary (must be `not_covered`, proves coverage is real):")
+            render([covrow])
 
         record.update(
             checked=len(rows),
@@ -441,18 +609,36 @@ data:
             failed=sum(r["verdict"] == "fail" for r in rows),
             reasons=sorted({r["reason"] for r in rows if r["reason"]}),
             images=rows,
+            uncovered=[r["image"] for r in rows if r["reason"] == "not_covered"],
             canary={
                 "image": canary,
                 "expect": expect,
                 "observed": crow.get("reason") or crow.get("verdict"),
                 "ok": bool(canary) and crow.get("reason") == expect,
             },
+            coverage_canary={
+                "image": cov_canary,
+                "expect": "not_covered",
+                "observed": covrow.get("reason") or covrow.get("verdict"),
+                "ok": bool(cov_canary) and covrow.get("reason") == "not_covered",
+            },
         )
 
-        # THE CONTRACT. Silence from the canary means the rule did not run, and
-        # every `pass` above is then an artefact of nothing happening -- exactly
-        # the Factory#562 failure. Any canary result other than the expected
-        # cause invalidates the whole run, including the greens.
+        # THE CONTRACT, BOTH SIDES. Each canary catches a different way for this
+        # probe to lie, and either one failing voids the run including its
+        # greens.
+        #
+        # Signature canary -- silence means the rule did not run, and every
+        # `pass` above is then an artefact of nothing happening (Factory#562).
+        # It doubles as the coverage POSITIVE control: it is a
+        # `tfactory-runner-*` image, so it can only report `signature` if that
+        # glob still exists. Delete the glob and it reports `not_covered`
+        # instead, which breaks this contract rather than quietly reclassifying
+        # eleven images.
+        #
+        # Coverage canary -- must come back `not_covered` (Factory#574). If it
+        # reads covered, a glob has been widened to match everything, which
+        # manufactures coverage without providing any.
         if canary and crow.get("reason") != expect:
             got = crow.get("reason") or "SILENT (no warning at all)"
             eprint(
@@ -462,6 +648,18 @@ data:
             )
             record["status"] = "not_checked"
             record["problem"] = f"canary expected {expect}, got {got}"
+            notify(record)
+            return 2
+
+        if cov_canary and covrow.get("reason") != "not_covered":
+            got = covrow.get("reason") or covrow.get("verdict") or "SILENT"
+            eprint(
+                f"ERROR: coverage canary contract broken -- expected 'not_covered', "
+                f"got {got!r}. An image nothing should name reads as covered, so "
+                "`covered` above means nothing. The verdicts are NOT evidence."
+            )
+            record["status"] = "not_checked"
+            record["problem"] = f"coverage canary expected not_covered, got {got}"
             notify(record)
             return 2
 
@@ -508,13 +706,39 @@ data:
 
         nix = "ghcr.io/olafkfreund/tfactory-runner-nix:latest"
         ok = "ghcr.io/olafkfreund/tfactory-runner-jest:latest"
-        v = verdicts([nix, ok], [auth, f"unverified image {nix}"])
+        seen = {nix: "fail", ok: "pass"}
+        v = verdicts([nix, ok], [auth, f"unverified image {nix}"], seen)
         assert v[nix]["verdict"] == "fail" and v[nix]["reason"] == "registry_auth", v[nix]
         assert v[ok]["verdict"] == "pass", "an image nobody complained about passed"
         # The bare message alone carries no cause and must not be dressed up as
         # one -- that conflation IS Factory#430.
-        v = verdicts([nix], [f"unverified image {nix}"])
+        v = verdicts([nix], [f"unverified image {nix}"], {nix: "fail"})
         assert v[nix]["reason"] == "unknown", v[nix]
+
+        # --- Factory#574: covered vs not checked -------------------------------
+        # Silence about an image NO rule names is not a pass. This is the whole
+        # issue: without the annotation, `ok` below is indistinguishable from a
+        # verified image.
+        v = verdicts([ok], [], {})
+        assert v[ok]["reason"] == "not_covered", v[ok]
+        assert v[ok]["verdict"] == "fail", "an unexamined image must never read pass"
+        # Present in the annotation, even as `fail`, means a rule DID name it --
+        # that is covered, and the signature verdict is a separate axis.
+        v = verdicts([nix], [auth], {nix: "fail"})
+        assert v[nix]["reason"] == "registry_auth", v[nix]
+        # Third-party images are out of scope by design (Factory#564): absence
+        # from the annotation says nothing about them and must not be reported.
+        pg = "postgres:16"
+        v = verdicts([pg], [], {})
+        assert v[pg]["verdict"] == "pass" and v[pg]["reason"] == "", v[pg]
+        # A wiped or unparseable annotation must make everything not_covered,
+        # never leave the greens standing.
+        v = verdicts([nix, ok], [], {})
+        assert all(r["reason"] == "not_covered" for r in v.values()), v
+        # The coverage canary must be recognised as uncovered, and it is
+        # first-party so the regex has to match it.
+        assert FIRST_PARTY.match(COVERAGE_CANARY), COVERAGE_CANARY
+        assert verdicts([COVERAGE_CANARY], [], {})[COVERAGE_CANARY]["reason"] == "not_covered"
         # Warn-value envelope unwrapping.
         assert parse_warnings(['299 - "hello \\"x\\""']) == ['hello "x"']
         assert parse_warnings(["bare text"]) == ["bare text"]
