@@ -1,0 +1,55 @@
+# The k3s CoreDNS Corefile, with ONE line changed: the forward upstream.
+#
+# ONLY the Corefile key is declared here. `NodeHosts` is deliberately absent —
+# k3s owns and rewrites it as nodes join and leave, and this Application syncs
+# with ServerSideApply so field ownership is split rather than contested. Adding
+# NodeHosts here would freeze node-name resolution at whatever was committed.
+#
+# The rest of this file is k3s's own template, reproduced verbatim so the diff
+# against a stock cluster is exactly the forward block. If a k3s upgrade changes
+# the template, ArgoCD will show this Application OutOfSync against the new
+# default — that is the intended signal to re-baseline, not a bug.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+          pods insecure
+          fallthrough in-addr.arpa ip6.arpa
+        }
+        hosts /etc/coredns/NodeHosts {
+          ttl 60
+          reload 15s
+          fallthrough
+        }
+        prometheus :9153
+        # Factory#571/#430: the node resolver (Docker bridge gw 172.18.0.1) only
+        # answers inside the node's own netns, so from pod netns it is a black hole
+        # and every external lookup in the cluster dies. Listed FIRST so the node
+        # resolver is still preferred once nixos_config#1232 makes it work; the
+        # public resolvers are the fallback forward's health-check fails over to.
+        #
+        # `policy sequential` and not the default random: with random, a third of
+        # lookups would still be aimed at the black hole and time out. Sequential
+        # means the list is an ORDER OF PREFERENCE, and forward's health-checking
+        # marks the dead upstream down and moves to the next. Measured on the live
+        # cluster: 8/8 external lookups resolved through this block while
+        # /etc/resolv.conf was still pointing at the unreachable 172.18.0.1.
+        forward . /etc/resolv.conf 1.1.1.1 8.8.8.8 {
+          policy sequential
+        }
+        cache 30
+        loop
+        reload
+        loadbalance
+        import /etc/coredns/custom/*.override
+    }
+    import /etc/coredns/custom/*.server

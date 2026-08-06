@@ -1,0 +1,62 @@
+# coredns-upstream — give cluster DNS an upstream that actually answers (Factory#571, #430).
+#
+# THE FAILURE THIS EXISTS TO STOP. k3s points CoreDNS at the node's
+# /etc/resolv.conf, and on p510 Docker Engine 29 writes the bridge gateway
+# 172.18.0.1 there. That address only answers inside the node's own network
+# namespace, so from a POD it is a black hole: every external name in the
+# cluster fails with `Temporary failure in name resolution`, while everything
+# ending in .svc.cluster.local keeps working perfectly. That split is why the
+# outage reads as "some CronJobs died and some are fine" rather than "DNS is
+# down" — the survivors were simply the ones that never leave the cluster.
+#
+# Measured during Factory#571, from a pod on the server node:
+#   cluster-local via 10.43.0.10   10/10 OK
+#   external      via 10.43.0.10    0/10 FAIL
+#   external      via 1.1.1.1      OK, and raw TCP egress to :443 OK
+# CoreDNS's own log agreed: `[ERROR] plugin/errors: 2 . NS: read udp
+# 10.42.0.15:40722->172.18.0.1:53: i/o timeout`.
+#
+# WHY THIS IS DECLARED HERE AND NOT FIXED BY HAND. It has been fixed by hand
+# before, inside the node containers, and it came back — this time because the
+# agent node went unreachable at 03:13Z, CoreDNS was rescheduled onto the server
+# node, and the new pod came up with the untouched broken upstream. A repair
+# that lives only in a running pod is one eviction away from being gone. The
+# host-level fix belongs in nixos_config#1232 and has not landed; until it does,
+# this is what survives a pod restart, a node restart and a k3d recreate.
+#
+# WHY ServerSideApply IS LOAD-BEARING AND NOT A STYLE CHOICE. This ConfigMap is
+# k3s's, and its OTHER key, NodeHosts, is owned and continuously rewritten by the
+# k3s-supervisor as nodes come and go. A normal (client-side) apply of a manifest
+# containing only Corefile would DELETE NodeHosts and break node-name resolution
+# cluster-wide. Server-side apply tracks ownership per field, so ArgoCD owns
+# `data.Corefile` and k3s keeps `data.NodeHosts`. Verified against the live
+# object before this was committed: after applying Corefile alone with
+# --server-side, NodeHosts was still present and intact.
+#
+# WHY prune IS OFF AND THERE IS NO FINALIZER. Both exist to stop the same
+# accident: deleting or misconfiguring this Application must never be able to
+# delete the cluster's DNS configuration. Sync forward, never reap.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: coredns-upstream
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/coredns-upstream/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+  syncPolicy:
+    automated:
+      # NOT prune. See the header: this Application must never be able to remove
+      # the coredns ConfigMap.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      # Load-bearing. Without it, applying a Corefile-only manifest wipes the
+      # NodeHosts key that k3s owns.
+      - ServerSideApply=true
