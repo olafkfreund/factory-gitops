@@ -89,6 +89,18 @@ spec:
             # (default) until explicitly switched via CFACTORY_COPILOT_PROVIDER.
             - { name: OLLAMA_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OLLAMA_API_KEY } } }
             - { name: CFACTORY_AUDIT_HMAC_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_AUDIT_HMAC_SECRET } } }
+            # The chain forked once at entry 2178 under the pre-CFactory#310 write
+            # race. Both rows are genuine and every HMAC recomputes; relinking one
+            # is the edit the chain exists to detect, so the row stays as written
+            # and is declared here. Counted and shown on the Audit view, but not
+            # raising the verdict. Anything NOT listed still does — a regression of
+            # the append serialisation stays loud, and an acknowledgement only ever
+            # forgives `forked`, so listing an id cannot hide a later edit to it.
+            # Not a secret: it is an id, and the whole point is that it is reviewable.
+            # Read by CFactory#312 onwards; see factory-gitops#146. Inert on older
+            # images (settings carry extra="ignore"), which is what the deployed
+            # sha-bd374f3 is until CFactory ships #310/#312 to main.
+            - { name: CFACTORY_AUDIT_ACKNOWLEDGED_FORKS, value: "2178" }
             # RFC-0020 Phase 3 (#364): key-encryption key for the per-tenant git
             # credential store. Envelope encryption — this KEK wraps a per-record
             # data key and the credential is sealed with AES-256-GCM, so the
