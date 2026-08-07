@@ -27,6 +27,21 @@
 # service went dark -- bad credential, unwired env, uninstrumented app, crashed
 # exporter, a rebuild that dropped a Secret. Any cause, same alarm.
 #
+# THE SECOND HALF (Factory#607)
+#
+# Counting spans per service answers "is this service emitting". It cannot
+# answer "does the run's trace reach the work", and that is a different
+# question with a nastier failure mode: the PARR work happens in per-task
+# Kubernetes Jobs, and a Job handed a stale or fabricated TRACEPARENT emits a
+# perfectly healthy-looking <service>-job span -- under a trace nobody is
+# looking at. Every count-by-service check passes on that.
+#
+# So the block at the end of check.py asks the collector the actual property:
+# for each trace that has a job-side span in the window, does that trace also
+# hold a control-plane span? It is vacuous when no Jobs ran, which is why
+# <service>-job must NEVER be added to EXPECTED_SERVICES -- see the window
+# note below.
+#
 # WHY A CRONJOB
 #
 # job-watchdog sweeps EVERY CronJob in this namespace rather than a hardcoded
@@ -71,44 +86,54 @@ data:
     STREAM = os.environ.get("OBSERVE_TRACES_STREAM", "default")
     EXPECTED = [s.strip() for s in os.environ["EXPECTED_SERVICES"].split(",") if s.strip()]
     LOOKBACK_MIN = int(os.environ.get("LOOKBACK_MINUTES", "60"))
+    # Factory#607: spans emitted from inside a per-task Kubernetes Job carry a
+    # service name of this shape (job_dispatch.trace_env sets <service>-job).
+    JOB_SUFFIX = os.environ.get("JOB_SIDE_SUFFIX", "-job")
 
     email = os.environ["OBSERVE_EMAIL"]
     password = os.environ["OBSERVE_PASSWORD"]
     auth = base64.b64encode(f"{email}:{password}".encode()).decode()
 
     now = int(time.time())
-    body = json.dumps({
-        "query": {
-            "sql": f"SELECT service_name, count(*) AS n FROM {STREAM} GROUP BY service_name",
-            "start_time": (now - LOOKBACK_MIN * 60) * 1_000_000,
-            "end_time": now * 1_000_000,
-            "from": 0,
-            "size": 100,
-        }
-    }).encode()
 
-    req = urllib.request.Request(
-        f"{ENDPOINT}/api/{ORG}/_search?type=traces",
-        data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Basic {auth}"},
-    )
 
-    try:
-        raw = urllib.request.urlopen(req, timeout=60).read().decode()
-    except urllib.error.HTTPError as e:
-        # A collector that cannot be QUERIED is itself a reason to shout: it is
-        # the state in which every service looks silent and none of them is.
-        # Never print the response body unfiltered -- it can echo the request.
-        print(f"FAIL: collector query returned HTTP {e.code}; "
-              f"cannot tell whether any service is tracing", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:  # noqa: BLE001 - any transport failure is a real failure
-        print(f"FAIL: collector unreachable ({type(e).__name__}); "
-              f"cannot tell whether any service is tracing", file=sys.stderr)
-        sys.exit(1)
+    def query(sql, size=100):
+        body = json.dumps({
+            "query": {
+                "sql": sql,
+                "start_time": (now - LOOKBACK_MIN * 60) * 1_000_000,
+                "end_time": now * 1_000_000,
+                "from": 0,
+                "size": size,
+            }
+        }).encode()
+        req = urllib.request.Request(
+            f"{ENDPOINT}/api/{ORG}/_search?type=traces",
+            data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Basic {auth}"},
+        )
+        try:
+            raw = urllib.request.urlopen(req, timeout=60).read().decode()
+        except urllib.error.HTTPError as e:
+            # A collector that cannot be QUERIED is itself a reason to shout: it
+            # is the state in which every service looks silent and none is.
+            # Never print the response body unfiltered -- it can echo the request.
+            print(f"FAIL: collector query returned HTTP {e.code}; "
+                  f"cannot tell whether any service is tracing", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:  # noqa: BLE001 - any transport failure is a real failure
+            print(f"FAIL: collector unreachable ({type(e).__name__}); "
+                  f"cannot tell whether any service is tracing", file=sys.stderr)
+            sys.exit(1)
+        return json.loads(raw).get("hits", [])
 
-    counts = {h["service_name"]: h.get("n", 0) for h in json.loads(raw).get("hits", [])}
+
+    counts = {
+        h["service_name"]: h.get("n", 0)
+        for h in query(f"SELECT service_name, count(*) AS n FROM {STREAM} "
+                       f"GROUP BY service_name")
+    }
 
     silent = [s for s in EXPECTED if counts.get(s, 0) <= 0]
     for s in EXPECTED:
@@ -130,6 +155,66 @@ data:
         sys.exit(1)
 
     print(f"\nOK: all {len(EXPECTED)} services emitted spans in the last {LOOKBACK_MIN}m")
+
+    # ── Factory#607: did the job-side spans actually JOIN a run's trace? ──────
+    #
+    # The check above asks whether a service is emitting. It cannot ask the
+    # question Factory#607 is about, because the interesting failure emits
+    # perfectly: a Job handed a stale or fabricated TRACEPARENT produces a
+    # healthy-looking <service>-job span under a trace nobody is looking at.
+    # Verified as a mutation on 2026-08-07 -- the orphan landed in this
+    # collector under trace abab...abab while the run's own trace held only its
+    # control-plane span. Counting spans by service name passes that case.
+    #
+    # So: for every trace that has a job-side span in the window, assert the
+    # trace ALSO holds a control-plane span. That is the property "the trace
+    # crosses the Job boundary", stated as something the collector can answer.
+    #
+    # Deliberately VACUOUS WHEN IDLE. Jobs are dispatched per PARR task, not on
+    # a timer, so an hour with no builds legitimately has no job-side spans --
+    # and a check that goes red because the factory was quiet is a check people
+    # learn to ignore. This is why <service>-job must NEVER be added to
+    # EXPECTED_SERVICES: that list is for pods a kubelet probes every 10s.
+    job_traces = {
+        h["trace_id"]
+        for h in query(f"SELECT trace_id FROM {STREAM} "
+                       f"WHERE service_name LIKE '%{JOB_SUFFIX}'", size=200)
+        if h.get("trace_id")
+    }
+    if not job_traces:
+        print(f"  (no job-side spans in the last {LOOKBACK_MIN}m -- no PARR Jobs "
+              f"ran, nothing to check)")
+        sys.exit(0)
+
+    ids = ", ".join(f"'{t}'" for t in job_traces)
+    spans_by_trace = {}
+    for h in query(f"SELECT trace_id, service_name FROM {STREAM} "
+                   f"WHERE trace_id IN ({ids})", size=1000):
+        spans_by_trace.setdefault(h["trace_id"], set()).add(h["service_name"])
+
+    orphaned = [
+        t for t in job_traces
+        if not any(not s.endswith(JOB_SUFFIX) for s in spans_by_trace.get(t, ()))
+    ]
+    print(f"\n  {len(job_traces)} trace(s) with a job-side span; "
+          f"{len(job_traces) - len(orphaned)} of them cross the Job boundary")
+
+    if orphaned:
+        print(
+            f"\nFAIL: {len(orphaned)} of {len(job_traces)} traces hold a job-side "
+            f"span and NO control-plane span: {', '.join(sorted(orphaned)[:5])}\n"
+            f"\nThe Job emitted, so this is not a silent exporter -- the trace "
+            f"context did not survive the dispatch. Check, in this order:\n"
+            f"  1. does the Job manifest carry TRACEPARENT?  -> job_dispatch.trace_env\n"
+            f"  2. is it the DISPATCHING span's traceparent, or a stale one?\n"
+            f"  3. did the control-plane span itself fail to export?\n"
+            f"     -> then the Job is fine and the parent is the silent half\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("OK: every job-side span in the window belongs to a trace that also "
+          "holds a control-plane span")
 ---
 apiVersion: batch/v1
 kind: CronJob
