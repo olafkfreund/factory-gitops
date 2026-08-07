@@ -26,6 +26,17 @@ spec:
   template:
     metadata: { labels: { app: cfactory } }
     spec:
+      # Factory#550. No SA token in this pod. The CFactory backend has no
+      # in-cluster API caller at all: the only match for "kubernetes" anywhere
+      # under apps/ is an @xterm/xterm README in node_modules. It also runs under
+      # the `default` SA, which has no RoleBinding in this namespace.
+      #
+      # Stated EXPLICITLY rather than left to the default, because the default is
+      # `true` and an unset field records no decision. Factory#504's
+      # chart-vs-gitops gate compares this against charts/cfactory/values.yaml
+      # (which already declares false), so the two engines now agree by check
+      # rather than by luck. Related: Factory#42, Factory#570.
+      automountServiceAccountToken: false
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       # Factory#503. Every CronJob in this namespace has carried this set since
@@ -195,6 +206,10 @@ spec:
   template:
     metadata: { labels: { app: cfactory-frontend } }
     spec:
+      # Factory#550. Static nginx serving the built cockpit bundle — it has no
+      # reason to hold a Kubernetes credential, and no kubectl on PATH. Same
+      # reasoning as the backend above.
+      automountServiceAccountToken: false
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       # Factory#503. This pod had NO securityContext at all — not even fsGroup —
