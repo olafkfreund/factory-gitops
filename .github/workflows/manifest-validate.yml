@@ -16,7 +16,9 @@
 # tools, zero kustomizations discovered, zero YAML discovered, a build that
 # produces no output, a file this gate cannot validate and has not been told to
 # skip, zero Kyverno policies discovered, zero Kyverno test suites discovered,
-# and a test suite that runs zero cases.
+# a test suite that runs zero cases, and -- the one that is easy to miss -- a
+# test case that expects a verdict and got no result at all, which the Kyverno
+# CLI scores as a pass (#148).
 name: manifest validation (blocking)
 
 on:
@@ -35,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install kustomize, kubeconform and the Kyverno CLI
+      - name: Install kustomize, kubeconform, yq and the Kyverno CLI
         run: |
           set -euo pipefail
           curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
@@ -51,10 +53,23 @@ jobs:
           # a policy the webhook accepts failing here.
           curl -sfL https://github.com/kyverno/kyverno/releases/download/v1.18.2/kyverno-cli_v1.18.2_linux_x86_64.tar.gz \
             | tar -xz -C /usr/local/bin kyverno
+          # #148 needs to read a test suite's `results:` back out of YAML, and
+          # those suites use anchors and aliases, so a grep is not a parser.
+          # Pinned and downloaded rather than taken from the runner image: yq
+          # IS preinstalled on ubuntu-latest today, and a gate whose correctness
+          # depends on undeclared image contents is a gate that breaks the week
+          # that image changes.
+          curl -sfL https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_amd64 \
+            -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
           # Rule 4.7: prove the tools are usable before claiming anything passed.
           # A download that 404s into a 0-byte file still leaves a file behind.
           kustomize version
           kubeconform -v
+          yq --version
+          # The #148 assertion is a python script. It imports the standard
+          # library only (json), so this proves everything it needs.
+          python3 --version
           kyverno version
 
       - name: Build every kustomization and schema-check every manifest
@@ -302,6 +317,16 @@ jobs:
           # -v 4 is required: at default verbosity the CLI prints a misleading
           # "Policies Skipped (as required variables are not provided)" and
           # hides the actual reason.
+          #
+          # -v 4 also emits one `rule.name=` per rule the engine LOADED, autogen
+          # rules included. That is the authoritative inventory of what exists,
+          # taken from the engine rather than from a grep over YAML, and the
+          # test step below needs it (#148): a rule a suite NAMES but the policy
+          # no longer HAS is reported Excluded for every one of its cases, and
+          # Excluded passes. Collecting it here costs nothing -- the command was
+          # already being run for its own sake.
+          : > /tmp/kyverno-rule-inventory.txt
+
           fail=0
           for f in "${POLICIES[@]}"; do
             out=$(kyverno apply "$f" --resource /tmp/kyverno-probe.yaml -v 4 2>&1)
@@ -317,6 +342,13 @@ jobs:
             elif printf '%s\n' "$out" | grep -q 'error='; then
               echo "::error file=$f::kyverno reported an error while loading this policy"
             else
+              # The first sed strips the ANSI colouring zerolog writes even
+              # under --remove-color, which otherwise sits between `rule.name=`
+              # and the name itself.
+              printf '%s\n' "$out" \
+                | sed 's/\x1b\[[0-9;]*m//g' \
+                | sed -n 's/.*[[:space:]]rule\.name=\([^[:space:]]\{1,\}\).*/\1/p' \
+                >> /tmp/kyverno-rule-inventory.txt
               echo "ok  kyverno    $f  ($rules rule(s) validated against Kyverno v1.18.2)"
               continue
             fi
@@ -324,6 +356,9 @@ jobs:
             printf '%s\n' "$out" | grep -E 'error=|Applying [0-9]+ policy rule' | head -10
             fail=1
           done
+
+          sort -u -o /tmp/kyverno-rule-inventory.txt /tmp/kyverno-rule-inventory.txt
+          echo "inventoried $(wc -l < /tmp/kyverno-rule-inventory.txt) loaded rule name(s) for the test step"
 
           # What this still does NOT catch, so nobody reads a green tick as
           # more than it is:
@@ -413,6 +448,109 @@ jobs:
           #      quietly turn this step green
           #   3. no summary line    -- the CLI did not get as far as running
           #   4. zero cases         -- it ran, and it ran nothing
+          #   5. a case that expects a real verdict and got no result at all
+          #
+          # Guard 5 is #148, and it is what makes coverage assertable at all.
+          # `kyverno test` v1.18.2 reports a resource for which a rule produced
+          # NO result as `Excluded`, and an Excluded row satisfies ANY expected
+          # result -- `skip`, `pass` and `fail` alike. So guards 1 to 4 all hold
+          # while the rule under test evaluates nothing whatsoever. Measured, on
+          # this repo, with this CLI: re-scoping
+          # require-first-party-signature-coverage to a namespace that does not
+          # exist still reports "15 tests passed and 0 tests failed", five
+          # expected-`fail` cases among them.
+          #
+          # The distinction the CLI will not draw, and this does:
+          #
+          #   pass / fail / warn / error  the rule evaluated this resource and
+          #                               returned that verdict. An unevaluated
+          #                               resource can NEVER satisfy this.
+          #   skip                        "this rule has nothing to say", which
+          #                               is honestly true both when the rule
+          #                               ran and declined (REASON Ok) and when
+          #                               it never matched at all (Excluded).
+          #
+          # So the assertion needs no allowlist and no edit to any suite: an
+          # Excluded row is a failure exactly when the suite expected a verdict.
+          # All three committed suites pass unchanged -- the 84 negative cases in
+          # kyverno-test-verify-factory-image-signatures.yaml are Excluded by
+          # design and stay legal.
+          #
+          # NOTHING HERE TOUCHES THE NETWORK, and that is a constraint rather
+          # than a side note. The obvious way to assert coverage would be a
+          # positive case on verify-factory-image-signatures, but a MATCHED
+          # image reference sends the CLI to ghcr.io -- verdict `fail` when it
+          # is reachable and `error` when it is not -- which would put a
+          # third-party outage inside a required status check. #149 declined
+          # that trade and so does this. The two `kyverno test` runs and the yq
+          # read are all local.
+          cat > /tmp/assert-evaluated.py <<'PYEOF'
+          import json, sys
+
+          # argv: <suite path, for the annotation> <suite .results as JSON> <rule inventory>
+          # stdin: `kyverno test ... -o json` output, wrapped in CLI chatter.
+          suite_path, expected_json, inventory_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          raw = sys.stdin.read()
+          lo, hi = raw.find("["), raw.rfind("]")
+          if lo < 0 or hi < lo:
+              print(f"::error file={suite_path}::kyverno test -o json produced no JSON array -- this check cannot confirm anything")
+              sys.exit(1)
+          rows = json.loads(raw[lo:hi + 1])
+          if not rows:
+              print(f"::error file={suite_path}::kyverno test -o json reported 0 cases")
+              sys.exit(1)
+
+          entries = json.load(open(expected_json)) or []
+          if not entries:
+              print(f"::error file={suite_path}::no `results` entries -- this suite asserts nothing")
+              sys.exit(1)
+
+          inventory = set(open(inventory_path).read().split())
+          if not inventory:
+              print(f"::error file={suite_path}::the rule inventory is empty -- this check cannot confirm anything")
+              sys.exit(1)
+
+          POSITIVE = {"pass", "fail", "warn", "error"}
+          UNEVALUATED = {"Excluded", "Invalid Policy"}
+
+          want = {}
+          for e in entries:
+              names = e.get("resources") or ([e["resource"]] if e.get("resource") else [])
+              for n in names:
+                  want[(e.get("policy"), e.get("rule"), e.get("kind"), n)] = str(e.get("result", "")).lower()
+
+          bad = 0
+
+          # 1. Every rule a suite names must be a rule the engine actually
+          #    loaded. A rule renamed or deleted in the policy leaves every case
+          #    naming it reported Excluded, which satisfies `skip` as happily as
+          #    `fail` -- so an all-negative suite goes on reporting all-pass
+          #    while asserting nothing at all. This is the only direction an
+          #    all-negative suite can be checked in without a network call.
+          reported = set()
+          for policy, rule, _, _ in want:
+              if rule and rule not in inventory and rule not in reported:
+                  reported.add(rule)
+                  print(f"::error file={suite_path}::`{rule}` is not a rule of any policy this gate loaded -- "
+                        f"every case naming it is reported Excluded and passes vacuously (#148)")
+                  bad = 1
+
+          # 2. Every case that expects a real verdict must have got one.
+          for r in rows:
+              parts = str(r.get("RESOURCE", "")).split("/")
+              if len(parts) < 3:
+                  continue
+              policy, rule, kind, name = r.get("POLICY"), r.get("RULE"), parts[1], parts[-1]
+              w = want.get((policy, rule, kind, name), want.get((policy, rule, None, name)))
+              if w in POSITIVE and r.get("REASON") in UNEVALUATED:
+                  print(f"::error file={suite_path}::case {r.get('ID')} expects `{w}` for {r.get('RESOURCE')}, but rule "
+                        f"`{rule}` produced NO result ({r.get('REASON')}) -- the CLI scores that as a pass (#148)")
+                  bad = 1
+
+          sys.exit(bad)
+          PYEOF
+
           fail=0
           for f in "${SUITES[@]}"; do
             out=$(kyverno test "$(dirname "$f")" -f "$(basename "$f")" 2>&1)
@@ -429,8 +567,13 @@ jobs:
               echo "::error file=$f::kyverno test ran 0 cases -- a suite that tests nothing cannot pass (#143)"
             elif [ "$rc" -ne 0 ] || [ "$failed" -ne 0 ]; then
               echo "::error file=$f::$failed of $((passed + failed)) Kyverno test case(s) failed -- a rule does not do what this suite says it does"
+            elif ! yq -o=json '.results' "$f" > /tmp/kyverno-expected.json; then
+              echo "::error file=$f::could not read \`results\` out of this suite -- this gate cannot confirm what it asserted"
+            elif ! kyverno test "$(dirname "$f")" -f "$(basename "$f")" -o json 2>/dev/null \
+                 | python3 /tmp/assert-evaluated.py "$f" /tmp/kyverno-expected.json /tmp/kyverno-rule-inventory.txt; then
+              echo "::error file=$f::a case this suite says must produce a verdict produced none -- the rule under test evaluated nothing (#148)"
             else
-              echo "ok  kyverno-test  $f  ($passed case(s) against Kyverno v1.18.2)"
+              echo "ok  kyverno-test  $f  ($passed case(s) against Kyverno v1.18.2, every expected verdict actually evaluated)"
               continue
             fi
 
@@ -439,14 +582,25 @@ jobs:
           done
 
           # What this still does NOT catch:
-          #   - Any policy no suite covers, which is #145. Today that is
-          #     verify-factory-image-signatures and
-          #     strip-last-applied-configuration-from-secrets: they load, they
-          #     are never evaluated here, and a dead expression in either would
-          #     still ship green. Coverage of policies by suites is not itself
-          #     measured -- adding a policy does not fail this step. Making it
-          #     fail is #145 step 2, and must land AFTER those two suites
-          #     exist or it wedges the required check.
+          #   - Any policy no suite covers. All three are covered today (#149),
+          #     but coverage of policies BY suites is not itself measured --
+          #     adding a fourth policy with no suite does not fail this step.
+          #     Making it fail is #145 step 2, which was gated on #148 for the
+          #     reason #145 gives: a coverage gate stacked on suites that
+          #     cannot fail measures the wrong thing. Guard 5 is what ungates it.
+          #   - A glob NARROWED until it covers nothing, in
+          #     verify-factory-image-signatures specifically. Measured:
+          #     `ghcr.io/olafkfreund/aifactory:*` tightened to `aifactory:v*`
+          #     still reports 84 passed, 0 failed, and still passes guard 5,
+          #     because every case in that suite is legitimately negative and
+          #     legitimately Excluded. Asserting the positive half means a
+          #     MATCHED image, which means a call to ghcr.io from a required
+          #     status check; that is a worse trade than the gap. The narrowing
+          #     direction is covered off-CI instead, by
+          #     require-first-party-signature-coverage, which reports any
+          #     first-party image in `factory` that its mirror list does not
+          #     name. Guard 5's rule-inventory half DOES catch the blunter
+          #     version of this -- a rule renamed or deleted outright.
           #   - Signature verification. No case here reaches a registry or
           #     rekor, by design; the suite is offline rule logic only.
           #   - Anything the webhook checks at admission time that the CLI does
