@@ -40,3 +40,18 @@ jobs:
             /tmp/watchdog_extracted.py
       - name: Selftest
         run: python3 /tmp/watchdog_extracted.py selftest
+
+      # restart-watchdog (Factory#561) is the other half of the same job: this
+      # one reports a CronJob that stopped working, that one reports a container
+      # stuck in a restart loop. Its assertions cover the same class of rule --
+      # what fires, what stays muted -- so they belong behind the same gate,
+      # added here as a step rather than a matrix so the required check keeps
+      # its existing name.
+      - name: Extract restart-watchdog's watchdog.py from the ConfigMap
+        run: |
+          python3 .github/scripts/extract_embedded_script.py \
+            apps/restart-watchdog/manifests/manifests.yaml \
+            watchdog.py \
+            /tmp/restart_watchdog_extracted.py
+      - name: Selftest (restart-watchdog)
+        run: python3 /tmp/restart_watchdog_extracted.py selftest

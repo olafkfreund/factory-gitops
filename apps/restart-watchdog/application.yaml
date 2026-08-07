@@ -1,0 +1,37 @@
+# restart-watchdog — container crash-loop detection and notification (Factory#561).
+#
+# A Deployment could restart every three minutes for ten days with nobody told:
+# kyverno-background-controller did exactly that (392 restarts), and
+# kyverno-cleanup-controller alongside it (257). apps/job-watchdog covers every
+# CronJob in the cluster; nothing covered Deployments, StatefulSets or
+# DaemonSets. This reads every pod every 30 minutes and opens a GitHub issue --
+# carrying the termination reason and exit code, not just the count -- when a
+# container is restarting NOW.
+#
+# It reuses job-watchdog's notification channel and secret exactly, and lives in
+# the `factory` namespace so job-watchdog's own CronJob monitoring watches it.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). ArgoCD syncs
+# the manifests/ kustomization into the `factory` namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: restart-watchdog
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/restart-watchdog/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

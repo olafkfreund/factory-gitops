@@ -1,0 +1,719 @@
+# Container restart watchdog -> GitHub issue (Factory#561).
+#
+# THE DEFECT THIS CLOSES: `kyverno-background-controller` restarted 392 times
+# over 10 days and `kyverno-cleanup-controller` 257 times, and nothing in the
+# fleet said so. It was found because a human happened to run
+# `kubectl -n kyverno get pods`. apps/job-watchdog already covers every CronJob
+# in the cluster (Factory#381, #439, #571) -- Deployments, StatefulSets and
+# DaemonSets had no equivalent, so a controller could exit every three minutes
+# indefinitely in total silence.
+#
+# WHY THAT SILENCE IS WORSE THAN IT LOOKS: the Kyverno background- and
+# reports-controllers are what produce the PolicyReports the fleet cites as
+# admission evidence (Factory#444, Factory#522). A controller dying every few
+# minutes can leave those reports stale or partial while the report objects
+# themselves still exist and still look present. That is the recurring shape:
+# an artefact that satisfies a control review while the control is not running.
+# It also destroys restart count as a signal in the other direction -- once a
+# pod sits at 392, a genuinely new crash loop is invisible against the noise.
+#
+# WHAT IT REPORTS, AND WHY NOT JUST THE COUNT: `restartCount` is a running
+# total for the life of the pod. It never decreases, so "count > N" alerts
+# forever about a pod that recovered days ago; and it resets on reschedule, so
+# a week-old crash loop reads as brand new the moment the pod moves. Neither
+# error is conservative. So the trigger is a RECENT termination plus a
+# meaningful count, and CrashLoopBackOff fires on its own because that is not a
+# rate question -- the workload is down right now.
+#
+# The issue body leads with `lastState.terminated`: reason, exit code, and how
+# long the container survived. Factory#561 cost a day precisely because a count
+# cannot tell `OOMKilled` from a liveness-probe kill from a clean `Completed`
+# exit, and those need three unrelated fixes. (It was the third: a lost leader
+# lease, caused by the node losing the API server -- see
+# apps/kyverno/manifests/kustomization.yaml.)
+#
+# NO NEW DELIVERY PATH AND NO NEW SECRET: this reuses apps/job-watchdog's exact
+# channel -- a GitHub issue on ALERT_REPO with the fleet `GITHUB_TOKEN` that is
+# already in `factory-secrets`. No Prometheus, no Alertmanager, no webhook. The
+# fleet has no pager and inventing one to close a notification gap is the wrong
+# trade; that reasoning is set out at length in apps/job-watchdog.
+#
+# IT DOES NOT EMIT TO OPENOBSERVE, deliberately. job-watchdog emits a health
+# record per CronJob per run because "no news" had to stop reading as OK for
+# things that run on a schedule. A container's health is not periodic -- it is
+# readable from the live API at any moment -- so a stream here would be write-
+# only data. The GitHub issue IS the durable record.
+#
+# WHO WATCHES THIS WATCHDOG: it is a CronJob in the `factory` namespace, and
+# job-watchdog reports staleness and failure for every CronJob in the cluster,
+# including this one. If this stops running, job-watchdog opens an issue about
+# it. That is a dead man's switch built out of something other than itself, so
+# this app deliberately grows no heartbeat of its own -- a second copy of that
+# machinery would be one more thing to keep working.
+#
+# IT EXITS 0 WHEN IT FINDS PROBLEMS. Non-zero here means only that THIS job
+# could not do its work (API unreachable, no token, notification refused). A
+# watchdog that goes red on its findings is indistinguishable from one that is
+# itself broken, and using job failure as the alert channel is the mistake
+# Factory#381 was about.
+#
+# App-of-apps auto-discovers apps/**/application.yaml.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: restart-watchdog
+  namespace: factory
+  labels: { app: restart-watchdog }
+---
+# Cluster-scoped and read-only, following apps/job-watchdog. Namespaced would
+# be the tighter grant, but it is the wrong one here: the workloads this exists
+# to catch are in `kyverno`, and job-watchdog was already widened for exactly
+# this reason (Factory#571) after `fides/fides-server-updater` sat wedged for
+# five days unwatched. A monitor with an unwatched edge reports health for
+# ground it is not standing on.
+#
+# `pods` only, `get`/`list` only. It never creates, patches or deletes
+# anything, and it reads no Secrets, ConfigMaps or logs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: restart-watchdog
+  labels: { app: restart-watchdog }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: restart-watchdog
+  labels: { app: restart-watchdog }
+subjects:
+  - kind: ServiceAccount
+    name: restart-watchdog
+    namespace: factory
+roleRef:
+  kind: ClusterRole
+  name: restart-watchdog
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: restart-watchdog-script
+  namespace: factory
+  labels: { app: restart-watchdog }
+data:
+  watchdog.py: |
+    #!/usr/bin/env python3
+    """Alert when a container is restarting, fleet-wide (Factory#561).
+
+    THE DEFECT THIS CLOSES: kyverno-background-controller restarted 392 times over
+    10 days and kyverno-cleanup-controller 257 times. Nothing noticed. It surfaced
+    because a human happened to run `kubectl -n kyverno get pods`. Every restart is
+    a cold informer cache and a window where that controller is doing nothing, and
+    the background/reports controllers are what produce the PolicyReports the fleet
+    cites as admission evidence (Factory#444, Factory#522).
+
+    WHY RESTART COUNT ALONE IS NOT THE SIGNAL: restartCount is cumulative for the
+    life of the pod and never decreases, so "count > N" keeps firing forever for a
+    pod that was sick on Tuesday and has been fine since. It is also reset by any
+    reschedule, so a pod that has been crash-looping for a week reads as brand new
+    the moment it moves nodes. Both errors point the same way -- the count is a
+    running total, and what matters is whether restarts are happening NOW.
+
+    So a container is reported when BOTH are true:
+      1. it has restarted at least MIN_RESTARTS times in this pod's life, and
+      2. its most recent termination was within the last WINDOW_HOURS.
+    plus, unconditionally, any container currently in CrashLoopBackOff -- that one
+    is not a rate question, it is down right now.
+
+    AND IT CARRIES THE EXIT REASON. "392 restarts" cost a day of investigation
+    because a count cannot tell OOMKilled from a liveness-probe kill from a clean
+    leader-election exit, and those need three completely different fixes. The
+    issue body leads with lastState.terminated: reason, exit code, and how long the
+    container survived.
+
+    KEYED ON THE WORKLOAD, NOT THE POD. A crash-looping Deployment is eventually
+    rescheduled and gets a new pod name; keying the issue on the pod name would
+    open a fresh issue for every reschedule, which is the crying-wolf failure that
+    gets a label muted within a week.
+
+    DELIVERY reuses apps/job-watchdog's channel exactly: a GitHub issue on
+    ALERT_REPO using the fleet GITHUB_TOKEN. No new secret, no new endpoint. It
+    opens on a finding, re-comments every ALERT_RENOTIFY_HOURS while it persists,
+    and CLOSES itself on recovery.
+
+    WHO WATCHES THIS WATCHDOG: it is a CronJob in the `factory` namespace, and
+    apps/job-watchdog already reports staleness and failure for every CronJob in
+    the cluster including this one. That is a real dead-man's switch built out of
+    something other than itself, so this script deliberately does NOT grow its own
+    heartbeat.
+
+    THE BOUNDARY WITH job-watchdog's KILL ATTRIBUTION (Factory#598,
+    factory-gitops#157), which also reads `lastState.terminated` fleet-wide. They
+    answer different questions and neither subsumes the other:
+
+      #157 asks WHAT KILLED THIS CONTAINER, once. It attributes a single abnormal
+      termination to a cause (runtime_lost, oom_killed, evicted, ...) and groups
+      node-scoped causes per node. It deliberately skips clean exits --
+      `if term.get("reason") == "Completed" and not term.get("exitCode"): continue`
+      -- because a container that exits 0 was not killed, and every completed
+      CronJob pod would otherwise be a finding. It also emits but never notifies
+      `app_error`, on the grounds that an ordinary non-zero exit is already visible
+      as a failed Job and a CrashLoopBackOff.
+
+      THIS asks IS THIS CONTAINER STUCK IN A LOOP. Repetition is the finding, and
+      the reason is carried along rather than being the trigger.
+
+    Factory#561 falls in the gap between them, twice over: 392 clean `Completed` /
+    exit 0 terminations are invisible to #157's kill path by design, and the
+    "already visible as a CrashLoopBackOff" argument does not hold for a Deployment
+    that restarts and comes back healthy each time -- it never enters
+    CrashLoopBackOff, never fails a Job, and shows nothing but a rising counter.
+
+    ponytail: a container that is BOTH repeatedly restarting AND infra-killed
+    (an OOM loop) will produce one issue here and one from #157. Left as is, because
+    they are two facts a human wants -- "killed by the OOM killer" and "for the
+    fortieth time" -- and suppressing one would need shared state between two
+    independently scheduled CronJobs. If the double-notify turns out to grate,
+    the cheap fix is to skip reasons in #157's NOTIFY_CODES here, at the cost of
+    never reporting a repeated OOM as a loop.
+
+    Run the checks below with `selftest` (the argument spelling the other eight
+    embedded scripts in this repo use, so one CI recipe extracts and runs them all).
+    `.github/workflows/job-watchdog-test.yml` runs it on every PR.
+
+    Exit codes: 0 = ran (whatever the findings), 2 = no GITHUB_TOKEN/ALERT_REPO,
+    3 = kubernetes API unreachable, 5 = notification could not be delivered.
+    Non-zero means THIS job is broken, never that a watched workload is -- a
+    watchdog that goes red on its findings is indistinguishable from one that is
+    itself broken.
+
+    Env:
+      MIN_RESTARTS          restarts before a running container is reported (5)
+      WINDOW_HOURS          how recent the last termination must be (6)
+      EXCLUDE_NAMESPACES    comma-separated namespaces to skip (default none)
+      ALERT_REPO            owner/repo to raise issues on
+      ALERT_RENOTIFY_HOURS  re-comment cadence while unhealthy (24)
+      GITHUB_TOKEN          token with `repo` scope on ALERT_REPO
+    """
+
+    import json
+    import os
+    import ssl
+    import sys
+    import urllib.error
+    import urllib.request
+    from datetime import datetime, timezone
+
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+    ISSUE_LABEL = "restart-watchdog"
+    SEVERITY_LABELS = {"critical": "severity:critical", "warning": "severity:warning"}
+    MARKER = "<!-- restart-watchdog:{key} -->"
+
+
+    def eprint(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    def _parse_ts(raw):
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+
+    def _dur(seconds):
+        if seconds is None:
+            return "unknown"
+        s = int(seconds)
+        if s < 90:
+            return f"{s}s"
+        if s < 5400:
+            return f"{s / 60:.0f}m"
+        if s < 172800:
+            return f"{s / 3600:.1f}h"
+        return f"{s / 86400:.1f}d"
+
+
+    def workload_key(pod):
+        """namespace/workload/container-stable identity that survives a reschedule.
+
+        ponytail: this reads the standard k8s name shape rather than walking
+        ownerReferences up to the Deployment, which would be one extra API call per
+        pod. A ReplicaSet-owned pod is always <workload>-<rs-hash>-<pod-hash>, so
+        dropping the last two segments recovers the Deployment name. If a workload
+        ever appears with dashes where the hash should be, walk the owner chain.
+        """
+        meta = pod["metadata"]
+        owners = meta.get("ownerReferences") or []
+        kind = owners[0]["kind"] if owners else ""
+        name = meta["name"]
+        if kind == "ReplicaSet":
+            parts = name.rsplit("-", 2)
+            return parts[0] if len(parts) == 3 else name
+        if kind:
+            # StatefulSet/DaemonSet/Job own their pods directly and their names are
+            # already stable (ordinals for StatefulSet, which we keep on purpose --
+            # "replica 3 is the one crash-looping" is the useful fact).
+            return owners[0]["name"] if kind != "StatefulSet" else name
+        return name
+
+
+    def assess(pod, now, min_restarts, window_hours):
+        """Return one record per unhealthy container, or []."""
+        st = pod.get("status") or {}
+        started = _parse_ts(st.get("startTime"))
+        pod_age = (now - started).total_seconds() if started else None
+        out = []
+        for cs in st.get("containerStatuses") or []:
+            restarts = cs.get("restartCount", 0)
+            term = (cs.get("lastState") or {}).get("terminated") or {}
+            waiting = (cs.get("state") or {}).get("waiting") or {}
+            crashloop = waiting.get("reason") == "CrashLoopBackOff"
+
+            finished = _parse_ts(term.get("finishedAt"))
+            since = (now - finished).total_seconds() if finished else None
+            recent = since is not None and since <= window_hours * 3600
+
+            if not crashloop and not (restarts >= min_restarts and recent):
+                continue
+
+            ran_for = None
+            began = _parse_ts(term.get("startedAt"))
+            if began and finished:
+                ran_for = (finished - began).total_seconds()
+
+            out.append({
+                "namespace": pod["metadata"]["namespace"],
+                "workload": workload_key(pod),
+                "container": cs["name"],
+                "pod": pod["metadata"]["name"],
+                "node": (pod.get("spec") or {}).get("nodeName"),
+                "restarts": restarts,
+                "reason": term.get("reason") or waiting.get("reason") or "unknown",
+                "exit_code": term.get("exitCode"),
+                "last_terminated_age_seconds": since,
+                "container_lifetime_seconds": ran_for,
+                "pod_age_seconds": pod_age,
+                "restarts_per_hour": (restarts / (pod_age / 3600)) if pod_age and pod_age > 60 else None,
+                "status": "crashloop" if crashloop else "restarting",
+            })
+        return out
+
+
+    def severity_of(record):
+        return "critical" if record["status"] == "crashloop" else "warning"
+
+
+    def key_of(record):
+        return f"{record['namespace']}/{record['workload']}/{record['container']}"
+
+
+    def issue_title(record):
+        r = record
+        if r["status"] == "crashloop":
+            return (f"{key_of(r)} is in CrashLoopBackOff "
+                    f"({r['restarts']} restarts, {r['reason']} exit {r['exit_code']})")
+        rate = r["restarts_per_hour"]
+        rate_s = f"{rate:.1f}/h" if rate else f"{r['restarts']} total"
+        return (f"{key_of(r)} is restarting at {rate_s} "
+                f"and exiting {r['reason']} ({r['exit_code']})")
+
+
+    def issue_body(record):
+        r = record
+        lines = [
+            MARKER.format(key=key_of(r)),
+            "",
+            f"`{key_of(r)}` has restarted **{r['restarts']}** times and terminated "
+            f"most recently **{_dur(r['last_terminated_age_seconds'])} ago**.",
+            "",
+            "## The termination, not the count",
+            "",
+            "A restart count cannot distinguish an OOM kill from a failed liveness "
+            "probe from a deliberate clean exit, and those need different fixes. "
+            "This is what the container actually reported:",
+            "",
+            "```",
+            f"reason              {r['reason']}",
+            f"exitCode            {r['exit_code']}",
+            f"ran for             {_dur(r['container_lifetime_seconds'])} before exiting",
+            f"restarts            {r['restarts']} over a {_dur(r['pod_age_seconds'])} pod lifetime",
+            "```",
+            "",
+            "Read it as: `OOMKilled` means raise the memory limit; a non-zero exit "
+            "with a short lifetime usually means a failing probe or a bad config; "
+            "**`Completed` / exit 0 means the process chose to exit** -- for a "
+            "leader-electing controller that is a lost lease, which is a "
+            "node-to-apiserver reachability question, not a resource one "
+            "(Factory#561).",
+            "",
+            "## Where",
+            "",
+            "```",
+            f"pod                 {r['namespace']}/{r['pod']}",
+            f"container           {r['container']}",
+            f"node                {r['node']}",
+            "```",
+            "",
+            "If several unrelated workloads on this same node report at once, the "
+            "node is the suspect, not any of them.",
+            "",
+            "## Reproduce",
+            "",
+            "```",
+            f"kubectl -n {r['namespace']} get pod {r['pod']} \\",
+            "  -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'",
+            f"kubectl -n {r['namespace']} logs {r['pod']} -c {r['container']} --previous",
+            "```",
+            "",
+            "---",
+            "Raised automatically by `apps/restart-watchdog`. It closes itself when "
+            "the container stops restarting.",
+        ]
+        return "\n".join(lines)
+
+
+    def k8s_get(path):
+        with open(f"{SA}/token") as f:
+            token = f.read().strip()
+        req = urllib.request.Request(
+            f"https://kubernetes.default.svc{path}",
+            headers={"authorization": f"Bearer {token}", "accept": "application/json"},
+            method="GET",
+        )
+        ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            return json.load(r)
+
+
+    def gh(token, method, path, body=None):
+        req = urllib.request.Request(
+            f"https://api.github.com{path}",
+            data=None if body is None else json.dumps(body).encode(),
+            headers={
+                "authorization": f"Bearer {token}",
+                "accept": "application/vnd.github+json",
+                "content-type": "application/json",
+                "user-agent": "factory-restart-watchdog",
+            },
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+    def ensure_labels(token, repo):
+        """Idempotent. A missing label makes the dedup query match nothing, which
+        would open a duplicate issue every run -- crying wolf on the first day."""
+        for name, color, desc in (
+            (ISSUE_LABEL, "1d76db", "Raised by the container restart watchdog"),
+            (SEVERITY_LABELS["critical"], "b60205", "The workload is down right now"),
+            (SEVERITY_LABELS["warning"], "fbca04", "Restarting, but currently up"),
+        ):
+            try:
+                gh(token, "POST", f"/repos/{repo}/labels",
+                   {"name": name, "color": color, "description": desc})
+            except urllib.error.HTTPError as e:
+                if e.code != 422:  # 422 = already exists
+                    raise
+
+
+    def open_issues(token, repo):
+        """marker -> issue, for every open issue this watchdog raised."""
+        issues = gh(token, "GET",
+                    f"/repos/{repo}/issues?state=open&labels={ISSUE_LABEL}&per_page=100") or []
+        out = {}
+        for i in issues:
+            for line in (i.get("body") or "").splitlines():
+                line = line.strip()
+                if line.startswith("<!-- restart-watchdog:"):
+                    out[line] = i
+                    break
+        return out
+
+
+    def issue_severity(issue):
+        have = {lbl["name"] for lbl in issue.get("labels") or []}
+        for sev, label in SEVERITY_LABELS.items():
+            if label in have:
+                return sev
+        return None
+
+
+    def notify_action(record, issue, now, renotify_hours):
+        """open | escalate | renotify | None. Pure, so the muting rules are testable."""
+        sev = severity_of(record)
+        if issue is None:
+            return "open"
+        if issue_severity(issue) != sev:
+            return "escalate"
+        updated = _parse_ts(issue.get("updated_at"))
+        if updated and (now - updated).total_seconds() >= renotify_hours * 3600:
+            return "renotify"
+        return None  # already reported and nothing changed: stay quiet
+
+
+    def notify(token, repo, records, live_keys, now, renotify_hours):
+        ensure_labels(token, repo)
+        existing = open_issues(token, repo)
+        sent = 0
+        for r in records:
+            marker = MARKER.format(key=key_of(r))
+            issue = existing.get(marker)
+            action = notify_action(r, issue, now, renotify_hours)
+            if action is None:
+                continue
+            sev = severity_of(r)
+            if action == "open":
+                new = gh(token, "POST", f"/repos/{repo}/issues", {
+                    "title": issue_title(r), "body": issue_body(r),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                eprint(f"NOTIFIED  {key_of(r)} [{sev}] -> opened {repo}#{new['number']}")
+            elif action == "escalate":
+                was = issue_severity(issue)
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+                   {"title": issue_title(r), "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]]})
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Severity changed: **{was} -> {sev}**.\n\n" + issue_body(r)})
+                eprint(f"NOTIFIED  {key_of(r)} [{was} -> {sev}] -> {repo}#{issue['number']}")
+            elif action == "renotify":
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"Still restarting after {renotify_hours:g}h with no "
+                            f"change in severity.\n\n" + issue_body(r)})
+                eprint(f"NOTIFIED  {key_of(r)} [still {sev}] -> {repo}#{issue['number']}")
+            sent += 1
+
+        # RECOVERY. An open issue whose workload is no longer restarting gets closed,
+        # because an alert that never clears is one nobody reads. The comment says
+        # WHICH recovery it saw: a workload that went quiet is good news, a workload
+        # that vanished entirely is the Factory#429 shape and a human should judge
+        # it -- so the two never get the same wording.
+        firing = {MARKER.format(key=key_of(r)) for r in records}
+        for marker, issue in existing.items():
+            if marker in firing:
+                continue
+            key = marker.split(":", 1)[1].rsplit("-->", 1)[0].strip()
+            if key in live_keys:
+                note = (f"RECOVERED. `{key}` is still running and has not restarted "
+                        "within the watchdog's window. Closing automatically.")
+            else:
+                note = (f"NO LONGER PRESENT. `{key}` was not found in the cluster at "
+                        "all on this run -- it may have been renamed, retired, or "
+                        "deleted. That is not the same as recovering, so it is "
+                        "stated rather than closed quietly. Closing; reopen if the "
+                        "workload should exist.")
+            gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments", {"body": note})
+            gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+               {"state": "closed", "state_reason": "completed"})
+            eprint(f"RECOVERED {key} -> closed {repo}#{issue['number']}")
+            sent += 1
+        return sent
+
+
+    def main():
+        min_restarts = int(os.environ.get("MIN_RESTARTS", "5"))
+        window_hours = float(os.environ.get("WINDOW_HOURS", "6"))
+        renotify = float(os.environ.get("ALERT_RENOTIFY_HOURS", "24"))
+        excluded = {n.strip() for n in os.environ.get("EXCLUDE_NAMESPACES", "").split(",") if n.strip()}
+        repo = os.environ.get("ALERT_REPO", "").strip()
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        if not repo or not token:
+            eprint("FATAL: ALERT_REPO and GITHUB_TOKEN are required -- an alerting "
+                   "job with no delivery path is the bug it exists to close.")
+            return 2
+
+        now = datetime.now(timezone.utc)
+        try:
+            pods = k8s_get("/api/v1/pods?limit=2000")["items"]
+        except Exception as e:  # noqa: BLE001 - any failure here means we are blind
+            eprint(f"FATAL: kubernetes API unreachable: {e}")
+            return 3
+
+        records, live = [], set()
+        for p in pods:
+            if p["metadata"]["namespace"] in excluded:
+                continue
+            for cs in (p.get("status") or {}).get("containerStatuses") or []:
+                live.add(f"{p['metadata']['namespace']}/{workload_key(p)}/{cs['name']}")
+            records.extend(assess(p, now, min_restarts, window_hours))
+
+        for r in sorted(records, key=lambda r: -r["restarts"]):
+            eprint(f"UNHEALTHY {key_of(r)} restarts={r['restarts']} "
+                   f"reason={r['reason']} exit={r['exit_code']} "
+                   f"last={_dur(r['last_terminated_age_seconds'])} ago")
+        eprint(f"scanned {len(pods)} pods, {len(records)} unhealthy container(s)")
+
+        try:
+            sent = notify(token, repo, records, live, now, renotify)
+        except Exception as e:  # noqa: BLE001 - an undelivered alert is a failure
+            eprint(f"FATAL: could not deliver notification: {e}")
+            return 5
+        eprint(f"notifications sent: {sent}")
+        return 0
+
+
+    def _selftest():
+        """The rules that decide whether a human is woken. Run: selftest"""
+        now = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
+
+        def pod(name, ns="kyverno", kind="ReplicaSet", start="2026-07-28T12:00:00Z",
+                restarts=0, reason="Completed", code=0, fin=None, began=None, waiting=None):
+            cs = {"name": "controller", "restartCount": restarts, "state": {}}
+            if fin:
+                cs["lastState"] = {"terminated": {"reason": reason, "exitCode": code,
+                                                  "finishedAt": fin, "startedAt": began or fin}}
+            if waiting:
+                cs["state"] = {"waiting": {"reason": waiting}}
+            else:
+                cs["state"] = {"running": {"startedAt": start}}
+            return {"metadata": {"name": name, "namespace": ns,
+                                 "ownerReferences": [{"kind": kind, "name": "owner"}] if kind else []},
+                    "spec": {"nodeName": "k3d-agent-0-0"},
+                    "status": {"startTime": start, "containerStatuses": [cs]}}
+
+        # The real Factory#561 pod: 392 restarts, last one 73 minutes ago.
+        hot = assess(pod("kyverno-background-controller-78b7b8c84c-28cns", restarts=392,
+                         fin="2026-08-07T10:47:00Z", began="2026-08-07T10:43:42Z"), now, 5, 6)
+        assert len(hot) == 1, hot
+        assert hot[0]["status"] == "restarting"
+        assert hot[0]["reason"] == "Completed" and hot[0]["exit_code"] == 0
+        # It must carry the lifetime, because 3m18s of uptime IS the finding.
+        assert 190 < hot[0]["container_lifetime_seconds"] < 210, hot[0]
+        assert severity_of(hot[0]) == "warning"
+
+        # THE REGRESSION THAT MATTERS: a big cumulative count that stopped days ago
+        # must NOT fire. restartCount never decreases, so a naive `count > N` check
+        # would alert on this pod forever and get the label muted.
+        cold = assess(pod("kyverno-background-controller-78b7b8c84c-28cns", restarts=392,
+                          fin="2026-08-01T10:47:00Z"), now, 5, 6)
+        assert cold == [], cold
+
+        # ...and the same pod one hour inside the window does fire again.
+        warm = assess(pod("x-aaaaaaaaaa-bbbbb", restarts=392, fin="2026-08-07T07:00:00Z"), now, 5, 6)
+        assert len(warm) == 1
+
+        # A recent restart below the threshold is noise, not an alert.
+        assert assess(pod("x-aaaaaaaaaa-bbbbb", restarts=1, fin="2026-08-07T11:00:00Z"),
+                      now, 5, 6) == []
+
+        # CrashLoopBackOff bypasses the count entirely: it is down NOW.
+        loop = assess(pod("x-aaaaaaaaaa-bbbbb", restarts=2, fin="2026-08-07T11:59:00Z",
+                          waiting="CrashLoopBackOff"), now, 5, 6)
+        assert len(loop) == 1 and loop[0]["status"] == "crashloop"
+        assert severity_of(loop[0]) == "critical"
+
+        # OOMKilled must survive into the record -- telling it apart from a clean
+        # exit is the whole reason this reports the reason and not just the count.
+        oom = assess(pod("x-aaaaaaaaaa-bbbbb", restarts=9, reason="OOMKilled", code=137,
+                         fin="2026-08-07T11:00:00Z"), now, 5, 6)
+        assert oom[0]["reason"] == "OOMKilled" and oom[0]["exit_code"] == 137
+        assert "OOMKilled" in issue_body(oom[0]) and "137" in issue_body(oom[0])
+
+        # Workload key survives a reschedule (new pod hash) AND a redeploy (new RS
+        # hash), or every restart of a rolling Deployment opens a brand new issue.
+        a = workload_key(pod("kyverno-background-controller-78b7b8c84c-28cns"))
+        b = workload_key(pod("kyverno-background-controller-9f1c22d40e-s548p"))
+        assert a == b == "kyverno-background-controller", (a, b)
+        # StatefulSet ordinals are kept: "replica 3" is the useful fact.
+        assert workload_key(pod("postgres-0", kind="StatefulSet")) == "postgres-0"
+        assert workload_key(pod("job-abc", kind="Job")) == "owner"
+        assert workload_key(pod("static-pod", kind="")) == "static-pod"
+
+        # Marker round-trips: notify() parses the key back out to close issues.
+        rec = hot[0]
+        marker = MARKER.format(key=key_of(rec))
+        assert marker.split(":", 1)[1].rsplit("-->", 1)[0].strip() == key_of(rec)
+        assert marker in issue_body(rec).splitlines()[0]
+
+        # Muting: reported once, then silent until the renotify window elapses.
+        iss = {"labels": [{"name": SEVERITY_LABELS["warning"]}], "updated_at": "2026-08-07T11:00:00Z"}
+        assert notify_action(rec, None, now, 24) == "open"
+        assert notify_action(rec, iss, now, 24) is None
+        assert notify_action(rec, iss, now, 0.5) == "renotify"
+        # A warning that becomes a crashloop escalates instead of staying quiet.
+        assert notify_action(loop[0], iss, now, 24) == "escalate"
+
+        print("selftest OK")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if "selftest" in sys.argv[1:] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: restart-watchdog
+  namespace: factory
+  labels: { app: restart-watchdog }
+spec:
+  # Every 30 minutes, matching job-watchdog. The Factory#561 loop restarted
+  # roughly every 37 minutes at its worst and as often as every 3, so this
+  # catches a fresh crash loop within one window of it crossing the threshold
+  # rather than 10 days later. It opens at most one issue per workload and then
+  # goes quiet, so the cadence costs nothing when the fleet is healthy.
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata: { labels: { app: restart-watchdog } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          serviceAccountName: restart-watchdog
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: watchdog
+              # Stock python, digest-pinned like every other third-party image
+              # here (Factory#573). The script is stdlib-only, so no build.
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+              command: ["python3", "/script/watchdog.py"]
+              env:
+                # 5 restarts with the most recent inside 6h. Tuned against the
+                # real data rather than picked: the Factory#561 controller hit
+                # 5 within its first ~3 hours and would have been reported the
+                # same morning, while the whole of the current healthy fleet --
+                # including 19 containers still carrying restarts from the
+                # Factory#582 node rebuild -- produces zero findings. Both
+                # directions were checked; a threshold only tested against the
+                # bad case is half a threshold.
+                - { name: MIN_RESTARTS, value: "5" }
+                - { name: WINDOW_HOURS, value: "6" }
+                # Same destination as job-watchdog, on purpose: one label, one
+                # inbox, one place fleet faults are already worked.
+                - { name: ALERT_REPO, value: "olafkfreund/Factory" }
+                - { name: ALERT_RENOTIFY_HOURS, value: "24" }
+                - name: GITHUB_TOKEN
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: restart-watchdog-script

@@ -90,23 +90,71 @@ patches:
   #   error="client rate limiter Wait returned an error: context deadline exceeded"
   #   leadership lost, stopped leading
   #
-  # No --clientRateLimitQPS is set anywhere in the args, so it runs at
-  # Kyverno's default 20 QPS / 50 burst. On startup this controller LISTs and
-  # WATCHes ~20 informer types AND has a 621-deep report backlog to aggregate.
-  # The lease renewal call queues behind that traffic on the same client-side
-  # rate limiter and times out, leadership drops mid-sync, the process exits
-  # cleanly, and it does the whole thing again five minutes later. The backlog
-  # only grows, so this cannot recover on its own.
-  #
-  # 300 QPS / 600 burst is the upstream recommendation for a cluster with a
-  # report backlog; it is client-side throttling only and does not raise load
-  # on the API server beyond what the controller genuinely needs to catch up.
+  # On startup this controller LISTs and WATCHes ~20 informer types AND had a
+  # 621-deep report backlog to aggregate. The lease renewal call times out
+  # mid-sync, leadership drops, the process exits cleanly, and it does the whole
+  # thing again five minutes later. The backlog only grows, so this cannot
+  # recover on its own.
   #
   # Memory 128Mi -> 512Mi: not the crash cause, but ~20 informer caches plus
   # 621 reports will not fit in 128Mi, and the next failure would be a real
   # OOM once it stops dying early enough to avoid one.
   #
-  # Revisit once the backlog is drained; the QPS bump is safe to keep.
+  # TWO CORRECTIONS TO THE ABOVE, measured while root-causing Factory#561, which
+  # is this same exit signature on the background- and cleanup-controllers.
+  # They are recorded rather than quietly deleted because the original wording
+  # is an actively misleading recipe: read as written, it says "controller
+  # exits 0 after a lost lease" implies "raise clientRateLimitQPS", and the
+  # obvious next move is to paste this patch onto the other three controllers.
+  # That would be three deployment rolls of an admission webhook for nothing.
+  #
+  #   1. "Kyverno's default 20 QPS / 50 burst" IS NOT TRUE of this release.
+  #      v1.18.2 defaults to 100 QPS / 200 burst -- from the shipped binary's
+  #      own `--help`, run out of the exact image this kustomization pins:
+  #
+  #        -clientRateLimitQPS float
+  #             ... Uses the client default if zero. (default 100)
+  #        -clientRateLimitBurst int
+  #             ... Uses the client default if zero. (default 200)
+  #
+  #      20/50 was the v1.12.x default -- correct when this comment was first
+  #      written against v1.12.6, stale since the 2026-07-26 bump to v1.18.2.
+  #      So this patch is a 3x on an already-generous limit, not the 15x rescue
+  #      it reads as.
+  #
+  #   2. "client rate limiter Wait returned an error: context deadline
+  #      exceeded" IS NOT EVIDENCE OF THROTTLING. It is what client-go logs
+  #      when the context handed to the limiter was ALREADY dead on arrival.
+  #      Read the two lines in order and the direction is unambiguous: the Put
+  #      times out FIRST, burning the renew deadline, and only then does the
+  #      slow-path Get find an expired context waiting at the limiter. The
+  #      limiter is reporting the timeout, not causing it.
+  #
+  #      Measured on the live background-controller across 22h: zero
+  #      "client-side throttling" / "Waited for" log lines, i.e. the 100 QPS
+  #      limit is never reached in steady state.
+  #
+  # What actually ends the lease is the API server becoming unreachable from
+  # the NODE for longer than Kyverno's renew deadline (leaseDurationSeconds is
+  # 12 on every kyverno lease; renew deadline is hardcoded, no flag exposes
+  # it -- `--leaderElectionRetryPeriod` is the only leader-election knob in
+  # v1.18.2). Under Factory#571 the node resolv.conf pointed at a black hole
+  # and every API-adjacent call was slow; under Factory#582 the node was
+  # NotReady outright. Both are fixed, and the restarts stopped with them.
+  #
+  # THE TELL that it is the node and not Kyverno: on 2026-08-06T14:48:42Z all
+  # four Kyverno controllers AND keda-operator -- a completely unrelated
+  # leader-electing controller on the same node -- lost their leases in the
+  # same second. No amount of Kyverno tuning explains keda.
+  #
+  # SO: do not add clientRateLimit flags to the other controllers. If this exit
+  # signature returns, look at node-to-apiserver reachability first. The
+  # restart itself is now alerted on by apps/restart-watchdog, so nobody has to
+  # notice 392 of them by hand again.
+  #
+  # This patch is kept as-is: the memory bump is genuinely load-bearing (this
+  # controller is the one that aggregates reports) and the QPS bump is
+  # harmless. It is simply not the mechanism the text claimed.
   - target:
       group: apps
       version: v1
