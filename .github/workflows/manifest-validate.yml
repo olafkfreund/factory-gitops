@@ -311,6 +311,45 @@ jobs:
               ("nfs-provisioner", "nfs-provisioner"),
           }
 
+          # Factory#550. automountServiceAccountToken, banked as an EXPECTED VALUE
+          # rather than a presence check, because it is not a "must be false"
+          # control: aifactory and tfactory MUST mount their token or builds and
+          # verification stop. Putting those two in EXCEPTIONS would file a
+          # decision as debt.
+          #
+          # Every value below was measured against the RUNNING image, not read off
+          # the source, because the source is misleading here -- all four charts
+          # declared `false` while two of the four services call the API server.
+          #   pfactory  false  neither `kubernetes` nor `kubernetes_asyncio` imports
+          #                    in ghcr.io/olafkfreund/pfactory and no kubectl on
+          #                    PATH, so the one load_incluster_config() call in
+          #                    plan/enrich/adapters/kubernetes.py cannot execute
+          #   cfactory  false  no in-cluster API caller anywhere under apps/
+          #   cfactory-frontend false  static nginx
+          #   aifactory true   6 call sites; Job-per-task (RFC-0016) is built on them
+          #   tfactory  true   kube_sandbox.py creates every Nix-lane verify Job via
+          #                    load_incluster_config(); kubernetes_asyncio confirmed
+          #                    present in the running pod
+          #
+          # Only these five are banked, because only these five were verified. A
+          # value nobody measured is the defect this gate exists to catch.
+          #
+          # WHY CI IS THE ONLY THING THAT SEES THIS, measured on the live cluster:
+          # ArgoCD selfHeal reverts a field the manifest DECLARES, but ignores one
+          # it does not mention -- it diffs desired against live, and a field
+          # present only in live is not a difference. So deleting an automount line
+          # from a manifest does NOT strip it from the running pods, and the
+          # Application keeps reporting Synced. Nothing downstream notices. (Patched
+          # pfactory both ways to confirm: the declared field came back before a 3s
+          # poll; the undeclared one survived 40 minutes and a forced hard refresh.)
+          AUTOMOUNT = {
+              "aifactory": True,
+              "tfactory": True,
+              "pfactory": False,
+              "cfactory": False,
+              "cfactory-frontend": False,
+          }
+
           # Per-control carve-outs. Each one is a line in a diff a reviewer sees.
           EXCEPTIONS = {
               ("nfs-provisioner", "nfs-provisioner", "capabilities.drop[ALL]"):
@@ -339,6 +378,19 @@ jobs:
               return out
 
 
+          def automount_of(spec, sa_tokens):
+              # The automount value this pod actually gets, or None if nothing says.
+              #
+              # POD SPEC FIRST, because that is the precedence Kubernetes applies: a
+              # pod-level value overrides the ServiceAccount's. Reading the SA first
+              # would assert on the value the cluster IGNORES -- not hypothetical,
+              # TFactory's chart declared false on its ServiceAccount while its
+              # Deployment rendered true, and the cluster honoured the true.
+              if "automountServiceAccountToken" in spec:
+                  return spec["automountServiceAccountToken"]
+              return sa_tokens.get(spec.get("serviceAccountName", "default"))
+
+
           docs = [d for d in json.load(open("/tmp/hardening.json")) if isinstance(d, dict)]
           workloads = [d for d in docs if d.get("kind") in KINDS]
           # Rule 4.7, the guard every step in this file carries: absence is a
@@ -348,11 +400,40 @@ jobs:
                     "-- discovery broke and this gate checked nothing")
               sys.exit(1)
 
+          # ServiceAccount docs, for the automount fallback below.
+          sa_tokens = {
+              (d.get("metadata") or {}).get("name"): d.get("automountServiceAccountToken")
+              for d in docs
+              if d.get("kind") == "ServiceAccount"
+          }
+
           seen, bad, unhardened = set(), 0, []
+          seen_automount, loose_tokens = set(), []
           for d in workloads:
               name = (d.get("metadata") or {}).get("name", "<unnamed>")
               spec = (d.get("spec") or {}).get("template", {}).get("spec") or {}
               pod_sc = spec.get("securityContext") or {}
+
+              if name in AUTOMOUNT:
+                  seen_automount.add(name)
+                  want = AUTOMOUNT[name]
+                  got = automount_of(spec, sa_tokens)
+                  if got is not want:
+                      shown = "nothing (defaults to true)" if got is None else repr(got)
+                      print("::error::REGRESSION: " + name + " declares "
+                            "automountServiceAccountToken=" + shown + ", expected "
+                            + repr(want) + ". This value was measured per workload "
+                            "against the running image (Factory#550) -- " + name
+                            + (" NEEDS its token to create Jobs; withholding it stops "
+                               "builds/verification." if want else
+                               " has no in-cluster API caller, so the token is a "
+                               "credential nothing asked for.")
+                            + " ArgoCD will NOT correct this: it ignores a field the "
+                            "manifest does not declare, so the running pods keep the "
+                            "old value and the Application stays Synced.")
+                      bad = 1
+              elif automount_of(spec, sa_tokens) is not False:
+                  loose_tokens.append(name)
               for c in spec.get("containers") or []:
                   cname = c.get("name", "<unnamed>")
                   gaps = missing(pod_sc, c.get("securityContext") or {})
@@ -381,6 +462,16 @@ jobs:
                     "deliberately; leaving it stale means this gate silently stops checking it.")
               bad = 1
 
+          # Same staleness guard for AUTOMOUNT, and it needs its own: the two lists
+          # are keyed differently (AUTOMOUNT by workload, since the field is on the
+          # pod spec; HARDENED by workload+container), so one loop cannot cover both
+          # and a rename would slip through whichever list was not checked.
+          for wname in sorted(set(AUTOMOUNT) - seen_automount):
+              print("::error::" + wname + " is in AUTOMOUNT but no such workload was "
+                    "rendered -- it was renamed or removed. Update AUTOMOUNT deliberately; "
+                    "leaving it stale means this gate silently stops checking it.")
+              bad = 1
+
           # Reported, never fatal. These are the workloads #521 did not reach --
           # they are visible so the next sweep has a worklist, but they cannot
           # wedge the required check.
@@ -389,8 +480,18 @@ jobs:
                     "(informational, does not fail):")
               for u in sorted(unhardened):
                   print("  -  " + u)
+          if loose_tokens:
+              print("note: " + str(len(loose_tokens)) + " workload(s) mount an API token "
+                    "without a banked decision (informational, does not fail). Each needs "
+                    "its image checked for an in-cluster API caller before banking a value "
+                    "-- do NOT assume false:")
+              for u in sorted(set(loose_tokens)):
+                  print("  -  " + u)
           print("ratchet: " + str(len(seen)) + "/" + str(len(HARDENED))
                 + " banked workload(s) still carry " + ", ".join(CONTROLS))
+          print("ratchet: " + str(len(seen_automount)) + "/" + str(len(AUTOMOUNT))
+                + " banked workload(s) still declare their measured "
+                "automountServiceAccountToken value")
           sys.exit(bad)
           PYEOF
 
