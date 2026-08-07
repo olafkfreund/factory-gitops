@@ -260,27 +260,92 @@ spec:
           command: ["python3", "-u", "-c"]
           args:
             - |
+              # cred-sync (Factory#292, hardened by Factory#628). The cli-creds Secret
+              # volume is refreshed by kubelet, so this re-copies the seed into the writable
+              # ~/.claude emptyDir whenever the seed is genuinely newer than what is there.
+              #
+              # Factory#628: exp() used to collapse every read failure -- missing file,
+              # malformed JSON, absent key -- to 0, and 0 is not a sentinel here, it is the
+              # oldest possible timestamp. An unreadable destination therefore lost every
+              # comparison, so ANY seed was copied over it, including one that had expired
+              # two months earlier, announced as "adopted fresher credential (+494672.6h)".
+              # 494672.6h is 56 years: it is seed_expiry_ms/3600000 with the other side at 0.
+              #
+              # Tested by .github/scripts/test_cred_sync.py, which also proves the three
+              # vendored copies of this script are byte-identical.
               import json, os, shutil, time
-              SEED = "/seed/claude-credentials.json"
-              DEST = "/h/.claude/.credentials.json"
-              def exp(p):
+
+              SEED = os.environ.get("CRED_SYNC_SEED", "/seed/claude-credentials.json")
+              DEST = os.environ.get("CRED_SYNC_DEST", "/h/.claude/.credentials.json")
+              # No real credential is 90 days fresher than the one it replaces. A delta that
+              # large means one side is garbage, not that the seed is better.
+              MAX_SKEW_MS = 90 * 86400000
+
+
+              def exp(path):
+                  """Expiry in ms, or None when unreadable / unparseable / no expiry key.
+
+                  None means "unknown" and is deliberately not a number. Substituting a
+                  timestamp for a read failure is the whole of Factory#628.
+                  """
                   try:
-                      with open(p) as f:
-                          return int(json.load(f).get("claudeAiOauth", {}).get("expiresAt", 0))
+                      with open(path) as fh:
+                          value = json.load(fh).get("claudeAiOauth", {}).get("expiresAt")
                   except Exception:
-                      return 0
-              while True:
-                  try:
-                      s, d = exp(SEED), exp(DEST)
-                      if s > d:
-                          tmp = DEST + ".tmp"
-                          shutil.copyfile(SEED, tmp)
-                          os.chmod(tmp, 0o660)
-                          os.replace(tmp, DEST)  # atomic; readers never see a partial file
-                          print(f"cred-sync: adopted fresher credential (+{(s - d) / 3600000:.1f}h)", flush=True)
-                  except Exception as e:
-                      print(f"cred-sync: {type(e).__name__}: {e}", flush=True)
-                  time.sleep(60)
+                      return None
+                  return None if value is None else int(value)
+
+
+              def ts(ms):
+                  if ms is None:
+                      return "unknown"
+                  return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000))
+
+
+              def decide(seed, dest, dest_exists, now):
+                  """(adopt, message). Pure, so the selftest can pin every branch."""
+                  if seed is None:
+                      return False, "seed unreadable, leaving dest untouched"
+                  if seed <= now:
+                      return False, f"seed expires {ts(seed)}, already past (now {ts(now)}), refusing to adopt"
+                  if dest is None and dest_exists:
+                      return False, "dest exists but is unreadable, refusing to overwrite it"
+                  if dest is not None and seed - dest > MAX_SKEW_MS:
+                      return False, (f"seed expires {ts(seed)}, dest expires {ts(dest)}, delta "
+                                     f"{(seed - dest) / 3600000:.1f}h exceeds the sanity bound, refusing")
+                  if dest is not None and seed <= dest:
+                      return False, ""
+                  # States what was compared, not a conclusion: this line cannot be wrong the
+                  # way "adopted fresher credential" was.
+                  return True, f"seed expires {ts(seed)}, dest expires {ts(dest)}, adopting seed"
+
+
+              def sync(now=None):
+                  now = int(time.time() * 1000) if now is None else now
+                  adopt, why = decide(exp(SEED), exp(DEST), os.path.exists(DEST), now)
+                  if adopt:
+                      tmp = DEST + ".tmp"
+                      shutil.copyfile(SEED, tmp)
+                      os.chmod(tmp, 0o660)
+                      os.replace(tmp, DEST)  # atomic; readers never see a partial file
+                  return adopt, why
+
+
+              def main():
+                  last = None
+                  while True:
+                      try:
+                          why = sync()[1]
+                      except Exception as e:
+                          why = f"{type(e).__name__}: {e}"
+                      if why and why != last:  # a refusal recurs every 60s; say it once
+                          print(f"cred-sync: {why}", flush=True)
+                      last = why
+                      time.sleep(60)
+
+
+              if __name__ == "__main__":
+                  main()
           securityContext:
             allowPrivilegeEscalation: false
             # Stdlib-only inline script; every write goes to the /h/.claude
