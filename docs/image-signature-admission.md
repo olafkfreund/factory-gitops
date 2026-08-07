@@ -344,6 +344,32 @@ lost if the cluster is ever recreated.
 
    A private package answers `denied` and 403s the manifest.
 
+   **A readable manifest is not the check.** What Kyverno actually fetches to
+   verify is the **`.sig` tag** derived from the image digest —
+   `sha256-<digest>.sig` — and a package can serve one and not the other. Probe
+   the object that matters:
+
+   ```bash
+   PKG=tfactory-runner-nix
+   TOK=$(curl -s "https://ghcr.io/token?scope=repository%3Aolafkfreund%2F$PKG%3Apull&service=ghcr.io" | jq -r .token)
+   DIG=$(curl -sI -H "Authorization: Bearer $TOK" \
+       -H 'Accept: application/vnd.oci.image.index.v1+json' \
+       "https://ghcr.io/v2/olafkfreund/$PKG/manifests/latest" \
+       | tr -d '\r' | awk -F': ' '/[Dd]ocker-[Cc]ontent-[Dd]igest/{print $2}')
+   curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOK" \
+       -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+       "https://ghcr.io/v2/olafkfreund/$PKG/manifests/${DIG/:/-}.sig"
+   ```
+
+   **The `Accept` header on that last call is load-bearing, and getting it wrong
+   fakes the exact failure you are triaging.** The `.sig` tag is an OCI *image
+   manifest*; ask for it with the index/list media types the first call uses and
+   ghcr.io returns **404** — for every package, including ones that are public
+   and verifying fine. Measured while writing this: the same four packages
+   returned 404 with the wrong `Accept` and 200 with the right one, one of them
+   an image the live webhook had just reported `pass`. A 404 here means read it
+   again before believing it.
+
 2. **`background: false` froze every report at admission.** A long-lived Pod was
    evaluated once, ever, and its report stayed green across arbitrarily many
    image changes. Audit results were a snapshot of whenever the Pod was last
