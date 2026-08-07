@@ -199,13 +199,26 @@ patches:
   #
   # THE REMOVAL WAS MUTATION-CHECKED, 2026-08-07 (Factory#566). Asserting that a
   # deletion closes a failure mode is not the same as showing it, so: one server
-  # dry-run Pod carrying all 17 covered images through the real admission
-  # webhook, both controllers restarted between states so the 60m image-verify
-  # cache is cold.
+  # dry-run Pod carrying 17 RUNNING IMAGES through the real admission webhook,
+  # both controllers restarted between states so the 60m image-verify cache is
+  # cold.
+  #
+  # SAY WHICH COUNT YOU MEAN. There are two, both correct, at different grains:
+  # 19 REPOSITORIES are named by globs in apps/kyverno-policies (fixed by that
+  # file, changes only on a commit), and N IMAGES are actually running at any
+  # given moment (changes whenever a workload starts or stops, no commit
+  # anywhere). 17 below is the second kind, measured during this experiment --
+  # it is not a target, and re-running this later will give a different N. The
+  # hardcoded "sixteen" this block used to carry was wrong precisely because
+  # nobody wrote down which grain it was. See the COUNTING NOTE in
+  # apps/kyverno-policies/manifests/verify-factory-image-signatures.yaml.
   #
   #   flag present, no Secret                ->   0 failures  (the state #177 found)
   #   flag present, Secret holding a bad PAT ->  16 failures  (5 services + 11 runners)
   #   flag REMOVED, bad Secret still present ->   0 failures  (this file, today)
+  #
+  # The 16 is 17 minus one image whose verdict was still cache-warm; the point
+  # is 0 -> everything, not the exact integer.
   #
   # Row 3 is the one that matters: the same invalid credential is still sitting
   # in the namespace and can no longer do any harm, because nothing reads it.
