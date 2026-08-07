@@ -24,7 +24,8 @@
 #     v1.18.2 refuses to load it ("required variables are not provided"),
 #     `kyverno test` then reports every case `Skip / Invalid Policy` and counts
 #     all 8 as PASSED. `kyverno apply` exits 1 on it, so the neighbouring step
-#     in manifest-validate.yml is what catches that one. See #148.
+#     in manifest-validate.yml catches it first; since #148 the test step
+#     catches it too, reporting the three `pass` cases as `Invalid Policy`.
 #
 # WHAT EACH CASE ASSERTS
 #
@@ -57,24 +58,25 @@
 # wrong kind). It is not a pass and it is not a failure.
 #
 # ---------------------------------------------------------------------------
-# TWO THINGS THIS SUITE CANNOT ASSERT, BOTH TOOL LIMITS, NEITHER A GAP IN THE
-# POLICY.
+# ONE THING THIS SUITE CANNOT ASSERT. A TOOL LIMIT, NOT A GAP IN THE POLICY.
 #
-# 1. UPDATE. The rule matches `operations: [CREATE, UPDATE]` and the UPDATE half
-#    is the one that runs constantly -- every re-apply of an existing Secret.
-#    `kyverno test` v1.18.2 evaluates every resource as a CREATE and has no knob
-#    for the admission operation (no `operation` field on a test result, no
-#    flag, no values-file entry). Measured: replacing CREATE with DELETE in the
-#    rule's operations list makes the CLI report `pass: 0, fail: 0, skip: 0` --
-#    so the list IS honoured, and only the CREATE half of it is reachable here.
-#    The UPDATE path is covered by the live-webhook evidence in the policy's own
-#    header (the `kubectl apply` warning that IS the rule working).
+# UPDATE. The rule matches `operations: [CREATE, UPDATE]` and the UPDATE half
+# is the one that runs constantly -- every re-apply of an existing Secret.
+# `kyverno test` v1.18.2 evaluates every resource as a CREATE and has no knob
+# for the admission operation (no `operation` field on a test result, no flag,
+# no values-file entry). Measured: replacing CREATE with DELETE in the rule's
+# operations list makes the CLI report `pass: 0, fail: 0, skip: 0` -- so the
+# list IS honoured, and only the CREATE half of it is reachable here. The
+# UPDATE path is covered by the live-webhook evidence in the policy's own
+# header (the `kubectl apply` warning that IS the rule working).
 #
-# 2. Anything that stops the rule producing a result. A resource with no result
-#    is reported `Excluded` by this CLI and satisfies ANY expected result. So
-#    narrowing the match, or deleting the rule, turns these cases green rather
-#    than red. Measured and filed as factory-gitops#148; it applies to every
-#    suite in this directory.
+# What used to be the second entry here -- that anything stopping the rule
+# producing a result turns these cases green rather than red, because the CLI
+# reports `Excluded` and Excluded satisfies any expected result -- is
+# factory-gitops#148, and it is FIXED. manifest-validate.yml now fails on an
+# Excluded row wherever the suite expected a verdict. Measured: narrowing this
+# rule's `kinds: [Secret]` to `[ServiceAccount]` used to report 8 of 8 passed
+# and now produces 3 errors, one per `result: pass` case.
 # ---------------------------------------------------------------------------
 apiVersion: cli.kyverno.io/v1alpha1
 kind: Test

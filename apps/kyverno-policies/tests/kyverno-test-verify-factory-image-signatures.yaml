@@ -26,9 +26,27 @@
 #     does not exist makes its rule evaluate nothing, and its 15-case suite
 #     still reports "15 tests passed and 0 tests failed".
 #
-# So a positive assertion cannot fail. Narrowing a glob until it covers nothing,
-# or deleting a rule outright, turns every case about it Excluded and green.
-# That is the tool, not this file, and it is filed as factory-gitops#148.
+# So a positive assertion cannot fail IN THE CLI. Narrowing a glob until it
+# covers nothing, or deleting a rule outright, turns every case about it
+# Excluded and green. That is the tool, not this file, and it is
+# factory-gitops#148.
+#
+# WHAT #148 CLOSED, and what it did not. manifest-validate.yml now wraps
+# `kyverno test -o json` with two guards, so the tool's blind spot is no longer
+# the gate's blind spot:
+#
+#   - a case expecting `pass`/`fail`/`warn`/`error` whose REASON is `Excluded`
+#     or `Invalid Policy` FAILS the gate. The re-scoping measurement above is
+#     caught: 5 errors where there were 15 passes.
+#   - a `results` entry naming a rule the engine did not load FAILS the gate,
+#     which is the first measurement above and is the one that matters here.
+#     Rename or delete any of the six rules below and this suite goes red
+#     rather than quietly asserting nothing.
+#
+# What is still not caught is the narrowing of a glob within a rule that still
+# exists -- see the `aifactory:v*` line below. Closing that needs a MATCHED
+# image, which needs the network, which is the trade this file declined and
+# #148 declined again.
 #
 # The consequence for this suite: only NEGATIVE space is assertable. Every case
 # below asserts that no rule speaks about an image, which fails the moment a
@@ -40,13 +58,17 @@
 #   `cfactory:*`  -> `cfactory*`           4 of 84 cases fail
 #   namespaces: [factory] -> [factory, default]   2 of 84 cases fail
 #   `aifactory:*` -> `aifactory:v*`        0 fail -- the narrowing direction,
-#                                          which is the #148 hole above
+#                                          and still 0 after #148, because
+#                                          every case here is legitimately
+#                                          negative and legitimately Excluded
 #
 # That opposite direction is covered by a different control:
 # require-first-party-signature-coverage reports any first-party image running
 # in `factory` that its mirror list does not name, and that policy has its own
 # suite in kyverno-test.yaml. It is not a complete substitute -- the mirror is a
-# hand-maintained copy of these globs -- which is why #148 stays open.
+# hand-maintained copy of these globs -- so the glob-narrowing gap is real and
+# is recorded in the "does NOT catch" note at the end of the test step in
+# manifest-validate.yml.
 #
 # The positive half WAS checked by hand when this file was written -- all nine
 # references (aifactory, aifactory `-nix`, pfactory, tfactory, cfactory,
@@ -59,8 +81,9 @@
 # Those cases are deliberately NOT committed. A MATCHED image sends the CLI to
 # ghcr.io -- verdict `fail` when it is reachable, `error` when it is not -- so
 # committing them would put a third-party network dependency inside the required
-# status check, in exchange for assertions that cannot fail. That trade is only
-# worth revisiting if #148 is fixed.
+# status check, in exchange for assertions that cannot fail. #148 kept that
+# trade refused: it made coverage assertable WITHOUT the network, so these cases
+# stay uncommitted.
 # ---------------------------------------------------------------------------
 #
 # `skip` is the expected result throughout. It reads as "this rule has nothing
