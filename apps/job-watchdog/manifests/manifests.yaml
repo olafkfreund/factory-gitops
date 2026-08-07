@@ -113,6 +113,56 @@
 # a recovered one gets a comment and its issue CLOSED. An alarm that fires every
 # 30 minutes is muted within a week, which is this same bug by another route.
 #
+# CONTAINER KILLS (Factory#598): ATTRIBUTION, NOT DETECTION. On 2026-08-06 six
+# containers across `argocd`, `factory` and `fides` were destroyed within 89
+# seconds with `exitCode: 255, reason: Unknown`, and nobody could say what
+# killed them. Not because the fleet lacked an alert -- because nothing in it
+# reads container terminations at all. A CronJob record is about schedules and
+# the ArgoCD record is about reconciliation; a Deployment whose container is
+# killed and restarted produces no failed Job, no missed schedule and no drift.
+#
+# The defect was never "it went unnoticed". It was that the evidence which names
+# the cause is DESTROYED FASTER THAN A HUMAN ARRIVES: Events age out in about an
+# hour, and `lastState.terminated` is erased the moment a pod is replaced --
+# rolling `fides-server` that afternoon wiped its copy before anyone looked. By
+# the time #598 was filed, a restart count was the only surviving trace.
+#
+# So this does not just report that a container died. It NAMES THE KILLER and
+# transcribes the proof into the issue while the proof still exists:
+#   - the kubelet's `reason` separates the cases an exit code cannot. 255 alone
+#     covers a fatal application error, a `kubectl delete`, a SIGTERM the
+#     process turned into 255, an eviction and an oddly-reported OOM;
+#   - `reason: Unknown` specifically means the kubelet had NO exit status --
+#     the container runtime restarted underneath a running container. That is a
+#     node event, and the 255 is a placeholder rather than a value anyone chose;
+#   - the NODE's own conditions corroborate it. Every condition is re-stamped
+#     when a kubelet re-registers, so a Ready transition 2m9s after the kill is
+#     the restart that caused it. That is the difference between a hypothesis
+#     and an attribution, and it is why this reads `nodes` as well as `pods`.
+#
+# It refuses to guess (Factory#431): a reason with no rule reports as
+# `unattributed` and quotes the raw values, because a confidently wrong cause is
+# worse than an admitted gap -- a reader acts on it.
+#
+# ONE FINDING PER CAUSE, NOT PER VICTIM. Those six kills had one cause. Six
+# issues for one fault is an alarm nobody reads twice, so node-scoped causes
+# (runtime_lost, evicted) group per node while container-scoped ones (an OOM is
+# one container's memory limit) stay per container. Same argument that makes the
+# ArgoCD record one-per-controller rather than one-per-Application.
+#
+# AND IT STAYS QUIET. Only terminations inside a one-hour window are reported,
+# so ancient restarts on long-lived pods do not open dozens of issues on the
+# first run. An ordinary non-zero exit is EMITTED to the stream but never
+# notified: it is already visible as a failed Job and a CrashLoopBackOff, and an
+# issue per failed build would bury the kills that have no other witness.
+#
+# A KILL IS AN EVENT, NOT A STATE, so it never closes as "recovered" -- nothing
+# about it gets better. It closes on ABSENCE OF RECURRENCE once it has been open
+# long enough for a human to meet it, and says so. The alternative considered and
+# rejected was exempting these from the orphan sweep entirely: that leaves an
+# issue that can open and never close, and a channel that only accumulates
+# teaches people to ignore the label, which discredits every other finding here.
+#
 # ---------------------------------------------------------------------------
 # ARGOCD STOPPED RECONCILING (Factory#443, factory-gitops#138)
 # ---------------------------------------------------------------------------
@@ -205,8 +255,8 @@ metadata:
 # reports "all healthy" for the part of the cluster it is not looking at, which
 # is the same false green this app exists to abolish.
 #
-# Least privilege is preserved where it counts: list/get on two resource kinds,
-# no write verb anywhere, no secrets, no pods, no exec. The scope widens; the
+# Least privilege is preserved where it counts: list/get only, no write verb
+# anywhere, no secrets, no `pods/log`, no `pods/exec`. The scope widens; the
 # power does not.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -222,6 +272,17 @@ rules:
   # holds, and still no write verb anywhere.
   - apiGroups: ["argoproj.io"]
     resources: ["applications"]
+    verbs: ["get", "list"]
+  # Factory#598. Container terminations are not a batch object, so nothing above
+  # can see them: on 2026-08-06 six containers across `argocd`, `factory` and
+  # `fides` died within 89 seconds with `exitCode: 255, reason: Unknown` and the
+  # fleet had no component that reads `lastState.terminated` at all. `nodes` is
+  # here because the exit code alone cannot tell an application fault from the
+  # node's runtime being restarted underneath it — the node's own conditions can.
+  # Still read-only, and deliberately NOT `pods/log`: this names what killed a
+  # container, it does not read what the container said.
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -288,6 +349,10 @@ data:
       FAIL_THRESHOLD        consecutive failures before status=failing (2)
       RECONCILE_TOLERANCE_SECONDS
                             max age of the freshest ArgoCD reconciledAt (900)
+      POD_TERMINATION_WINDOW_SECONDS
+                            how recent a container termination must be to be
+                            reported (3600). Must stay above this CronJob's own
+                            period or a kill can fall between two runs.
       OBSERVE_URL           OpenObserve base url (default in-cluster service)
       OO_ORG                OpenObserve organization (default "default")
       OO_STREAM             target stream (default "job_health")
@@ -347,8 +412,19 @@ data:
     # has stopped being the truth and every `Synced` in the cluster is a cached
     # opinion from before the stall. There is no "may self-recover" reading of a
     # controller that is not running.
+    # The three Pod codes below are critical because each names a cause OUTSIDE
+    # the container: the runtime lost it, the kernel OOM-killed it, or the
+    # kubelet evicted it. None of them is something the workload chose and none
+    # self-corrects. Deliberately NOT here: `signalled`, `deadline_exceeded` and
+    # `unattributed`, which are warnings, and `app_error`, which never notifies
+    # at all. Grading an ordinary non-zero exit critical would make every
+    # transient container restart in the fleet a critical and mute the label
+    # inside a week — the same cry-wolf failure this app exists to avoid, and it
+    # would bury the very findings #598 is about.
     CRITICAL_CODES = {"never_succeeded", "stale", "reconcile_stalled",
-                      "reconcile_unreadable"}
+                      "reconcile_unreadable",
+                      "runtime_lost", "oom_killed", "evicted",
+                      "terminations_unreadable"}
 
     # Factory#443. ArgoCD's application controller re-examines every Application
     # every `timeout.reconciliation`. That key is UNSET in this cluster's
@@ -400,6 +476,18 @@ data:
         "suspended": "is suspended and will never run",
         "reconcile_stalled": "has stopped reconciling — every Synced is stale",
         "reconcile_unreadable": "cannot be read, so nothing is checking ArgoCD",
+        # Factory#598. Each of these says WHAT killed the container, because
+        # "exit 255" in a subject line says nothing a reader can act on.
+        "runtime_lost": "lost containers to a runtime or kubelet restart, not to "
+                        "anything they did",
+        "oom_killed": "was OOM-killed: it exceeded its memory limit",
+        "evicted": "had pods evicted under node pressure",
+        "signalled": "was killed by a signal rather than exiting on its own",
+        "deadline_exceeded": "was stopped mid-run by its activeDeadlineSeconds",
+        "unattributed": "terminated abnormally for a reason this watchdog cannot "
+                        "name, so it is recorded verbatim rather than guessed at",
+        "terminations_unreadable": "cannot be read, so no container kill in this "
+                                   "cluster is being attributed",
     }
 
     # "last success" is the CronJob word. For the ArgoCD record the same field
@@ -706,6 +794,319 @@ data:
         }
 
 
+    # ---- CONTAINER TERMINATIONS (Factory#598) -------------------------------
+    #
+    # Neither of the two signals above can see a container being killed. A
+    # CronJob record is about schedules and a reconcile record is about ArgoCD;
+    # a running Deployment whose container is destroyed and restarted produces
+    # no failed Job, no missed schedule and no sync drift. On 2026-08-06 six
+    # containers across `argocd`, `factory` and `fides` died inside 89 seconds
+    # with `exitCode: 255, reason: Unknown` and nothing in the fleet named a
+    # cause, because nothing in the fleet reads `lastState.terminated` at all.
+    #
+    # ATTRIBUTION, NOT DETECTION, IS THE POINT. `exit 255` is the least
+    # informative code there is: a fatal application error, a `kubectl delete`, a
+    # SIGTERM the process turned into 255, an eviction and an OOM the runtime
+    # reported oddly can all land on it. Reporting "a container exited 255" would
+    # be a new alert that still leaves a human doing the work this exists to do.
+    # What separates those cases is `reason` plus the node's own conditions, and
+    # reading them is the whole of this section.
+    _RUNTIME_LOST = (
+        "the CONTAINER RUNTIME LOST the container: the kubelet had no exit "
+        "status to report, which is what it records when containerd or the "
+        "kubelet itself restarts underneath a running container. This is a "
+        "NODE-LEVEL disruption, not an application exit -- the process was "
+        "killed out from under the kubelet and never got to say why. The "
+        "`exitCode: 255` is a placeholder for 'no status', not a value the "
+        "process chose, which is exactly why it attributes nothing on its own"
+    )
+
+    # kubelet `reason` -> (code, what actually killed it). Reason first, exit
+    # code only as a tiebreak: a code alone is ambiguous by construction.
+    TERMINATION_REASONS = {
+        "OOMKilled": (
+            "oom_killed",
+            "the kernel OOM-killer killed it: the container exceeded its memory "
+            "limit. A limit or a leak in THIS container, not a node fault",
+        ),
+        "Evicted": (
+            "evicted",
+            "the kubelet EVICTED the pod under node pressure -- the node ran "
+            "short of memory, disk or inodes and reclaimed it",
+        ),
+        "DeadlineExceeded": (
+            "deadline_exceeded",
+            "activeDeadlineSeconds elapsed and the pod was stopped mid-run",
+        ),
+        "Unknown": ("runtime_lost", _RUNTIME_LOST),
+        "ContainerStatusUnknown": ("runtime_lost", _RUNTIME_LOST),
+        "Error": (
+            "app_error",
+            "the process itself exited non-zero. An application fault: the "
+            "container chose this exit code, nothing external killed it",
+        ),
+    }
+
+    SIGNAL_EXITS = {
+        137: ("signalled",
+              "killed by SIGKILL (128+9) with no OOMKilled reason -- something "
+              "outside the container stopped it hard"),
+        143: ("signalled",
+              "stopped by SIGTERM (128+15) -- a graceful stop the process "
+              "turned into a non-zero exit"),
+    }
+
+    # Causes that belong to the NODE rather than to one container, and therefore
+    # group into ONE finding per (node, cause). The #598 event killed six
+    # containers in three namespaces from a single node-level cause; six issues
+    # for one fault is an alarm nobody reads twice, which is the same argument
+    # that makes the ArgoCD record one-per-controller rather than one-per-app.
+    # Everything else stays per-container, because a memory limit is a property
+    # of one container and merging five OOMs would hide four faults behind one.
+    NODE_SCOPED = {"runtime_lost", "evicted"}
+
+    # Which codes reach a human. `app_error` is EMITTED to the stream but never
+    # notified: a container that exited non-zero of its own accord is already
+    # visible as a failed Job, a CrashLoopBackOff and a red CronJob record, and
+    # opening an issue for every failed build would bury the kills that nothing
+    # else reports. #598 is about the terminations with no other witness.
+    NOTIFY_CODES = {"runtime_lost", "oom_killed", "evicted", "signalled",
+                    "deadline_exceeded", "unattributed"}
+
+    # Only terminations this recent are reported. Long-lived pods each carry an
+    # ancient restart or two; without a window the first run would open dozens of
+    # issues about things that resolved days ago. Must stay comfortably above the
+    # CronJob's own 30-minute period or a kill could land between two runs and be
+    # seen by neither.
+    POD_WINDOW_SECONDS = 3600
+
+    # How close a node condition transition has to sit to a kill before it is
+    # worth mentioning. Much tighter than the reporting window on purpose: every
+    # node has SOME transition within an hour, and a correlation that always
+    # fires corroborates nothing.
+    NODE_CORRELATION_SECONDS = 300
+
+    # How long a termination finding stays open once it stops recurring. See the
+    # close-on-absence rule in notify(): an event does not "recover", so this is
+    # the grace that lets a human meet the issue before it closes itself.
+    POD_CLOSE_AFTER_HOURS = 24
+
+    # Marks a record as a termination finding, in the dedup key itself. `/` is
+    # illegal in a Kubernetes object name, so this can never collide with a
+    # CronJob subject.
+    KILL_PREFIX = "kill/"
+
+
+    def attribute_termination(term: dict, pod_reason: str | None) -> tuple[str, str]:
+        """(code, sentence) naming what killed a container.
+
+        Returns `unattributed` rather than a guess when the kubelet's reason is
+        not one there is a rule for. Factory#431: "unknown" beats a plausible
+        token. A confidently wrong attribution is worse than the silence this
+        change exists to remove, because a reader acts on it -- and the whole
+        complaint in #598 is that a generic code was treated as an answer.
+        """
+        reason = str(term.get("reason") or "")
+        exit_code = term.get("exitCode")
+        # Eviction is recorded on the POD, not the container status, so it has to
+        # be read first or it reads as an ordinary non-zero exit.
+        if pod_reason == "Evicted":
+            return TERMINATION_REASONS["Evicted"]
+        if reason in TERMINATION_REASONS:
+            code, why = TERMINATION_REASONS[reason]
+            # `Error` is only the kubelet's word for "exited non-zero"; the exit
+            # code is what says whether a signal did it.
+            if code == "app_error" and exit_code in SIGNAL_EXITS:
+                return SIGNAL_EXITS[exit_code]
+            return (code, why)
+        if term.get("signal"):
+            return ("signalled", f"killed by signal {term['signal']}")
+        if exit_code in SIGNAL_EXITS:
+            return SIGNAL_EXITS[exit_code]
+        return (
+            "unattributed",
+            f"the kubelet reported reason `{reason or 'unset'}` with exit "
+            f"{exit_code}, which this watchdog has no rule for. Recorded "
+            "verbatim rather than guessed at",
+        )
+
+
+    def node_context(node: dict | None, finished: datetime, code: str) -> list[str]:
+        """What the node itself says about the moment the container died.
+
+        This is the half that turns "the runtime lost it" into "the kubelet on
+        node X re-registered 2m9s later, which is what lost it". EVERY node
+        condition is re-stamped when a kubelet re-registers, so a Ready
+        transition sitting right next to the kill is the node's runtime
+        restarting — and that is the observation that separates a node event
+        from an application one.
+
+        The CONCLUSION is drawn only for `runtime_lost`. For an app that exited 1
+        three minutes after its node came back, the same transition is context
+        and probably explains why it was unhappy, but calling it the cause would
+        be the confidently-wrong attribution #431 warns about.
+        """
+        if not node:
+            return ["the node this ran on is no longer in the cluster, so its "
+                    "conditions can neither corroborate nor rule anything out"]
+        name = (node.get("metadata") or {}).get("name", "?")
+        conds = {c.get("type"): c
+                 for c in (node.get("status") or {}).get("conditions") or []}
+        out = []
+        ready = conds.get("Ready") or {}
+        if ready.get("lastTransitionTime"):
+            delta = (_parse_ts(ready["lastTransitionTime"]) - finished).total_seconds()
+            if abs(delta) <= NODE_CORRELATION_SECONDS:
+                out.append(
+                    f"node `{name}` last re-stamped Ready={ready.get('status')} "
+                    f"(reason {ready.get('reason')}) at "
+                    f"{ready['lastTransitionTime']}, {_dur(abs(delta))} "
+                    f"{'AFTER' if delta >= 0 else 'BEFORE'} the kill. Every node "
+                    "condition is re-stamped when a kubelet re-registers, so "
+                    "this is the node's kubelet going away and coming back"
+                    + (" -- which is what lost the container"
+                       if code == "runtime_lost" else
+                       ". Context, not the cause: this container reported its "
+                       "own exit status, so that did not kill it")
+                )
+        hot = [t for t in ("MemoryPressure", "DiskPressure", "PIDPressure")
+               if (conds.get(t) or {}).get("status") == "True"]
+        out.append(
+            f"node `{name}` pressure as at this run: "
+            + (", ".join(f"{p}=True" for p in hot) if hot else
+               "no Memory/Disk/PID pressure. That rules pressure out NOW, not "
+               "at the time of the kill -- node conditions carry no history, "
+               "which is itself why this record has to be written when it "
+               "happens rather than reconstructed afterwards")
+        )
+        return out
+
+
+    def assess_pod_terminations(pods: list[dict], nodes: list[dict], error: str | None,
+                                now: datetime,
+                                window: int = POD_WINDOW_SECONDS) -> list[dict]:
+        """Abnormal container terminations inside `window`, as health records.
+
+        Reads BOTH `lastState.terminated` — the container died and is running
+        again, which is the fides-db case where a restart count was the only
+        surviving trace — and `state.terminated`, where it is still down. Reading
+        only the first misses every one-shot pod that never came back; the #598
+        sweep done by hand missed `fleet-match` for exactly that reason.
+
+        An unreadable pod or node list is a CRITICAL finding, never a skip: a
+        cluster where terminations cannot be enumerated is a cluster where the
+        next #598 goes unattributed again, and that must not read as a clean run.
+        """
+        if error is not None:
+            return [{
+                "_timestamp": int(now.timestamp() * 1_000_000),
+                "source": "job-watchdog", "kind": "Pod",
+                "namespace": "cluster", "cronjob": f"{KILL_PREFIX}terminations",
+                "schedule": "", "suspended": False,
+                "status": "terminations_unreadable",
+                "codes": ["terminations_unreadable"],
+                "problems": [
+                    f"CANNOT LIST pods or nodes: {error}. No container kill "
+                    "anywhere in this cluster is being attributed while this "
+                    "holds, and an unwatched kill reads exactly like no kill"
+                ],
+                "consecutive_failures": 0, "surviving_jobs": 0,
+                "last_success_age_seconds": None, "last_schedule_age_seconds": None,
+                "expected_period_seconds": window, "tolerance_seconds": window,
+                "node": "", "victims": [],
+            }]
+
+        by_node = {(n.get("metadata") or {}).get("name"): n for n in nodes}
+        found: dict = {}
+        for p in pods:
+            meta = p.get("metadata") or {}
+            status = p.get("status") or {}
+            node_name = (p.get("spec") or {}).get("nodeName") or ""
+            statuses = ((status.get("containerStatuses") or [])
+                        + (status.get("initContainerStatuses") or []))
+            for cs in statuses:
+                for where in ("lastState", "state"):
+                    term = (cs.get(where) or {}).get("terminated") or {}
+                    if not term.get("finishedAt"):
+                        continue
+                    # A clean exit 0 is not a kill.
+                    if term.get("reason") == "Completed" and not term.get("exitCode"):
+                        continue
+                    finished = _parse_ts(term["finishedAt"])
+                    age = (now - finished).total_seconds()
+                    # The small negative bound tolerates clock skew between the
+                    # kubelet that stamped it and this pod.
+                    if not -60 <= age <= window:
+                        continue
+                    code, why = attribute_termination(term, status.get("reason"))
+                    if code in NODE_SCOPED:
+                        key = ("cluster",
+                               f"{KILL_PREFIX}node/{node_name or 'unscheduled'}/{code}")
+                    else:
+                        key = (meta.get("namespace", ""),
+                               f"{KILL_PREFIX}pod/{meta.get('name', '?')}"
+                               f"/{cs.get('name', '?')}")
+                    victim = {
+                        "namespace": meta.get("namespace", ""),
+                        "pod": meta.get("name", ""),
+                        "container": cs.get("name", ""),
+                        "node": node_name,
+                        "reason": term.get("reason"),
+                        "exit_code": term.get("exitCode"),
+                        "signal": term.get("signal"),
+                        "finished_at": term["finishedAt"],
+                        "restart_count": cs.get("restartCount", 0),
+                        "still_down": where == "state",
+                    }
+                    slot = found.setdefault(
+                        key, {"code": code, "why": why, "node": node_name,
+                              "victims": []})
+                    # lastState and state can describe the same termination on a
+                    # pod that died once and stayed down.
+                    if not any(v["pod"] == victim["pod"]
+                               and v["container"] == victim["container"]
+                               and v["finished_at"] == victim["finished_at"]
+                               for v in slot["victims"]):
+                        slot["victims"].append(victim)
+
+        records = []
+        for (ns, name), slot in sorted(found.items()):
+            victims = sorted(slot["victims"], key=lambda v: v["finished_at"])
+            latest = _parse_ts(victims[-1]["finished_at"])
+            span = (latest - _parse_ts(victims[0]["finished_at"])).total_seconds()
+            problems = [
+                f"{len(victims)} container(s) terminated abnormally"
+                + (f" within {_dur(span)}" if len(victims) > 1 else "")
+                + f", most recently {_dur((now - latest).total_seconds())} ago",
+                f"WHAT KILLED THEM: {slot['why']}",
+            ]
+            problems += node_context(by_node.get(slot["node"]), latest, slot["code"])
+            records.append({
+                "_timestamp": int(now.timestamp() * 1_000_000),
+                "source": "job-watchdog",
+                "kind": "Pod",
+                "namespace": ns,
+                "cronjob": name,
+                "schedule": "",
+                "suspended": False,
+                "status": slot["code"],
+                # Only notify-worthy codes carry a code. An `app_error` record
+                # still lands in the stream — it is evidence — but severity_of()
+                # reads an empty list as healthy and says nothing.
+                "codes": [slot["code"]] if slot["code"] in NOTIFY_CODES else [],
+                "problems": problems,
+                "consecutive_failures": 0,
+                "surviving_jobs": 0,
+                "last_success_age_seconds": None,
+                "last_schedule_age_seconds": None,
+                "expected_period_seconds": window,
+                "tolerance_seconds": window,
+                "node": slot["node"],
+                "victims": victims,
+            })
+        return records
+
+
     def group_jobs(cronjobs: list[dict], jobs: list[dict]) -> dict:
         """uid -> Jobs owned by that CronJob (ownerReferences, not name guessing)."""
         uids = {(c.get("metadata") or {}).get("uid") for c in cronjobs}
@@ -801,6 +1202,7 @@ data:
             v = record.get(field)
             return "never" if v is None else f"{_dur(v)} ago"
         is_cron = _subject_kind(record) == "CronJob"
+        is_pod = _subject_kind(record) == "Pod"
         lines = [
             MARKER.format(ns=ns, name=name),
             f"**Severity: {sev.upper()}** — `{ns}/{name}`"
@@ -820,6 +1222,26 @@ data:
                 f"- Last success: {fmt('last_success_age_seconds')}",
                 f"- Last schedule: {fmt('last_schedule_age_seconds')}",
             ]
+        elif is_pod:
+            # The victim table IS the evidence. `lastState` is destroyed the
+            # moment a pod is replaced — rolling `fides-server` on 2026-08-06
+            # erased its copy before anyone looked — so the terminated block is
+            # transcribed here while it still exists rather than linked to.
+            lines += ["| when | pod | container | node | reason | exit | restarts |",
+                      "|---|---|---|---|---|---|---|"]
+            lines += [
+                f"| {v['finished_at']} | `{v['namespace']}/{v['pod']}` | "
+                f"`{v['container']}` | `{v['node']}` | `{v['reason']}` | "
+                f"`{v['exit_code']}` | {v['restart_count']}"
+                + (" (still down)" if v["still_down"] else "") + " |"
+                for v in record.get("victims") or []
+            ]
+            lines += [
+                "",
+                f"- Reporting window: {_dur(record['tolerance_seconds'])} "
+                "(terminations older than this are not reported, so this issue "
+                "describes a recent event, not a standing state)",
+            ]
         else:
             lines += [
                 f"- Applications seen: {record.get('applications')}",
@@ -828,9 +1250,12 @@ data:
                 "and survives the controller that wrote it)",
                 f"- Oldest reconcile: {fmt('oldest_reconcile_age_seconds')}",
             ]
+        if not is_pod:
+            lines += [
+                f"- Tolerance: {_dur(record['tolerance_seconds'])} "
+                f"(period {_dur(record['expected_period_seconds'])})",
+            ]
         lines += [
-            f"- Tolerance: {_dur(record['tolerance_seconds'])} "
-            f"(period {_dur(record['expected_period_seconds'])})",
             "",
             "Every record, including the healthy runs, is in the OpenObserve "
             f"stream `{os.environ.get('OO_STREAM', 'job_health')}`:",
@@ -847,6 +1272,28 @@ data:
                 "be closed automatically when this CronJob reports healthy again. "
                 "Closing it by hand while the CronJob is still unhealthy just "
                 "opens a fresh one on the next run.",
+            ]
+        elif is_pod:
+            lines += [
+                "Where to look first:",
+                "",
+                "```",
+                "kubectl --context factory get nodes -o json | jq '.items[] | "
+                "{name: .metadata.name, conditions: .status.conditions}'",
+                "kubectl --context factory get events -A "
+                "--sort-by=.lastTimestamp | tail -50",
+                "```",
+                "",
+                "**Events age out after roughly an hour and `lastState` is "
+                "destroyed the moment a pod is replaced**, so the table above "
+                "may already be the only surviving record. That is why it is "
+                "transcribed here rather than linked to (Factory#598).",
+                "",
+                "Raised automatically by the `job-watchdog` CronJob. A kill is "
+                "an EVENT, not a state, so this issue is never closed as "
+                "\"recovered\" — it closes on absence of recurrence once it has "
+                f"been open {POD_CLOSE_AFTER_HOURS}h and no matching termination "
+                "has been seen since.",
             ]
         else:
             lines += [
@@ -987,6 +1434,42 @@ data:
             if key in seen:
                 continue
             gone = key.split(":", 1)[1].rsplit(" ", 1)[0]
+
+            # CLOSE-ON-ABSENCE, for termination findings only (Factory#598).
+            #
+            # A container kill is an EVENT. It does not recover, so the "healthy
+            # again" close above would be a lie, and the "no longer exists"
+            # close below would be too — the pod is usually fine, the kill simply
+            # aged out of the reporting window. But exempting these from the
+            # sweep entirely is worse: the sweep is the ONLY thing that closes an
+            # issue whose record stops being produced, and an alert that can open
+            # and never close trains people to ignore the whole label, which
+            # discredits every other finding filed here.
+            #
+            # So: a positive rule. It closes once the finding has stopped
+            # recurring AND has been visible long enough for a human to meet it,
+            # and the comment says it is closing on absence rather than pretending
+            # anything got better.
+            if f"/{KILL_PREFIX}" in key:
+                open_for = (now - _parse_ts(issue["created_at"])).total_seconds()
+                if open_for < POD_CLOSE_AFTER_HOURS * 3600:
+                    continue
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": f"No termination matching `{gone}` has been seen for "
+                            f"the last {_dur(POD_CLOSE_AFTER_HOURS * 3600)}. "
+                            "Closing on ABSENCE OF RECURRENCE — not on recovery: "
+                            "a container kill is an event and nothing about it "
+                            "gets better, so this says only that it has not "
+                            "happened again.\n\nThe evidence stays in the table "
+                            "above and in the OpenObserve `job_health` stream. "
+                            "If the cause was never established, reopen: a kill "
+                            "nobody attributed is Factory#598 itself."})
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+                   {"state": "closed", "state_reason": "completed"})
+                eprint(f"NO RECURRENCE {gone} -> closed {repo}#{issue['number']}")
+                sent += 1
+                continue
+
             gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
                {"body": f"`{gone}` is no longer reported by the watchdog at all, "
                         "so this finding can no longer be evaluated. "
@@ -1031,6 +1514,9 @@ data:
         threshold = int(os.environ.get("FAIL_THRESHOLD", "2"))
         reconcile_tol = int(
             os.environ.get("RECONCILE_TOLERANCE_SECONDS", DEFAULT_RECONCILE_TOLERANCE)
+        )
+        pod_window = int(
+            os.environ.get("POD_TERMINATION_WINDOW_SECONDS", POD_WINDOW_SECONDS)
         )
         oo = os.environ.get(
             "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
@@ -1081,6 +1567,17 @@ data:
         except Exception as e:  # noqa: BLE001 — cannot see == cannot report
             apps, apps_err = [], repr(e)
 
+        # Pods and nodes, same shape and for the same reason (#598). Both, not
+        # one: the node conditions are what turn a generic `exit 255` into a
+        # named cause, so losing them would leave the attribution this exists to
+        # produce, unproduced.
+        try:
+            pods = k8s_get("/api/v1/pods")["items"]
+            nodes = k8s_get("/api/v1/nodes")["items"]
+            pods_err = None
+        except Exception as e:  # noqa: BLE001 — cannot see == cannot report
+            pods, nodes, pods_err = [], [], repr(e)
+
         now = datetime.now(timezone.utc)
         owned = group_jobs(cronjobs, jobs)
         records = [
@@ -1091,6 +1588,7 @@ data:
             )
         ]
         records.append(assess_argocd(apps, apps_err, now, reconcile_tol))
+        records += assess_pod_terminations(pods, nodes, pods_err, now, pod_window)
 
         # Namespace-qualified now that the watch is cluster-wide: two namespaces
         # may hold same-named CronJobs, and a bare name would make the operator's
@@ -1537,6 +2035,18 @@ data:
             assert "apps, apps_err = [], repr(e)" in body_of_main, \
                 "an unreadable ArgoCD must degrade to a finding, not a dead run"
 
+            # Same three, for the termination records (Factory#598). Dropping the
+            # `records +=` is invisible from every other angle: every other
+            # record still lands, the run still goes green, the heartbeat is
+            # still stamped, and the only difference is that container kills stop
+            # being attributed — which is the exact state #598 was filed about.
+            assert "assess_pod_terminations(" in body_of_main, \
+                "main must produce the container-termination records"
+            assert "/api/v1/pods" in body_of_main and "/api/v1/nodes" in body_of_main, \
+                "must list pods AND nodes: the node conditions are the attribution"
+            assert "pods, nodes, pods_err = [], [], repr(e)" in body_of_main, \
+                "an unreadable pod list must degrade to a finding, not a dead run"
+
         # Same-named CronJobs in two namespaces must stay two findings, not one.
         # Cluster-wide listing makes name collisions reachable for the first
         # time; if the issue marker collided, the second namespace's outage would
@@ -1660,6 +2170,195 @@ data:
         cron_body = issue_body(ra, "critical")
         assert "Surviving Jobs" in cron_body and "Last success" in cron_body
 
+        # ---- CONTAINER TERMINATIONS (Factory#598) ---------------------------
+        #
+        # The fixture is the real 2026-08-06 incident, transcribed from the live
+        # cluster: six containers in three namespaces, `Unknown`/255, in two
+        # bursts 89 seconds apart, all on k3d-agent-0-0, whose kubelet
+        # re-registered at 14:44:07 — 2m9s after the second burst.
+        def term_pod(ns, name, container, node, reason, code, when, *,
+                     where="lastState", restarts=1, pod_reason=None):
+            t = {"reason": reason, "exitCode": code, "finishedAt": when}
+            return {
+                "metadata": {"name": name, "namespace": ns},
+                "spec": {"nodeName": node},
+                "status": {
+                    **({"reason": pod_reason} if pod_reason else {}),
+                    "containerStatuses": [{
+                        "name": container, "restartCount": restarts,
+                        where: {"terminated": t},
+                    }],
+                },
+            }
+
+        def term_node(name, ready_at, *, pressure=None):
+            conds = [{"type": "Ready", "status": "True", "reason": "KubeletReady",
+                      "lastTransitionTime": ready_at}]
+            for p in ("MemoryPressure", "DiskPressure", "PIDPressure"):
+                conds.append({"type": p,
+                              "status": "True" if p == pressure else "False",
+                              "reason": "x", "lastTransitionTime": ready_at})
+            return {"metadata": {"name": name}, "status": {"conditions": conds}}
+
+        # 1. THE ATTRIBUTION TABLE. Every one of these lands on exit 255 or a
+        #    bare non-zero code in the raw data, which is why the code alone can
+        #    never be the answer.
+        assert attribute_termination({"reason": "Unknown", "exitCode": 255},
+                                     None)[0] == "runtime_lost"
+        assert attribute_termination({"reason": "ContainerStatusUnknown",
+                                      "exitCode": 255}, None)[0] == "runtime_lost"
+        assert attribute_termination({"reason": "OOMKilled", "exitCode": 137},
+                                     None)[0] == "oom_killed"
+        assert attribute_termination({"reason": "Error", "exitCode": 143},
+                                     None)[0] == "signalled"
+        assert attribute_termination({"reason": "Error", "exitCode": 137},
+                                     None)[0] == "signalled"
+        assert attribute_termination({"reason": "Error", "exitCode": 3},
+                                     None)[0] == "app_error"
+        assert attribute_termination({"reason": "DeadlineExceeded", "exitCode": 1},
+                                     None)[0] == "deadline_exceeded"
+        # Eviction is stamped on the POD, and reads as an ordinary exit without it.
+        assert attribute_termination({"reason": "Error", "exitCode": 137},
+                                     "Evicted")[0] == "evicted"
+        # Factory#431: a reason with no rule is NOT dressed up as an app error.
+        assert attribute_termination({"reason": "BrandNewReason", "exitCode": 42},
+                                     None)[0] == "unattributed"
+
+        incident = datetime(2026, 8, 6, 14, 50, tzinfo=timezone.utc)
+        agent = term_node("k3d-agent-0-0", "2026-08-06T14:44:07Z")
+        kills = [
+            term_pod("argocd", "argocd-redis-868dbb7cf4-dmfnw", "redis",
+                     "k3d-agent-0-0", "Unknown", 255, "2026-08-06T14:40:29Z"),
+            term_pod("argocd", "argocd-notifications-controller-6c65b4b9f6-6d2ql",
+                     "argocd-notifications-controller", "k3d-agent-0-0",
+                     "Unknown", 255, "2026-08-06T14:40:29Z"),
+            term_pod("factory", "nfs-provisioner-866dd8d944-mptfm",
+                     "nfs-provisioner", "k3d-agent-0-0", "Unknown", 255,
+                     "2026-08-06T14:41:58Z"),
+            # Still down, and recorded on `state` rather than `lastState`. The
+            # hand sweep of this incident missed exactly this pod by reading only
+            # lastState, so a regression here would recreate a real blind spot.
+            term_pod("factory", "fleet-match-29767120-98nzc", "match",
+                     "k3d-agent-0-0", "Unknown", 255, "2026-08-06T14:41:58Z",
+                     where="state", restarts=0),
+            term_pod("fides", "fides-db-54fdd777db-vm9lb", "postgres",
+                     "k3d-agent-0-0", "Unknown", 255, "2026-08-06T14:41:58Z",
+                     restarts=3),
+        ]
+
+        # 2. ONE FINDING FOR ONE NODE-LEVEL CAUSE, not five. The fan-out argument
+        #    that makes the ArgoCD record one-per-controller applies identically.
+        recs = assess_pod_terminations(kills, [agent], None, incident)
+        assert len(recs) == 1, [r["cronjob"] for r in recs]
+        lost = recs[0]
+        assert lost["status"] == "runtime_lost", lost
+        assert lost["cronjob"] == f"{KILL_PREFIX}node/k3d-agent-0-0/runtime_lost"
+        assert lost["namespace"] == "cluster"
+        assert len(lost["victims"]) == 5, lost["victims"]
+        assert {v["namespace"] for v in lost["victims"]} == {
+            "argocd", "factory", "fides"}, "the kill crossed namespaces"
+        assert severity_of(lost) == "critical", "a node losing containers is critical"
+
+        # 3. IT NAMES THE KILLER, and corroborates it with the node's own clock.
+        #    A finding that says "exit 255" and stops is the defect, not the fix.
+        blob = " ".join(lost["problems"])
+        assert "CONTAINER RUNTIME LOST" in blob, blob
+        assert "which is what lost the container" in blob, blob
+        assert "2026-08-06T14:44:07Z" in blob and "2m" in blob, blob
+        assert "not an application exit" in blob, blob
+
+        # 4. AND IT DOES NOT OVERCLAIM. The same node transition sits next to an
+        #    app that exited 1 four minutes later; that is context, not cause.
+        app_rec = assess_pod_terminations(
+            [term_pod("factory", "cloudflared-x", "cloudflared", "k3d-agent-0-0",
+                      "Error", 1, "2026-08-06T14:47:29Z")],
+            [agent], None, incident)[0]
+        assert app_rec["status"] == "app_error"
+        assert "Context, not the cause" in " ".join(app_rec["problems"])
+        # ...and an ordinary non-zero exit must NEVER reach a human. If it did,
+        # every failed build in the fleet would be an issue and the ones that
+        # matter would be buried — the cry-wolf failure, restated.
+        assert app_rec["codes"] == [], app_rec
+        assert severity_of(app_rec) is None, "app_error must not notify"
+        assert notify_action(app_rec, None, incident, 24) is None
+
+        # 5. PER-CONTAINER CAUSES DO NOT GROUP. Five OOMs on one node are five
+        #    faults; merging them would hide four behind one memory limit.
+        ooms = assess_pod_terminations(
+            [term_pod("factory", f"hog-{i}", "app", "k3d-agent-0-0",
+                      "OOMKilled", 137, "2026-08-06T14:41:00Z") for i in range(3)],
+            [agent], None, incident)
+        assert len(ooms) == 3, [r["cronjob"] for r in ooms]
+        assert all(r["status"] == "oom_killed" for r in ooms)
+        assert all(severity_of(r) == "critical" for r in ooms)
+        # Warning-grade causes stay warnings: a SIGTERM is not a node fault.
+        sigterm = assess_pod_terminations(
+            [term_pod("factory", "app-1", "app", "k3d-agent-0-0", "Error", 143,
+                      "2026-08-06T14:41:00Z")], [agent], None, incident)[0]
+        assert severity_of(sigterm) == "warning", sigterm
+
+        # 6. QUIET WHEN NOTHING IS WRONG — the half that decides whether anyone
+        #    still reads this label in a month. The same six kills, a day later:
+        #    outside the window, nothing is reported at all.
+        later = datetime(2026, 8, 7, 14, 50, tzinfo=timezone.utc)
+        assert assess_pod_terminations(kills, [agent], None, later) == []
+        # A clean exit 0 is not a kill even inside the window.
+        assert assess_pod_terminations(
+            [term_pod("factory", "done", "c", "k3d-agent-0-0", "Completed", 0,
+                      "2026-08-06T14:41:00Z", where="state")],
+            [agent], None, incident) == []
+        # An empty cluster reports nothing rather than something reassuring.
+        assert assess_pod_terminations([], [agent], None, incident) == []
+
+        # 7. FAILING CLOSED. An unreadable pod list is a critical finding, never
+        #    a clean run: "nothing is watching" must not look like "nothing
+        #    happened", which is the whole thesis of this app.
+        blind = assess_pod_terminations([], [], "HTTPError(403)", incident)
+        assert len(blind) == 1 and blind[0]["status"] == "terminations_unreadable"
+        assert severity_of(blind[0]) == "critical"
+        assert "403" in " ".join(blind[0]["problems"])
+
+        # 8. NODE PRESSURE IS REPORTED WHEN PRESENT, and its absence is stated as
+        #    absence-now rather than absence-then. Node conditions carry no
+        #    history, and pretending otherwise would be the confident-wrong
+        #    attribution again.
+        hot = assess_pod_terminations(
+            kills, [term_node("k3d-agent-0-0", "2026-08-06T14:44:07Z",
+                              pressure="DiskPressure")], None, incident)[0]
+        assert "DiskPressure=True" in " ".join(hot["problems"])
+        assert "carry no history" in " ".join(lost["problems"])
+        # A vanished node must not silently drop the finding.
+        orphan = assess_pod_terminations(kills, [], None, incident)[0]
+        assert "no longer in the cluster" in " ".join(orphan["problems"])
+
+        # 9. THE ISSUE BODY carries the evidence, because `lastState` is destroyed
+        #    the moment the pod is replaced and the events age out in an hour.
+        #    Transcribing it is the only thing that outlives the incident.
+        kill_body = issue_body(lost, "critical")
+        assert "fides-db-54fdd777db-vm9lb" in kill_body, kill_body
+        assert "`Unknown`" in kill_body and "`255`" in kill_body
+        assert "Surviving Jobs" not in kill_body, "CronJob furniture leaked"
+        assert "Freshest reconcile" not in kill_body, "ArgoCD furniture leaked"
+        assert "absence of recurrence" in kill_body
+        assert issue_title(lost, "critical").startswith(
+            "[critical] kill/node/k3d-agent-0-0/runtime_lost lost containers")
+        # Every code that can notify must have a title phrase, or issue_title
+        # raises mid-incident and the notification is lost at the worst moment.
+        for c in NOTIFY_CODES | {"terminations_unreadable"}:
+            assert c in TITLE_PHRASE, c
+
+        # 10. CLOSE-ON-ABSENCE. An event does not recover, so it must never be
+        #     closed as "healthy again" — but it must still close, or a channel
+        #     that only ever accumulates teaches people to ignore the label.
+        kill_marker = MARKER.format(ns=lost["namespace"], name=lost["cronjob"])
+        assert f"/{KILL_PREFIX}" in kill_marker, kill_marker
+        cron_marker = MARKER.format(ns="factory", name="cred-broker")
+        assert f"/{KILL_PREFIX}" not in cron_marker, cron_marker
+        # A live finding is never swept: it is still in `records`, so the
+        # absence rule cannot fire on something that is currently happening.
+        assert kill_marker in {
+            MARKER.format(ns=r["namespace"], name=r["cronjob"]) for r in recs}
+
         print("selftest OK")
         return 0
 
@@ -1711,6 +2410,11 @@ spec:
                 # positive in 54,217 records — and this one takes the minimum
                 # age across Applications, so it is quieter still.
                 - { name: RECONCILE_TOLERANCE_SECONDS, value: "900" }
+                # 2x this CronJob's 30-minute period (Factory#598). A kill must
+                # not be able to land between two runs and be seen by neither,
+                # and the overlap costs only a repeated record for an already
+                # de-duplicated finding.
+                - { name: POD_TERMINATION_WINDOW_SECONDS, value: "3600" }
                 - { name: OO_STREAM, value: "job_health" }
                 - { name: OO_ORG, value: "default" }
                 # Where unhealthy findings go so a human passively meets them.

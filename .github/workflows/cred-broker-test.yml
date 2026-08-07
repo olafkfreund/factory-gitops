@@ -27,6 +27,10 @@ jobs:
         with:
           python-version: "3.12"
       - name: Extract refresh.py from the ConfigMap
-        run: python3 .github/scripts/extract_cred_broker.py /tmp/refresh_extracted.py
+        run: |
+          python3 .github/scripts/extract_embedded_script.py \
+            apps/cred-broker/manifests/manifests.yaml \
+            refresh.py \
+            /tmp/refresh_extracted.py
       - name: Both directions
         run: python3 .github/scripts/test_cred_broker.py
