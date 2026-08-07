@@ -11,7 +11,8 @@
 # No paths filter: this takes seconds, and a required check that does not run on
 # a PR leaves that PR blocked forever.
 #
-# argocd-drift has the same gap and is NOT covered here — see factory-gitops#152.
+# All three embedded selftests now run here — job-watchdog, restart-watchdog and
+# argocd-drift — which closes factory-gitops#152.
 name: job-watchdog selftest
 
 on:
@@ -55,3 +56,18 @@ jobs:
             /tmp/restart_watchdog_extracted.py
       - name: Selftest (restart-watchdog)
         run: python3 /tmp/restart_watchdog_extracted.py selftest
+
+      # argocd-drift, the last of the three embedded selftests and the other
+      # half of factory-gitops#152. It is the DETECTOR for the reconcile stall
+      # that job-watchdog now alerts on (Factory#443), so a regression in its
+      # assertions is a regression in the same signal from the other end. Same
+      # generic extractor, one more step: the whole gap was that nobody had
+      # pointed it at this file.
+      - name: Extract argocd-drift's drift.py from the ConfigMap
+        run: |
+          python3 .github/scripts/extract_embedded_script.py \
+            apps/argocd-drift/manifests/manifests.yaml \
+            drift.py \
+            /tmp/argocd_drift_extracted.py
+      - name: Selftest (argocd-drift)
+        run: python3 /tmp/argocd_drift_extracted.py selftest

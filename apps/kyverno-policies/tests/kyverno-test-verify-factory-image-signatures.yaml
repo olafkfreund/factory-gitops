@@ -10,7 +10,7 @@
 #
 # This suite is OFFLINE. Nothing in it reaches ghcr.io, Fulcio or Rekor, and it
 # therefore says nothing about whether any signature verifies. It tests one
-# thing: the SCOPE of the six verifyImages rules -- which image references they
+# thing: the SCOPE of the seven verifyImages rules -- which image references they
 # speak about, and, the point of the file, which ones they must not.
 #
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@
 #     caught: 5 errors where there were 15 passes.
 #   - a `results` entry naming a rule the engine did not load FAILS the gate,
 #     which is the first measurement above and is the one that matters here.
-#     Rename or delete any of the six rules below and this suite goes red
+#     Rename or delete any of the seven rules below and this suite goes red
 #     rather than quietly asserting nothing.
 #
 # What is still not caught is the narrowing of a glob within a rule that still
@@ -52,15 +52,36 @@
 # below asserts that no rule speaks about an image, which fails the moment a
 # glob WIDENS -- the Factory#564 direction, where `skillai:*` grown to
 # `skillai*` silently pulls a `skillai-*` package under SkillAi's non-main ref
-# anchor. Measured, as the mutation check on the PR that added this file:
+# anchor. RE-MEASURED on Kyverno v1.18.2 when Factory#572 added the seventh rule
+# and took the cross-product from 84 cases to 98:
 #
-#   `skillai:*`   -> `skillai*`            4 of 84 cases fail
-#   `cfactory:*`  -> `cfactory*`           4 of 84 cases fail
-#   namespaces: [factory] -> [factory, default]   2 of 84 cases fail
+#   `skillai:*`   -> `skillai*`            4 of 98 cases fail
+#   `cfactory:*`  -> `cfactory*`           4 of 98 cases fail
+#   `odin:*`      -> `odin*`               2 of 98 cases fail  (Factory#572,
+#                                          both on `near-odin-exporter`, which
+#                                          is what that fixture is FOR -- a
+#                                          verifyImages rule emits two rows per
+#                                          matched image, hence 2 not 1)
+#   namespaces: [factory] -> [factory, default]   2 of 98 cases fail
 #   `aifactory:*` -> `aifactory:v*`        0 fail -- the narrowing direction,
 #                                          and still 0 after #148, because
 #                                          every case here is legitimately
 #                                          negative and legitimately Excluded
+#
+# THE NARROWING DIRECTION IS STILL UNCAUGHT HERE, and Factory#572 measured what
+# that costs for a rule that is genuinely load-bearing rather than only for the
+# `aifactory:v*` toy above. Narrowing `odin:*` to `odin:v*` and running the real
+# running Pod through `kyverno apply` gives:
+#
+#   pass: 0, fail: 0, warn: 0, error: 0, skip: 0
+#
+# Not a fail. NOTHING. The rule stops speaking and the CLI reports success. The
+# offline suites cannot see it -- the coverage policy reads its own mirror list,
+# not these globs, so it goes on believing odin is covered. The channel that
+# does see it is apps/kyverno-runner-probe, which reads the
+# `kyverno.io/verify-images` annotation the live webhook writes and reports an
+# absent image as `not_covered`. That is why the probe is not redundant with
+# these tests, and why the mirror list and these globs must be edited together.
 #
 # That opposite direction is covered by a different control:
 # require-first-party-signature-coverage reports any first-party image running
@@ -84,12 +105,34 @@
 # status check, in exchange for assertions that cannot fail. #148 kept that
 # trade refused: it made coverage assertable WITHOUT the network, so these cases
 # stay uncommitted.
+#
+# Factory#572 did the same by-hand positive check for `verify-odin-signature`,
+# against the live registry with an EMPTY keychain (DOCKER_CONFIG pointing at a
+# directory holding `{}`), which is how Kyverno reads ghcr.io:
+#
+#   kyverno apply .../verify-factory-image-signatures.yaml \
+#     --resource <the running odin-dashboard Pod> --policy-report
+#   -> rule: verify-odin-signature   result: pass
+#      message: verified image signatures for ghcr.io/olafkfreund/odin:sha-2749b26
+#
+# and mutated it three ways, each of which must go red and did:
+#
+#   subject Odin -> CFactory                 pass:0 fail:2
+#     "subject mismatch: expected ^https://github\.com/olafkfreund/CFactory/...,
+#      received https://github.com/olafkfreund/Odin/.github/workflows/deploy.yml
+#      @refs/heads/main"   <- the engine naming the real identity back
+#   issuer -> https://accounts.google.com    pass:0 fail:2
+#   glob odin:* -> odin:v*                   pass:0 fail:0  <- see the narrowing
+#                                            note above; silence, not a verdict
+#
+# Restored: pass:2 fail:0. That is uncommitted for the reason above, but it is
+# the check that says the identity is right rather than merely well-formed.
 # ---------------------------------------------------------------------------
 #
 # `skip` is the expected result throughout. It reads as "this rule has nothing
 # to say about this image", which for a verifyImages rule means the reference
 # matched none of its `imageReferences` globs, or the Pod was out of namespace
-# scope. Each of the six rules is asserted against every fixture, because the
+# scope. Each of the seven rules is asserted against every fixture, because the
 # claim being made is not per-rule: NO rule in this policy may speak about any
 # of these images. That cross-product is what catches a glob widened in one
 # rule toward a name that belongs to another.
@@ -115,7 +158,7 @@ results:
       - near-skillai-worker
       - near-skillai-migrator-tools
       - near-miss-in-initcontainer
-      - uncovered-odin
+      - near-odin-exporter
       - digest-pinned-first-party
       - other-owner-same-name
       - other-registry-same-name
@@ -143,6 +186,16 @@ results:
     resources: *no-rule-may-match
   - policy: verify-factory-image-signatures
     rule: verify-skillai-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match
+  # Factory#572. Naming this rule here is not padding: gate check 1 in
+  # manifest-validate.yml fails the build if a suite names a rule the engine did
+  # not load, so this entry is what ties `verify-odin-signature` to the loaded-
+  # rule inventory. Rename or delete the rule and this suite goes red instead of
+  # quietly asserting nothing about it.
+  - policy: verify-factory-image-signatures
+    rule: verify-odin-signature
     kind: Pod
     result: skip
     resources: *no-rule-may-match

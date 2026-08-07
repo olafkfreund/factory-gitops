@@ -214,6 +214,17 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create"]
+  # Factory#606. A secretKeyRef env var is resolved once, at container start,
+  # and is never refreshed, so rewriting the Secret changed nothing for a pod
+  # that was already running — aifactory exported no spans for 23 hours after
+  # the value was corrected. Rolling the consumers belongs to the thing that
+  # knows the value changed. resourceNames pins it to the four Deployments that
+  # actually mount `otel-otlp-auth`; `get` is not needed, only the annotation
+  # patch that rolls the pod template.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["aifactory", "pfactory", "tfactory", "cfactory"]
+    verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -230,10 +241,20 @@ data:
     """Derive `otel-otlp-auth` from `observe-root`. Stdlib only (Factory#465).
 
     Idempotent and quiet: when the derived header already matches, it writes
-    nothing and says so. Exit 0 = the Secret now holds the right value,
-    whatever it held before.
+    nothing and says so. Exit 0 = the Secret now holds the right value AND
+    every consumer is running against it, whatever they held before.
 
-    Exit codes: 0 ok, 2 observe-root unreadable, 3 write refused.
+    Factory#606: writing the Secret is not the job. `OTEL_EXPORTER_OTLP_HEADERS`
+    comes from a `secretKeyRef`, which kubelet resolves once at container start
+    and never refreshes, so a pod that started before the rewrite keeps
+    presenting the old header forever. aifactory exported nothing for 23 hours
+    that way, and the window closed only when something unrelated restarted it.
+    So a changed value now also rolls the four consumers, by stamping the
+    Secret's new resourceVersion onto their pod templates.
+
+    Exit codes: 0 ok, 2 observe-root unreadable, 3 write refused,
+    4 Secret written but a consumer could not be rolled (the dangerous state:
+    the value is right and something is still running on the old one).
     """
     import base64
     import json
@@ -247,6 +268,17 @@ data:
     DST = "otel-otlp-auth"
     API = "https://kubernetes.default.svc"
     ROOT = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+    # The Deployments whose pods take the header from `secretKeyRef`. Grep for
+    # `otel-otlp-auth` under apps/ to check this list is still complete; the
+    # Role pins the same four names.
+    CONSUMERS = ("aifactory", "pfactory", "tfactory", "cfactory")
+    # Stamped onto the pod template to force a roll. The value is the Secret's
+    # resourceVersion, NOT a hash of the header: a truncated digest of a
+    # low-entropy password sitting in a world-readable annotation is a leak,
+    # and the resourceVersion changes on exactly the same events. No domain
+    # prefix, so the ArgoCD ignoreDifferences pointer needs no ~1 escaping.
+    ANNOTATION = "otlp-auth-resourceversion"
 
 
     def eprint(*a):
@@ -270,6 +302,36 @@ data:
         with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
             raw = r.read()
         return json.loads(raw) if raw else None
+
+
+    def roll(rv):
+        """Stamp `rv` on every consumer's pod template. Returns names that failed.
+
+        A 404 is not a failure: an app that is not deployed has no pod running
+        on the old header. Anything else is, and it is the state worth an exit
+        code — the Secret is now right and something is still exporting with
+        the value it read at startup.
+        """
+        failed = []
+        for name in CONSUMERS:
+            try:
+                k8s(
+                    "PATCH",
+                    f"/apis/apps/v1/namespaces/{NS}/deployments/{name}",
+                    {"spec": {"template": {"metadata": {"annotations": {ANNOTATION: rv}}}}},
+                    content_type="application/merge-patch+json",
+                )
+                print(f"rolled {name} ({ANNOTATION}={rv})")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    print(f"skipped {name}: not deployed")
+                    continue
+                eprint(f"cannot roll {name}: {e!r}")
+                failed.append(name)
+            except Exception as e:  # noqa: BLE001 — a refused roll is the finding
+                eprint(f"cannot roll {name}: {e!r}")
+                failed.append(name)
+        return failed
 
 
     def main() -> int:
@@ -309,14 +371,14 @@ data:
 
         try:
             if cur:
-                k8s(
+                new = k8s(
                     "PATCH",
                     f"/api/v1/namespaces/{NS}/secrets/{DST}",
                     {"data": {"headers": wanted}},
                     content_type="application/merge-patch+json",
                 )
             else:
-                k8s(
+                new = k8s(
                     "POST",
                     f"/api/v1/namespaces/{NS}/secrets",
                     {
@@ -336,11 +398,24 @@ data:
             return 3
 
         # Loud on change: this is the line that would have shown #465 on day one.
-        print(
-            f"REWROTE {DST} from {SRC}: auth scheme was {had}, now Basic. "
-            "Pods already running keep the old value until they restart — "
-            "env from a Secret is read once, at container start."
-        )
+        print(f"REWROTE {DST} from {SRC}: auth scheme was {had}, now Basic.")
+
+        # Factory#606. Env from a Secret is read once, at container start, so
+        # the rewrite above is invisible to every pod already running. Rolling
+        # them is part of the same operation that caused it, not a thing a
+        # human is expected to remember.
+        rv = ((new or {}).get("metadata") or {}).get("resourceVersion")
+        if not rv:
+            # No resourceVersion means no stable value to stamp, and stamping
+            # nothing would silently leave the consumers on the old header.
+            eprint(f"FATAL: {DST} written but the API returned no resourceVersion; "
+                   "consumers NOT rolled and are still on the old value")
+            return 4
+        failed = roll(rv)
+        if failed:
+            eprint(f"FATAL: {DST} is correct, but these could not be rolled and are "
+                   f"still exporting with the value read at startup: {', '.join(failed)}")
+            return 4
         return 0
 
 

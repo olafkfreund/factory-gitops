@@ -307,21 +307,30 @@ data:
     # bug this list of images cannot see on its own. See COVERAGE below.
     #
     # ghcr.io/olafkfreund/odin is in the list above for exactly that reason. It
-    # is not a runner and not a Job image; it is the one first-party image known
-    # to be covered by NO rule today (Factory#572 -- signed, but its GHCR
-    # package is private and `kyverno-ghcr-pull` does not exist, so a rule would
-    # report UNAUTHORIZED in the same words a signature failure uses). It is
-    # carried here so this record states the true first-party position rather
-    # than a runner-only slice of it, and so the honest red is in the evidence.
-    # DO NOT remove it to make the verdict green; remove it when #572 closes and
-    # odin has a rule, at which point it will report `pass` on its own.
+    # is not a runner and not a Job image; it was carried as the one first-party
+    # image covered by NO rule, so that this record stated the true first-party
+    # position rather than a runner-only slice of it, and so the honest red was
+    # in the evidence.
     #
-    # The tag does not need chasing when odin redeploys. Coverage is decided by
-    # the repository globs, and NO glob names `odin` at any tag, so the verdict
-    # is `not_covered` whatever is pinned here. It is set to the tag actually
-    # running only so the record names something real -- Factory#568 recorded
-    # sha-50b5932, the cluster has since moved to sha-2749b26, and the verdict
-    # was identical for both.
+    # Factory#572 CLOSED that gap on 2026-08-07: the `odin` GHCR package was made
+    # public, `verify-odin-signature` was added to verify-factory-image-
+    # signatures and `odin:` to the coverage policy's mirror list. odin now
+    # reports `pass` here on its own, which is what the old comment said should
+    # happen. IT IS DELIBERATELY KEPT IN THE LIST rather than removed. Removing
+    # it would drop a real signature verification from the probe to no benefit;
+    # keeping it means the two coverage channels stay cross-checked on the image
+    # whose gap motivated the check.
+    #
+    # THE PINNED TAG NOW MATTERS IN A WAY IT DID NOT BEFORE, and this is the one
+    # thing to know before triaging an odin row here. While odin was uncovered
+    # the verdict was `not_covered` at any tag, so a stale pin was harmless. Now
+    # the tag is fetched and its signature verified: a stale pin still passes --
+    # cosign signatures are digest-keyed and old tags stay signed -- but it
+    # verifies a HISTORICAL image rather than the one running. So a `pass` on
+    # this row is not by itself a statement about the live deployment. The
+    # standing PolicyReport from verify-odin-signature is; that is the channel
+    # that follows the running Pod. Factory#568 recorded sha-50b5932, the cluster
+    # has since moved to sha-2749b26.
     FIRST_PARTY = re.compile(r"^ghcr\.io/olafkfreund/")
 
     # The negative half of the coverage contract. First-party, and named by no

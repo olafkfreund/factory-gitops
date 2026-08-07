@@ -613,6 +613,143 @@ jobs:
           #   - It cannot see workloads sourced from other repos. skillai-app comes
           #     from olafkfreund/SkillAi and is unhardened live; Factory#624.
 
+      # Factory#620. A Kyverno `Fail` webhook can stop every write it covers, so
+      # the blast radius of a Fail policy is decided entirely by its
+      # matchConditions -- and by how many Fail policies share the webhook.
+      #
+      # WHY THIS IS NOT COVERED ABOVE. Everything else in this job reasons about
+      # a policy in isolation. This hazard only exists BETWEEN policies:
+      # Kubernetes ANDs a webhook's matchConditions and Kyverno unions the
+      # matchConditions of every policy in a failure-policy group into that
+      # group's webhook. So adding a second Fail policy is enough to break the
+      # first one's scope without editing the first one's file -- either
+      # widening the webhook (second policy has no matchConditions) or silently
+      # switching both policies off (second policy has different ones). Neither
+      # is visible from either file alone, neither changes any rule's behaviour
+      # in `kyverno test`, and the failure mode of getting it wrong is the whole
+      # cluster.
+      #
+      # Kyverno v1.18.2 happens to render a policy that sets
+      # `webhookConfiguration` into its OWN "finegrained" webhook, which dodges
+      # the union -- verified by reading the generated config back off the
+      # cluster. This gate does not depend on that holding: it keeps the repo in
+      # the state that is safe either way.
+      - name: A Fail policy must be scoped, and must be the only one
+        run: |
+          set -uo pipefail
+
+          mapfile -t POLICIES < <(
+            git ls-files -z 'apps/**/*.yaml' | tr '\0' '\n' | sort | while read -r f; do
+              grep -qE '^apiVersion:[[:space:]]*"?kyverno\.io/' "$f" && printf '%s\n' "$f"
+            done
+          )
+          # Rule 4.7: a gate that cannot run must fail, not pass. The same
+          # discovery regex as the steps above, so if that regex ever stops
+          # matching, every Kyverno step in this job goes red together rather
+          # than this one quietly finding nothing to check.
+          if [ "${#POLICIES[@]}" -eq 0 ]; then
+            echo "::error::discovered 0 Kyverno policies -- this gate checked nothing"
+            exit 1
+          fi
+          echo "scanning ${#POLICIES[@]} Kyverno policy file(s) for Fail webhooks"
+
+          rc=0
+          failing=()
+          for f in "${POLICIES[@]}"; do
+            # Both spellings. `spec.failurePolicy` is deprecated and Kyverno
+            # rejects it outright alongside `webhookConfiguration`, but a policy
+            # carrying only the old one is still a Fail webhook.
+            fp=$(yq -r '[.spec.failurePolicy, .spec.webhookConfiguration.failurePolicy] | map(select(. != null)) | .[0] // "Ignore"' "$f")
+            [ "$fp" = "Fail" ] || continue
+
+            failing+=("$f")
+            n=$(yq -r '.spec.webhookConfiguration.matchConditions | length // 0' "$f")
+            if [ "$n" -lt 1 ]; then
+              echo "::error file=$f::failurePolicy Fail with no spec.webhookConfiguration.matchConditions -- this registers a Fail webhook over everything the policy's rules cover, cluster wide (Factory#620)"
+              rc=1
+            else
+              echo "ok  fail-scope  $f  ($n matchCondition(s))"
+            fi
+          done
+
+          if [ "${#failing[@]}" -gt 1 ]; then
+            echo "::error::${#failing[@]} policies set failurePolicy Fail: ${failing[*]}"
+            echo "::error::Kyverno ANDs matchConditions across a failure-policy group, so a second Fail policy either widens the first one's webhook or switches both off. Read the generated webhook back off the cluster before allowing this (Factory#620)."
+            rc=1
+          fi
+
+          if [ "${#failing[@]}" -eq 0 ]; then
+            echo "no Fail policies -- nothing to scope"
+          fi
+          exit "$rc"
+
+      # Factory#620. STRIPS `spec.webhookConfiguration.matchConditions` FROM THE
+      # CHECKED-OUT COPY so the two Kyverno CLI steps below can run at all.
+      #
+      # The Kyverno CLI v1.18.2 SEGFAULTS on a policy that carries that field:
+      #
+      #   $ kyverno apply apps/kyverno-policies/manifests/gate-task-pods-on-network-policy.yaml \
+      #       --resource /tmp/kyverno-probe.yaml -v 4
+      #   Applying 2 policy rule(s) to 1 resource(s)...
+      #   panic: runtime error: invalid memory address or nil pointer dereference
+      #     github.com/kyverno/kyverno/pkg/validation/policy.Validate
+      #       pkg/validation/policy/validate.go:139
+      #
+      # exit 2, no message. Bisected against the CLI: `webhookConfiguration`
+      # with only `failurePolicy` is fine; adding `matchConditions` panics; and
+      # `kyverno test` panics on the same file. So without this, the policy that
+      # made `Fail` safe would take BOTH offline Kyverno gates down with it, and
+      # under `shell: bash -e` it does so before either step can print why.
+      #
+      # This is a CLI defect, not a policy defect. The live webhook accepts the
+      # same file -- `kubectl apply --dry-run=server` succeeds, and the policy
+      # has been applied to the cluster and its generated webhook read back.
+      #
+      # NOT FIXED BY BUMPING THE CLI. The pin above is to v1.18.2 to MATCH the
+      # admission controller, which is the entire point of those steps; the only
+      # newer release is a v1.19.0-rc.1 pre-release. Trading "agrees with the
+      # webhook that will judge this for real" for "does not crash" is the wrong
+      # trade, and it would be a silent downgrade of both gates.
+      #
+      # WHAT COVERAGE THIS COSTS, STATED PLAINLY: nothing the CLI could measure.
+      # The CLI models rule evaluation against a resource; it does not generate
+      # webhook configurations, so it never had an opinion on matchConditions.
+      # The field is covered by the step ABOVE (present, non-empty, and the only
+      # Fail policy) and by reading the generated webhook off the cluster, which
+      # is the only place the question is actually decided.
+      #
+      # Deliberately ordered AFTER the Fail-scope gate: that gate reads the
+      # unstripped file. Anything else added here that needs
+      # webhookConfiguration must go above this step too.
+      - name: Work around a Kyverno CLI segfault on webhookConfiguration.matchConditions
+        run: |
+          set -uo pipefail
+
+          mapfile -t POLICIES < <(
+            git ls-files -z 'apps/**/*.yaml' | tr '\0' '\n' | sort | while read -r f; do
+              grep -qE '^apiVersion:[[:space:]]*"?kyverno\.io/' "$f" && printf '%s\n' "$f"
+            done
+          )
+          if [ "${#POLICIES[@]}" -eq 0 ]; then
+            echo "::error::discovered 0 Kyverno policies -- cannot confirm the workaround applied"
+            exit 1
+          fi
+
+          stripped=0
+          for f in "${POLICIES[@]}"; do
+            yq -e '.spec.webhookConfiguration.matchConditions' "$f" >/dev/null 2>&1 || continue
+            yq -i 'del(.spec.webhookConfiguration.matchConditions)' "$f"
+            # Rule 4.7 again: a strip that silently did nothing would hand the
+            # panicking file straight to the next step.
+            if yq -e '.spec.webhookConfiguration.matchConditions' "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::matchConditions survived the strip -- the CLI steps below will segfault"
+              exit 1
+            fi
+            echo "stripped matchConditions from $f (CLI workaround only; the file in git is unchanged)"
+            stripped=$((stripped + 1))
+          done
+          echo "$stripped policy file(s) adjusted for the CLI"
+
       - name: Validate Kyverno policies with Kyverno's own policy validation
         run: |
           set -uo pipefail
@@ -1009,6 +1146,9 @@ jobs:
           #     rekor, by design; the suite is offline rule logic only.
           #   - Anything the webhook checks at admission time that the CLI does
           #     not, which is why the `kyverno apply` step above stays.
+          #   - A `Fail` policy widening beyond its matchConditions. That is not
+          #     a property of a rule, it is a property of the generated webhook,
+          #     and `kyverno test` never generates one. See the next step.
           exit "$fail"
 
   # Second gate, deliberately NOT the required status check (branch protection

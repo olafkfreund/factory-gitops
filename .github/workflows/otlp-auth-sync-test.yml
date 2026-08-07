@@ -1,0 +1,43 @@
+# observe-otlp-auth-sync's sync.py lives as a block scalar inside a ConfigMap,
+# so nothing imported it and nothing ran it. Factory#465 made the derived value
+# correct; Factory#606 is that it never reached the pods, because a secretKeyRef
+# env var is resolved once at container start and never refreshed. aifactory
+# exported no spans for 23 hours and the fleet found out only because a new
+# check asked the collector.
+#
+# No paths filter: this takes seconds, and a required check that does not run on
+# a PR leaves that PR blocked forever.
+name: otlp-auth-sync rolls its consumers
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: a rotation reaches the pods
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Extract sync.py from the ConfigMap
+        run: |
+          python3 .github/scripts/extract_embedded_script.py \
+            apps/observe/manifests/manifests.yaml \
+            sync.py \
+            /tmp/otlp_sync_extracted.py
+      - name: Rotation reaches every consumer
+        run: python3 .github/scripts/test_otlp_auth_sync.py
+
+      # The reconciler patches a pod-template annotation, so every consumer's
+      # ArgoCD Application must ignore that pointer or selfHeal strips it back
+      # off and rolls the Deployment a second time.
+      - name: Every consumer ignores the annotation it is stamped with
+        run: python3 .github/scripts/check_otlp_ignore_differences.py

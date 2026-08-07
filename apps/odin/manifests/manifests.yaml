@@ -7,6 +7,12 @@ metadata:
     app: odin-dashboard
 spec:
   replicas: 1
+  # Factory#640: retained ReplicaSets keep their image reference, and the
+  # signature gate evaluates every one of them. Eleven revisions of history
+  # meant five pre-signing tags sat permanently red on the board and armed a
+  # denial for any `rollout undo` that reached them. Two is enough to roll
+  # back one bad deploy; more is unbounded liability at Enforce.
+  revisionHistoryLimit: 2
   strategy:
     type: Recreate
   selector:
