@@ -24,3 +24,13 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+  # observe-otlp-auth-sync stamps this annotation on the pod template when it
+  # rewrites `otel-otlp-auth`, which is what makes the new header reach a
+  # running pod at all (Factory#606). Without this, selfHeal would strip the
+  # annotation straight back off and roll the Deployment a second time.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: cfactory
+      jsonPointers:
+        - /spec/template/metadata/annotations/otlp-auth-resourceversion

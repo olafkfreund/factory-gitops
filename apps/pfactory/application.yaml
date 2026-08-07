@@ -26,9 +26,17 @@ spec:
       - CreateNamespace=true
   # KEDA's HPA owns spec.replicas (RFC-0016 #192). Without this, selfHeal would
   # revert the HPA's scale-out back to the manifest and fight the autoscaler.
+  #
+  # observe-otlp-auth-sync owns otlp-auth-resourceversion: it stamps that
+  # annotation on the pod template when it rewrites `otel-otlp-auth`, which is
+  # what makes the new header reach a running pod at all (Factory#606). A
+  # secretKeyRef env var is resolved once at container start and never
+  # refreshed. Without this pointer, selfHeal would strip the annotation back
+  # off and roll the Deployment a second time.
   ignoreDifferences:
     - group: apps
       kind: Deployment
       name: pfactory
       jsonPointers:
         - /spec/replicas
+        - /spec/template/metadata/annotations/otlp-auth-resourceversion
