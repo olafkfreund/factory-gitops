@@ -99,6 +99,20 @@ subjects:
 # deploy_runner.assert_dry_run (which, as of #569, also refuses a bare
 # `kubectl create` — dropping the flag is no longer a silent real apply).
 #
+# Factory#570 — `create` IS NOT HARMLESS, AND assert_dry_run IS NOT WHAT BOUNDS
+# IT. That guard is client-side, in the SAME Job as the model-generated content
+# it polices, and RBAC cannot tell a dryRun=All create from a real one. So
+# `create pods`/`jobs`/`deployments` here is a privilege-escalation primitive: a
+# REAL pod naming `serviceAccountName: cred-broker` (or tfactory-sandbox) hands
+# the caller that SA's token; a real ServiceAccount + RoleBinding mints a fresh
+# identity. Demonstrated on the live cluster. The layer that expresses the
+# constraint RBAC cannot is the Kyverno ClusterPolicy
+# `deploy-dryrun-sa-dryrun-only` (apps/kyverno-policies/manifests, ENFORCE),
+# which denies any NON-dryRun create by this SA while letting
+# `create --dry-run=server` through. Keep the two together: narrowing these
+# verbs further breaks the lane (create is required), so the admission policy —
+# not this Role — is what makes the grant safe.
+#
 # ORDERING: this Role REQUIRES the TFactory image to be running the `create`
 # spelling (TFactory#953). It ships only once that image is deployed; landing it
 # against an `apply` build breaks the VAL-2 rung on every kind, not just Secrets.
