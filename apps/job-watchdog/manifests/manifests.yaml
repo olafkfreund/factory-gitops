@@ -112,6 +112,79 @@
 # reported one produces zero until it escalates or the re-notify window elapses;
 # a recovered one gets a comment and its issue CLOSED. An alarm that fires every
 # 30 minutes is muted within a week, which is this same bug by another route.
+#
+# ---------------------------------------------------------------------------
+# ARGOCD STOPPED RECONCILING (Factory#443, factory-gitops#138)
+# ---------------------------------------------------------------------------
+#
+# On 2026-08-06 `k3d-agent-0-0` went NotReady at 03:17 and stranded
+# `argocd-application-controller-0` in Terminating. A single-replica StatefulSet
+# does not recreate a pod stuck terminating on an unreachable node, so the
+# controller was simply ABSENT and nothing in the cluster reconciled for six
+# hours. Two merged PRs sat in git and never reached the cluster. ArgoCD
+# reported, throughout:
+#
+#     $ kubectl get application pfactory -n argocd
+#     pfactory   Synced   Healthy
+#
+# `status.sync.status` is a CACHED COMPUTATION, not a live probe. A stranded
+# controller writes nothing, so nothing contradicts the old value and it reports
+# `Synced` indefinitely. `status.reconciledAt` is the field that actually moves
+# — it is to ArgoCD what `results[].timestamp` is to a Kyverno PolicyReport
+# (Factory#444) and `gate_revision` to a readiness verdict (PFactory#450).
+#
+# WHY HERE AND NOT IN apps/argocd-drift, WHICH ALREADY DETECTS THIS. It does,
+# correctly, and has since 2026-07-30: signal 2 of that job is exactly this
+# check. It was not the detection that failed. argocd-drift EMITS to the
+# OpenObserve stream `argocd_drift`, and the only reader of a stream is someone
+# who already went looking — the person who does not need it. Measured over the
+# nine days to 2026-08-07, `argocd_drift` holds 54,217 `ok` records and 304
+# `reconcile_stale` ones, and every single one of those 304 falls inside the
+# 08:00-10:00 window of the incident. The signal was right, on time, and silent.
+# Factory#439 is that same defect one layer down, and this app is where it was
+# fixed: this is the only thing in the fleet with a route to a human.
+#
+# So the DETECTION stays in argocd-drift (per Application, with the git-tip
+# comparison that needs) and the ALERT lands here, on the one path that already
+# notifies, dedupes, escalates, auto-closes and carries a dead-man's switch.
+# Copying that ~250-line issue state machine into argocd-drift would have been a
+# second thing to keep honest; this is ~40 lines that reuse it.
+#
+# ONE RECORD FOR THE WHOLE CONTROLLER, NOT ONE PER APPLICATION. When
+# reconciliation stops it stops for everything: on 2026-08-06 all 35 Applications
+# went stale together. A per-Application alert would have opened 35 GitHub issues
+# for one fault, which is CFactory#306's defect (an alarm that fires routinely
+# stops being an alarm) reached by volume instead of by frequency. The signal is
+# therefore the FRESHEST `reconciledAt` in the cluster: if the controller is
+# alive at all, something was reconciled recently. One issue, one dedup key,
+# `argocd/argocd-application-controller`.
+#
+# THE THRESHOLD IS MEASURED, NOT GUESSED. `timeout.reconciliation` is UNSET in
+# this cluster's `argocd-cm` (the ConfigMap has no `data` at all), so the
+# upstream default of 180s applies. Sampled live every 25s: the freshest
+# reconcile in the cluster cycles 0 -> ~180s as the controller sweeps all 35
+# Applications in one burst. 900s is 5x that interval — the SAME number
+# argocd-drift has used for the same field for eight days without one false
+# positive across 54,217 records, and this signal takes the MINIMUM age where
+# argocd-drift takes each app's own, so it fires strictly less often than a
+# threshold already proven quiet.
+#
+# WHEN THE WHOLE NODE IS STRANDED, THIS CHECK IS BLIND — and it must be said
+# out loud rather than assumed away. This is a CronJob on the cluster it
+# watches. On 2026-08-06 it was stranded on the same dead node as the controller
+# and argocd-drift, and none of the three ran between 03:17 and ~08:00. The
+# check below therefore covers the case where the CONTROLLER alone is gone
+# (OOMKilled, scaled to 0, crash-looping, its Redis unreachable) and the rest of
+# the cluster is fine — a real case that nothing alerts on today, because every
+# CronJob keeps passing and every Application keeps reporting Synced.
+#
+# The whole-cluster case is already covered, by the layer above: this watchdog
+# stamps JOB_WATCHDOG_HEARTBEAT only after a successful notify, and the
+# `job-watchdog-heartbeat` workflow in ALERT_REPO goes red on that stamp's
+# absence. It fired correctly on 2026-08-06 — the 07:20Z run failed, and every
+# run through 08:13Z, which is the only thing that did. So the new signal rides
+# a path that is already proven in both halves: in-cluster for a dead
+# controller, out-of-cluster for a dead cluster.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -143,6 +216,12 @@ metadata:
 rules:
   - apiGroups: ["batch"]
     resources: ["cronjobs", "jobs"]
+    verbs: ["get", "list"]
+  # Factory#443. Read-only on Applications, for the ONE field that moves when
+  # ArgoCD is alive: status.reconciledAt. Same grant apps/argocd-drift already
+  # holds, and still no write verb anywhere.
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -185,6 +264,13 @@ data:
     stream alone was not a notification: it was read by nobody for days while the
     fleet ran with no database backup at all.
 
+    It also emits ONE record on whether ArgoCD is still reconciling at all
+    (#443), taken from the FRESHEST status.reconciledAt across every
+    Application. `status.sync.status` cannot answer that question: it is a
+    cached computation, so a controller that has stopped writing keeps reporting
+    `Synced` indefinitely, which is what six hours of undeployed commits looked
+    like on 2026-08-06. reconciledAt is the field that moves.
+
     Finally it stamps a HEARTBEAT out to a GitHub Actions repo variable, so that
     a scheduled workflow outside the cluster can go red on the watchdog's own
     silence (#450). Only after the notification succeeded — see the manifest
@@ -200,6 +286,8 @@ data:
 
     Env:
       FAIL_THRESHOLD        consecutive failures before status=failing (2)
+      RECONCILE_TOLERANCE_SECONDS
+                            max age of the freshest ArgoCD reconciledAt (900)
       OBSERVE_URL           OpenObserve base url (default in-cluster service)
       OO_ORG                OpenObserve organization (default "default")
       OO_STREAM             target stream (default "job_health")
@@ -255,7 +343,41 @@ data:
     # success is still within tolerance and the next run may well clear it. A
     # warning that does not clear becomes critical on its own once the last
     # success ages past tolerance, so nothing has to remember to escalate it.
-    CRITICAL_CODES = {"never_succeeded", "stale"}
+    # Both ArgoCD codes are critical for the same reason: while either holds, git
+    # has stopped being the truth and every `Synced` in the cluster is a cached
+    # opinion from before the stall. There is no "may self-recover" reading of a
+    # controller that is not running.
+    CRITICAL_CODES = {"never_succeeded", "stale", "reconcile_stalled",
+                      "reconcile_unreadable"}
+
+    # Factory#443. ArgoCD's application controller re-examines every Application
+    # every `timeout.reconciliation`. That key is UNSET in this cluster's
+    # argocd-cm (the ConfigMap carries no `data` at all), so the upstream default
+    # of 180s applies — measured, not assumed. 900s is 5x it.
+    #
+    # Sampled live at 25s intervals on 2026-08-07: the controller sweeps all 35
+    # Applications in one burst, so the freshest reconciledAt in the cluster
+    # cycles 0 -> ~180s and the oldest peaks around 340s when one app misses a
+    # burst. The signal below takes the MINIMUM age, so it is quieter still.
+    #
+    # The strongest evidence that 900 does not cry wolf is that it is already
+    # deployed: apps/argocd-drift has used exactly this number on exactly this
+    # field since 2026-07-30, PER APPLICATION. Over the nine days to 2026-08-07
+    # its stream holds 54,217 `ok` records and 304 `reconcile_stale`, and all 304
+    # fall inside the 08:00-10:00 window of the factory-gitops#138 incident. A
+    # minimum-across-apps threshold fires strictly less often than a per-app one,
+    # so it inherits that quiet with room to spare.
+    #
+    # Raising this is safe; lowering it below ~360s is not, and would need the
+    # reconciliation timeout re-measured first rather than assumed.
+    DEFAULT_RECONCILE_TOLERANCE = 900
+    ARGOCD_RECONCILE_INTERVAL = 180
+
+    # The subject the ArgoCD record is filed under. It is the StatefulSet that
+    # actually stopped, which is what a human needs to go and look at, and it
+    # gives the finding a stable dedup key that does not depend on which
+    # Application happened to be checked.
+    ARGOCD_SUBJECT = ("argocd", "argocd-application-controller")
 
     ISSUE_LABEL = "job-watchdog"
     SEVERITY_LABELS = {"critical": "severity:critical", "warning": "severity:warning"}
@@ -276,7 +398,19 @@ data:
         "failing": "is failing",
         "not_scheduled": "is no longer being scheduled",
         "suspended": "is suspended and will never run",
+        "reconcile_stalled": "has stopped reconciling — every Synced is stale",
+        "reconcile_unreadable": "cannot be read, so nothing is checking ArgoCD",
     }
+
+    # "last success" is the CronJob word. For the ArgoCD record the same field
+    # holds the age of the last reconcile, and calling that a success in the
+    # issue body would be one more sentence a reader has to translate.
+    def _subject_kind(record: dict) -> str:
+        return record.get("kind") or "CronJob"
+
+
+    def _success_label(record: dict) -> str:
+        return "last reconcile" if _subject_kind(record) == "ArgoCD" else "last success"
 
 
     def issue_title(record: dict, sev: str) -> str:
@@ -456,6 +590,7 @@ data:
         return {
             "_timestamp": int(now.timestamp() * 1_000_000),
             "source": "job-watchdog",
+            "kind": "CronJob",
             "namespace": meta.get("namespace", ""),
             "cronjob": name,
             "schedule": schedule,
@@ -472,6 +607,101 @@ data:
             "last_success_age_seconds": None if success_age is None else int(success_age),
             "last_schedule_age_seconds": None if schedule_age is None else int(schedule_age),
             "expected_period_seconds": period,
+            "tolerance_seconds": tolerance,
+        }
+
+
+    def assess_argocd(apps: list[dict], error: str | None, now: datetime,
+                      tolerance: int) -> dict:
+        """Pure: every ArgoCD Application -> ONE record on the controller (#443).
+
+        THE DEFECT THIS CLOSES: on 2026-08-06 the application controller was
+        stranded on a NotReady node from 03:17. It is a single-replica
+        StatefulSet, and a StatefulSet does not recreate a pod stuck Terminating
+        on an unreachable node, so nothing reconciled for six hours. Two merged
+        PRs sat in git and never reached the cluster, while every Application
+        reported `Synced Healthy` the whole time.
+
+        WHY reconciledAt AND NOT sync.status. `status.sync.status` is a CACHED
+        COMPUTATION, not a live probe. A controller that has stopped writing
+        writes nothing that contradicts the old value, so `Synced` survives its
+        own author indefinitely — the more thoroughly ArgoCD is broken, the more
+        confidently it reports success. `status.reconciledAt` is the timestamp of
+        the last LOOK, and a stopped controller cannot forge it. Same shape as
+        Factory#444 (a PolicyReport's results[].timestamp, not its
+        metadata.creationTimestamp) and PFactory#450 (gate_revision).
+
+        ONE RECORD, NOT 35. Reconciliation does not stop for one Application; it
+        stops for the controller. All 35 went stale together on 2026-08-06, so a
+        per-Application record would have opened 35 issues for one fault, and an
+        alert that arrives 35-at-a-time is one nobody reads twice. The measure is
+        therefore the FRESHEST reconciledAt anywhere in the cluster: if the
+        controller is running at all, something was reconciled recently. Taking
+        the minimum also makes a legitimately paused or excluded single
+        Application incapable of raising this, which a per-app check could not
+        promise.
+
+        FAILS CLOSED. Applications that cannot be listed at all, and a cluster
+        where no Application carries a reconciledAt, are both reported as
+        findings rather than skipped. "I could not check" must never leave the
+        same trace as "I checked and it was fine" — that is this whole app.
+        """
+        ns, name = ARGOCD_SUBJECT
+        ages = sorted(
+            (now - _parse_ts(raw)).total_seconds()
+            for raw in (
+                (a.get("status") or {}).get("reconciledAt") for a in apps
+            )
+            if raw
+        )
+        freshest = ages[0] if ages else None
+        problems: list[tuple[str, str]] = []
+
+        if error is not None:
+            problems.append(
+                ("reconcile_unreadable",
+                 f"CANNOT READ ArgoCD Applications ({error}) — so nothing is "
+                 "checking whether GitOps is still running, and every `Synced` "
+                 "in the cluster is now unverified")
+            )
+        elif freshest is None:
+            problems.append(
+                ("reconcile_unreadable",
+                 f"{len(apps)} Application(s) and NOT ONE carries a "
+                 "status.reconciledAt — the controller has never completed a "
+                 "comparison, so no sync status in this cluster is evidence of "
+                 "anything")
+            )
+        elif freshest > tolerance:
+            problems.append(
+                ("reconcile_stalled",
+                 f"ArgoCD HAS STOPPED RECONCILING: the freshest reconciledAt "
+                 f"across {len(ages)} Application(s) is {_dur(freshest)} old "
+                 f"(> {_dur(tolerance)} tolerance, {_dur(ARGOCD_RECONCILE_INTERVAL)} "
+                 "reconciliation interval). Every Application still reporting "
+                 "Synced/Healthy is reporting a cached result from before the "
+                 "stall — deploys are landing in git and nowhere else "
+                 "(factory-gitops#138)")
+            )
+
+        return {
+            "_timestamp": int(now.timestamp() * 1_000_000),
+            "source": "job-watchdog",
+            # ponytail: `cronjob` holds the subject name for an Application
+            # controller too. The key is kept because it is the `job_health`
+            # stream's existing schema and the issue dedup marker; `kind`
+            # disambiguates. Renaming it would rewrite eight days of records and
+            # orphan every open issue, to fix a word.
+            "kind": "ArgoCD",
+            "namespace": ns,
+            "cronjob": name,
+            "status": problems[0][0] if problems else "ok",
+            "codes": [p[0] for p in problems],
+            "problems": [p[1] for p in problems],
+            "applications": len(apps),
+            "last_success_age_seconds": None if freshest is None else int(freshest),
+            "oldest_reconcile_age_seconds": None if not ages else int(ages[-1]),
+            "expected_period_seconds": ARGOCD_RECONCILE_INTERVAL,
             "tolerance_seconds": tolerance,
         }
 
@@ -570,22 +800,35 @@ data:
         def fmt(field):
             v = record.get(field)
             return "never" if v is None else f"{_dur(v)} ago"
+        is_cron = _subject_kind(record) == "CronJob"
         lines = [
             MARKER.format(ns=ns, name=name),
-            f"**Severity: {sev.upper()}** — `{ns}/{name}`, schedule "
-            f"`{record['schedule']}`, status `{record['status']}`.",
+            f"**Severity: {sev.upper()}** — `{ns}/{name}`"
+            + (f", schedule `{record['schedule']}`" if is_cron else "")
+            + f", status `{record['status']}`.",
             "",
             "What the watchdog found:",
             "",
         ]
         lines += [f"- {p}" for p in record["problems"]]
+        lines += [""]
+        if is_cron:
+            lines += [
+                f"- Consecutive failed runs: {record['consecutive_failures']}",
+                f"- Surviving Jobs: {record['surviving_jobs']} "
+                "(absence of failed Jobs is not health — they are garbage collected)",
+                f"- Last success: {fmt('last_success_age_seconds')}",
+                f"- Last schedule: {fmt('last_schedule_age_seconds')}",
+            ]
+        else:
+            lines += [
+                f"- Applications seen: {record.get('applications')}",
+                f"- Freshest reconcile: {fmt('last_success_age_seconds')} "
+                "(this is the measure — `sync.status` is a cached computation "
+                "and survives the controller that wrote it)",
+                f"- Oldest reconcile: {fmt('oldest_reconcile_age_seconds')}",
+            ]
         lines += [
-            "",
-            f"- Consecutive failed runs: {record['consecutive_failures']}",
-            f"- Surviving Jobs: {record['surviving_jobs']} "
-            "(absence of failed Jobs is not health — they are garbage collected)",
-            f"- Last success: {fmt('last_success_age_seconds')}",
-            f"- Last schedule: {fmt('last_schedule_age_seconds')}",
             f"- Tolerance: {_dur(record['tolerance_seconds'])} "
             f"(period {_dur(record['expected_period_seconds'])})",
             "",
@@ -597,11 +840,37 @@ data:
             "ORDER BY _timestamp DESC",
             "```",
             "",
-            "Raised automatically by the `job-watchdog` CronJob, and it will be "
-            "closed automatically when this CronJob reports healthy again. "
-            "Closing it by hand while the CronJob is still unhealthy just opens "
-            "a fresh one on the next run.",
         ]
+        if is_cron:
+            lines += [
+                "Raised automatically by the `job-watchdog` CronJob, and it will "
+                "be closed automatically when this CronJob reports healthy again. "
+                "Closing it by hand while the CronJob is still unhealthy just "
+                "opens a fresh one on the next run.",
+            ]
+        else:
+            lines += [
+                "Where to look first:",
+                "",
+                "```",
+                "kubectl --context factory -n argocd get pods",
+                "kubectl --context factory -n argocd get statefulset "
+                "argocd-application-controller",
+                "kubectl --context factory get nodes",
+                "kubectl --context factory get application -n argocd "
+                "-o custom-columns=NAME:.metadata.name,"
+                "RECONCILED:.status.reconciledAt",
+                "```",
+                "",
+                "A pod stuck `Terminating` on a NotReady node is the "
+                "factory-gitops#138 shape: a single-replica StatefulSet will not "
+                "replace it, so the controller is simply absent.",
+                "",
+                "Per-Application detail — including which are behind git — is in "
+                "the `argocd_drift` stream from `apps/argocd-drift`. Raised "
+                "automatically by the `job-watchdog` CronJob and closed "
+                "automatically once reconciliation resumes.",
+            ]
         return "\n".join(lines)
 
 
@@ -693,8 +962,9 @@ data:
             elif action == "close":
                 gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
                    {"body": f"RECOVERED. `{r['namespace']}/{name}` now reports "
-                            f"healthy: last success {_dur(r['last_success_age_seconds'])} "
-                            f"ago, within its {_dur(r['tolerance_seconds'])} tolerance. "
+                            f"healthy: {_success_label(r)} "
+                            f"{_dur(r['last_success_age_seconds'])} ago, within its "
+                            f"{_dur(r['tolerance_seconds'])} tolerance. "
                             "Closing automatically."})
                 gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
                    {"state": "closed", "state_reason": "completed"})
@@ -718,11 +988,11 @@ data:
                 continue
             gone = key.split(":", 1)[1].rsplit(" ", 1)[0]
             gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
-               {"body": f"The CronJob `{gone}` no longer exists in the watched "
-                        "namespace, so this finding can no longer be evaluated. "
+               {"body": f"`{gone}` is no longer reported by the watchdog at all, "
+                        "so this finding can no longer be evaluated. "
                         "Closing.\n\nIf it was not retired deliberately then its "
                         "disappearance is itself the problem, not the fix - a "
-                        "CronJob that stops existing produces no failures and no "
+                        "subject that stops existing produces no failures and no "
                         "alerts, only silence (Factory#429)."})
             gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
                {"state": "closed", "state_reason": "not_planned"})
@@ -759,6 +1029,9 @@ data:
 
     def main() -> int:
         threshold = int(os.environ.get("FAIL_THRESHOLD", "2"))
+        reconcile_tol = int(
+            os.environ.get("RECONCILE_TOLERANCE_SECONDS", DEFAULT_RECONCILE_TOLERANCE)
+        )
         oo = os.environ.get(
             "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
         ).rstrip("/")
@@ -797,6 +1070,17 @@ data:
             eprint(f"FATAL: kubernetes API unreachable: {e!r}")
             return 3
 
+        # ArgoCD Applications, in a try of their OWN and never a fatal (#443).
+        # A cluster with no ArgoCD, or a revoked RBAC grant, must not take the
+        # CronJob report and the heartbeat down with it — but it must not pass
+        # silently either, so the failure becomes a critical record below rather
+        # than a logged warning.
+        try:
+            apps = k8s_get("/apis/argoproj.io/v1alpha1/applications")["items"]
+            apps_err = None
+        except Exception as e:  # noqa: BLE001 — cannot see == cannot report
+            apps, apps_err = [], repr(e)
+
         now = datetime.now(timezone.utc)
         owned = group_jobs(cronjobs, jobs)
         records = [
@@ -806,6 +1090,7 @@ data:
                 key=lambda c: (c["metadata"].get("namespace", ""), c["metadata"]["name"]),
             )
         ]
+        records.append(assess_argocd(apps, apps_err, now, reconcile_tol))
 
         # Namespace-qualified now that the watch is cluster-wide: two namespaces
         # may hold same-named CronJobs, and a bare name would make the operator's
@@ -827,7 +1112,8 @@ data:
 
         bad = [f"{r['namespace']}/{r['cronjob']}" for r in records if r["status"] != "ok"]
         eprint(
-            f"reported {len(records)} CronJob(s) to '{stream}': "
+            f"reported {len(records)} subject(s) to '{stream}' "
+            f"({len(records) - 1} CronJob(s) + ArgoCD reconciliation): "
             f"{len(records) - len(bad)} ok, {len(bad)} unhealthy"
             + (f" ({', '.join(bad)})" if bad else "")
         )
@@ -1236,6 +1522,21 @@ data:
             assert "/apis/batch/v1/namespaces/" not in body_of_main, \
                 "a per-namespace list re-creates the unwatched-namespace blind spot"
 
+            # THE ARGOCD RECORD MUST BE PRODUCED (Factory#443), and asserted on
+            # the source for the same reason as the two above: dropping the
+            # append is invisible from every other angle. Every CronJob record
+            # still lands, the run still goes green, the heartbeat is still
+            # stamped, and the only difference is that a stalled controller has
+            # nothing watching it again.
+            assert "assess_argocd(" in body_of_main, \
+                "main must produce the ArgoCD reconciliation record"
+            assert "/apis/argoproj.io/v1alpha1/applications" in body_of_main, \
+                "must list Applications cluster-wide"
+            # ...and its failure must NOT be able to abort the run: the CronJob
+            # findings and the heartbeat outrank it.
+            assert "apps, apps_err = [], repr(e)" in body_of_main, \
+                "an unreadable ArgoCD must degrade to a finding, not a dead run"
+
         # Same-named CronJobs in two namespaces must stay two findings, not one.
         # Cluster-wide listing makes name collisions reachable for the first
         # time; if the issue marker collided, the second namespace's outage would
@@ -1251,6 +1552,113 @@ data:
             MARKER.format(ns=rb["namespace"], name=rb["cronjob"]), \
             "same-named CronJobs in different namespaces must not share an issue"
         assert severity_of(ra) is not None, "a long-stale CronJob must still be a finding"
+
+        # ---- Factory#443 / factory-gitops#138: ArgoCD stopped reconciling ----
+        #
+        # THE INCIDENT, as it actually was. The controller was stranded on a
+        # NotReady node from 03:17Z on 2026-08-06 and nothing reconciled for six
+        # hours, while every Application reported Synced/Healthy. The measured
+        # numbers from the issue, reproduced here: reconciledAt frozen at
+        # 03:13:27Z, read at 09:40:13Z.
+        def app(reconciled, sync="Synced", health="Healthy"):
+            return {
+                "metadata": {"name": "pfactory", "namespace": "argocd"},
+                "status": {
+                    "sync": {"status": sync, "revision": "5c53892"},
+                    "health": {"status": health},
+                    **({"reconciledAt": reconciled} if reconciled else {}),
+                },
+            }
+
+        outage = datetime(2026, 8, 6, 9, 40, 13, tzinfo=timezone.utc)
+        stalled = assess_argocd([app("2026-08-06T03:13:27Z")], None, outage, 900)
+        assert stalled["status"] == "reconcile_stalled", stalled
+        assert severity_of(stalled) == "critical", stalled
+        assert stalled["last_success_age_seconds"] == 23206, stalled
+        # The record must say WHY Synced/Healthy is not a contradiction, because
+        # that is the whole reason six hours passed.
+        assert "cached" in stalled["problems"][0], stalled
+        # ...and the title is the part that reaches a phone.
+        assert issue_title(stalled, "critical") == (
+            "[critical] argocd-application-controller has stopped reconciling "
+            "— every Synced is stale"), issue_title(stalled, "critical")
+
+        # ONE record for 35 stalled Applications, not 35. An alert that arrives
+        # 35-at-a-time for one fault is CFactory#306 by volume.
+        many = assess_argocd([app("2026-08-06T03:13:27Z")] * 35, None, outage, 900)
+        assert many["applications"] == 35 and many["status"] == "reconcile_stalled"
+        assert MARKER.format(ns=many["namespace"], name=many["cronjob"]) == \
+            "<!-- job-watchdog:argocd/argocd-application-controller -->", many
+
+        # THE OTHER DIRECTION, and it is the one that decides whether anyone
+        # still reads this alert in a month. Live-measured on 2026-08-07: the
+        # controller sweeps every Application in one burst, so the freshest
+        # reconcile cycles 0 -> ~180s and the oldest peaks near 340s. NONE of
+        # that may fire.
+        healthy_now = datetime(2026, 8, 7, 12, 56, 8, tzinfo=timezone.utc)
+        normal = assess_argocd(
+            [app("2026-08-07T12:49:57Z"),   # 371s — the oldest measured
+             app("2026-08-07T12:52:56Z"),   # 192s
+             app("2026-08-07T12:55:56Z")],  # 12s  — the freshest
+            None, healthy_now, 900)
+        assert normal["status"] == "ok", normal
+        assert normal["codes"] == [] and normal["problems"] == [], normal
+        assert severity_of(normal) is None, "a reconciling controller must be silent"
+        assert normal["last_success_age_seconds"] == 12, normal
+        assert normal["oldest_reconcile_age_seconds"] == 371, normal
+        # A single app far behind the rest is NOT this finding — apps/argocd-drift
+        # owns per-app drift. Only the controller having stopped is.
+        lagging = assess_argocd(
+            [app("2026-08-06T03:13:27Z"), app("2026-08-07T12:55:56Z")],
+            None, healthy_now, 900)
+        assert lagging["status"] == "ok", lagging
+
+        # THE MUTATION PAIR. One second inside tolerance is silence; one second
+        # outside is a critical. A comparison stuck on either constant, or a
+        # tolerance that swallowed everything, passes one line and fails the
+        # other.
+        edge = datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc)
+        assert assess_argocd([app("2026-08-07T11:45:01Z")], None, edge, 900)[
+            "status"] == "ok"                       # 899s
+        assert assess_argocd([app("2026-08-07T11:44:59Z")], None, edge, 900)[
+            "status"] == "reconcile_stalled"        # 901s
+
+        # FAILS CLOSED, both ways. "I could not check" must never leave the same
+        # trace as "I checked and it was fine" — RBAC revoked, CRD gone, ArgoCD
+        # uninstalled all land here.
+        blind = assess_argocd([], "HTTPError(403)", edge, 900)
+        assert blind["status"] == "reconcile_unreadable", blind
+        assert severity_of(blind) == "critical", blind
+        assert "403" in blind["problems"][0], blind
+        # Applications that exist but have never been reconciled are a finding,
+        # not an empty list quietly reported ok.
+        assert assess_argocd([app(None), app(None)], None, edge, 900)[
+            "status"] == "reconcile_unreadable"
+        # An empty cluster is unreadable too — zero Applications means zero
+        # evidence, and DEFINITELY not health.
+        assert assess_argocd([], None, edge, 900)["status"] == "reconcile_unreadable"
+
+        # A stalled controller must open exactly one issue, and a recovered one
+        # must CLOSE it. notify_action being right is not enough on its own —
+        # see the CronJob equivalent above — so drive it through both states.
+        assert notify_action(stalled, None, outage, 24) == "open"
+        assert notify_action(stalled, iss("critical", "2026-08-06T09:30:00Z"),
+                             outage, 24) is None, "already reported must not repeat"
+        assert notify_action(normal, iss("critical", "2026-08-06T09:30:00Z"),
+                             healthy_now, 24) == "close"
+
+        # The issue body must not carry CronJob furniture no reader can act on,
+        # and MUST carry the reconcile numbers. A shared template that quietly
+        # printed "Surviving Jobs: 0" for a dead controller is how a real alert
+        # starts reading like a template.
+        body = issue_body(stalled, "critical")
+        assert "Surviving Jobs" not in body and "schedule ``" not in body, body
+        assert "Freshest reconcile: 6.4h ago" in body, body
+        assert "Applications seen: 1" in body, body
+        assert "kubectl --context factory -n argocd get pods" in body, body
+        # ...and the CronJob body must not have lost its own furniture either.
+        cron_body = issue_body(ra, "critical")
+        assert "Surviving Jobs" in cron_body and "Last success" in cron_body
 
         print("selftest OK")
         return 0
@@ -1296,6 +1704,13 @@ spec:
               command: ["python3", "/script/watchdog.py"]
               env:
                 - { name: FAIL_THRESHOLD, value: "2" }
+                # 5x ArgoCD's 180s reconciliation interval (Factory#443), which
+                # is the upstream default here because `timeout.reconciliation`
+                # is unset in argocd-cm. The same number apps/argocd-drift has
+                # used on the same field since 2026-07-30 without one false
+                # positive in 54,217 records — and this one takes the minimum
+                # age across Applications, so it is quieter still.
+                - { name: RECONCILE_TOLERANCE_SECONDS, value: "900" }
                 - { name: OO_STREAM, value: "job_health" }
                 - { name: OO_ORG, value: "default" }
                 # Where unhealthy findings go so a human passively meets them.
