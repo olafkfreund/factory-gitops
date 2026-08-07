@@ -90,7 +90,7 @@ spec:
           # the live pod), so a non-root uid could not traverse to its own key.
           # Moving the mount off /root is an Odin image change, not a manifest
           # one. Note this is a mount PATH decision, so it is fixable in a repo
-          # we own rather than a genuine third-party constraint: Factory#608.
+          # we own rather than a genuine third-party constraint: Factory#622.
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           runAsNonRoot: false

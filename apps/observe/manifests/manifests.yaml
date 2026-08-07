@@ -78,7 +78,7 @@ spec:
       # group-readable and not group-writable. Flipping the uid needs a chown of
       # the existing volume in the same change, which is a maintenance window
       # with a backup, not a drive-by edit inside a hardening sweep. Tracked
-      # separately rather than silently skipped: Factory#607.
+      # separately rather than silently skipped: Factory#621.
       securityContext:
         fsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
