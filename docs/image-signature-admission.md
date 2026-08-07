@@ -475,50 +475,100 @@ asked the question.
 |-------|-------|-------------|
 | `ghcr.io/olafkfreund/skillai` | first-party, was unsigned | signed (SkillAi#303), rule `verify-skillai-signature` added |
 | `ghcr.io/olafkfreund/skillai-migrator` | first-party, was unsigned | signed (SkillAi#303), same rule |
-| `ghcr.io/olafkfreund/odin` | first-party, was unsigned | signed (Odin#4); **no rule yet**, see below |
+| `ghcr.io/olafkfreund/odin` | first-party, was unsigned | signed (Odin#4), rule `verify-odin-signature` added once the package went public (Factory#572) |
 | `busybox`, `postgres`, `pgvector/pgvector`, `redis`, `python`, `quay.io/keycloak/keycloak`, `quay.io/minio/minio`, `quay.io/minio/mc`, `quay.io/oauth2-proxy/oauth2-proxy`, `docker.io/cloudflare/cloudflared`, `public.ecr.aws/zinclabs/openobserve`, `registry.k8s.io/sig-storage/nfs-provisioner` | third-party | out of scope by design, see below |
 
 `skillai` deserves a note: it was the known-**unsigned** control used in the
 Factory#522 deny experiment, chosen precisely because it was public, readable
 and carried no signature — while running in this namespace the whole time.
 
-#### Why `odin` is signed but has no rule
+#### Never put a rule in front of an image Kyverno cannot read
 
-`ghcr.io/olafkfreund/odin` is signed and verifies against the live registry:
+This section used to be headed "Why `odin` is signed but has no rule". Factory#572
+closed that on 2026-08-07 and `verify-odin-signature` now exists. The heading
+changed rather than the section being deleted, because the rule of order it
+records is not about odin and outlives it.
 
-```bash
-cosign verify \
-  --certificate-identity-regexp '^https://github\.com/olafkfreund/Odin/\.github/workflows/deploy\.yml@refs/heads/main$' \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  ghcr.io/olafkfreund/odin:sha-2749b26
-```
+**The order is: sign it, confirm the signature is READABLE the way Kyverno reads
+it, and only then write the rule. Never the other way round.**
 
-> **Superseded 2026-08-07.** The `odin` GHCR package went **public** later the
-> same day, which removes the only reason it was denied a rule. Factory#572 adds
-> `verify-odin-signature` and rewrites this section; what follows is the state
-> while the package was private, kept because the *reasoning* — never put a rule
-> in front of an image Kyverno cannot read — outlives the instance.
-
-It had **no** rule in `verify-factory-image-signatures`, deliberately. The
-`odin` GHCR package was **private**, the last first-party package that was, and
-Kyverno holds no ghcr.io credential at all, by design:
+Skipping the middle step is the expensive mistake. A rule in front of an image
+Kyverno cannot read does not report "no signature". It reports a **registry-auth
+failure in the same words as a signature verdict** — the Factory#430 ambiguity —
+and leaves a permanent misleading red on exactly the board Factory#522's Enforce
+criterion is phrased against. `odin` was deliberately left ruleless for eleven
+days on this reasoning while its GHCR package was private:
 
 ```bash
 $ curl -s "https://ghcr.io/token?scope=repository%3Aolafkfreund%2Fodin%3Apull&service=ghcr.io"
 {"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}
-
-$ kubectl -n kyverno get secret kyverno-ghcr-pull
-Error from server (NotFound): secrets "kyverno-ghcr-pull" not found
 ```
 
-A rule added today would therefore report a **registry-auth** failure in the
-same words as a signature verdict — the exact Factory#430 ambiguity — and leave
-a permanent misleading red on the board that Factory#522's Enforce criterion is
-phrased against. Adding an accurate control later beats adding a confusing one
-now. Tracked in Factory#572.
+That was the right call, and it cost nothing, because the absence was **not
+silent**: `require-first-party-signature-coverage` reported odin accurately as an
+uncovered first-party image, in the language of coverage rather than the language
+of signatures. An honest gap on the board beats a misleading red on it.
 
-Its absence is not silent. The coverage policy below reports `odin` accurately,
-as an uncovered first-party image, which is what it is.
+##### How to confirm readability — not the obvious way
+
+`docker pull`, `crane manifest` and a `ghcr.io/token` probe all read the
+**manifest**. What Kyverno fetches in order to verify is the **`.sig` tag**
+derived from the image digest (`sha256-<digest>.sig`). Those are different
+objects and a package can serve one without the other, so check the one that
+matters, with an empty keychain, the way Kyverno has no credential:
+
+```bash
+mkdir -p /tmp/nocreds && echo '{}' > /tmp/nocreds/config.json
+DOCKER_CONFIG=/tmp/nocreds cosign verify \
+  --certificate-identity-regexp '^https://github\.com/olafkfreund/Odin/\.github/workflows/deploy\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  ghcr.io/olafkfreund/odin:sha-39ecd91
+```
+
+**Use `cosign`, not a hand-rolled `curl`, and if you must hand-roll it get the
+`Accept` header right.** The `.sig` tag is an OCI **image manifest**; reusing the
+index/list `Accept` header from a digest lookup returns **404 on every package,
+public ones included**. That was hit for real while cross-checking this
+(factory-gitops#180), and it is worse than an ordinary bug: a 404 there looks
+exactly like the registry-auth failure a triager is already hunting, so the tool
+being used to diagnose the Factory#430 ambiguity reintroduces it. `cosign`
+negotiates this correctly and is the reason the recipe above is safe.
+
+##### And read the identity off the signature, do not copy a neighbour
+
+The other half of writing an honest rule. A `subjectRegExp` that is well-formed
+but wrong admits nothing, and looks exactly like one that works until the day it
+denies something. `verify-skillai-signature` is the standing proof: it anchors on
+`refs/heads/core-mvp-foundation`, so a rule copied from any main-anchored
+neighbour would silently reject every signature SkillAi produces.
+
+Decode the certificate rather than assuming:
+
+```bash
+cosign download signature ghcr.io/olafkfreund/odin:sha-39ecd91 \
+  | jq -r '.Cert.Raw' | base64 -d \
+  | openssl x509 -inform der -noout -text | grep -A2 'Subject Alternative Name'
+```
+
+```
+X509v3 Subject Alternative Name: critical
+  URI:https://github.com/olafkfreund/Odin/.github/workflows/deploy.yml@refs/heads/main
+```
+
+Then mutate the rule to prove it is load-bearing. Measured for odin — wrong
+subject `pass:0 fail:2`, wrong issuer `pass:0 fail:2`, restored `pass:2 fail:0`.
+The wrong-subject failure has the engine name the true identity back at you,
+which is the confirmation worth having:
+
+```
+subject mismatch:
+expected ^https://github\.com/olafkfreund/CFactory/\.github/workflows/deploy\.yml@refs/heads/main$,
+received https://github.com/olafkfreund/Odin/.github/workflows/deploy.yml@refs/heads/main
+```
+
+One mutation that does **not** go red: narrowing the glob (`odin:*` → `odin:v*`)
+gives `pass: 0, fail: 0, skip: 0` — silence, not a verdict. Nothing offline
+catches it. See factory-gitops#181.
 
 #### The control that closes the class: `require-first-party-signature-coverage`
 
@@ -559,7 +609,7 @@ the rule to `verifyImages`; that loses the standing result, which is the point.
 | option | verdict |
 |--------|---------|
 | A sixth `verifyImages` rule in the existing policy: `imageReferences: ghcr.io/olafkfreund/*`, `required: true`, no attestor | **Rejected, measured.** It is schema-valid and works beautifully at admission (warns `unverified image ...` with no registry call). But `required: true` reads the `kyverno.io/verify-images` annotation Kyverno writes at admission time, which absent Pods do not have on a background scan. The reports controller logs `missing image metadata in annotation key=kyverno.io/verify-images` and emits nothing. Measured on this cluster: five of five uncovered images warned at admission, and **zero** rows were added to the PolicyReports over a full scan. It would have left the board reading `66 pass / 0 fail` — the exact defect, reintroduced by its own fix. |
-| The same, with any real attestor | **Rejected.** Any attestor means Kyverno must read the image. `odin` is private, so the failure would read `UNAUTHORIZED: authentication required` — Factory#430 all over again. The `validate` form never touches a registry, so it cannot produce that ambiguity. |
+| The same, with any real attestor | **Rejected.** Any attestor means Kyverno must read the image. `odin` was private when this was decided, so the failure would have read `UNAUTHORIZED: authentication required` — Factory#430 all over again. Every first-party package is public today (Factory#563, #572), so that is no longer a live example, but the property is why this shape was chosen and it does not depend on today's visibility: the `validate` form never touches a registry, so it **cannot** produce that ambiguity for any image, including one made private tomorrow. A coverage control has to keep answering "is this covered?" when the registry is unreachable — that is precisely when an unnoticed gap does the most damage. |
 | An explicit allowlist rule naming the twelve third-party images | **Rejected.** A rule that lists twelve images and then does nothing is ceremony: it creates a maintenance burden and the appearance of coverage without any. The declaration belongs in this document, which is where it now is. |
 | Digest-pinning third-party images | **Right control, wrong change.** It is genuinely valuable — a pinned digest cannot be repointed under a running cluster — but it is a different policy against manifests owned elsewhere, and it would add twelve standing Audit failures that nobody intends to clear soon, directly harming Factory#522. Tracked in Factory#573. |
 | Do nothing and document the limit | **Rejected.** Cheapest, but leaves the board over-claiming, which is the whole complaint. |
@@ -851,8 +901,11 @@ The experiment also reproduced the ambiguity by accident, which is the best
 evidence that it is a live hazard and not a historical footnote. Case C first
 pointed at `ghcr.io/olafkfreund/odin`, chosen as an unsigned image because
 `cosign verify` on a workstation reported `no signatures found`. In-cluster it
-denied with `UNAUTHORIZED: authentication required` instead: `odin` is a
-**private** package, and the workstation had a credential the cluster does not.
+denied with `UNAUTHORIZED: authentication required` instead: `odin` **was** a
+private package at the time, and the workstation had a credential the cluster
+did not. (Both facts have since changed — odin is signed as of Odin#4 and its
+package is public as of Factory#572 — but the ambiguity this accident exposed is
+not historical, and the next private or unreachable image reproduces it.)
 The local tool and the cluster disagreed about the same image for reasons that
 had nothing to do with signing. Case C was repointed at `skillai`, which is
 public, to get an actual signature verdict.
@@ -1274,10 +1327,18 @@ Do NOT skip a phase. Each is a separate, small PR.
 
    The policy verifies an image only if that image matches a rule glob.
    `required: true` means "a matched image must carry a signature", not "every
-   image must match a rule". 14 images currently run in `factory` that no rule
-   names, including two unsigned first-party ones (`odin`, `skillai`). Under
-   Enforce they are admitted unverified. Tracked in Factory#564. Not a blocker,
-   but a second reason the green board over-claims.
+   image must match a rule". When Factory#564 was filed, 14 images ran in
+   `factory` that no rule named, including two first-party ones (`odin`,
+   `skillai`) that were also unsigned. Both are now signed and both have rules
+   (SkillAi#303 + `verify-skillai-signature`; Odin#4 + `verify-odin-signature`,
+   Factory#572), and `require-first-party-signature-coverage` reports **zero**
+   uncovered first-party images. The remaining 12 are third-party and out of
+   scope by design — digest pinning is their control, tracked in Factory#573.
+
+   This is no longer a reason the green board over-claims. The reason it still
+   might is narrower and is recorded above: a narrowed glob makes a rule fall
+   silent rather than fail, and nothing offline catches it
+   (factory-gitops#181).
 
    From the point of the flip, unsigned images matching a rule are denied at
    admission.

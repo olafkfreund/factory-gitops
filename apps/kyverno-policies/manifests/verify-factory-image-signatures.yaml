@@ -91,13 +91,13 @@
 # because Kyverno reads ghcr.io anonymously and cannot retrieve a signature it
 # cannot read.
 #
-# CLOSED by Factory#563 on 2026-08-07: both packages were made PUBLIC, so all
-# sixteen covered images are readable with no credential at all. Kyverno holds
-# no ghcr.io Secret and needs none -- see apps/kyverno/manifests/
-# kustomization.yaml, which also records why the dormant
-# `--imagePullSecrets=kyverno-ghcr-pull` flag was removed rather than left in
-# place (Factory#566: a wrong or expired credential unverifies all sixteen at
-# once, with no fallback to the anonymous path).
+# CLOSED by Factory#563 on 2026-08-07: both packages were made PUBLIC, so every
+# covered image is readable with no credential at all. Kyverno holds no ghcr.io
+# Secret and needs none -- see apps/kyverno/manifests/kustomization.yaml, which
+# also records why the dormant `--imagePullSecrets=kyverno-ghcr-pull` flag was
+# removed rather than left in place (Factory#566: a wrong or expired credential
+# unverifies every covered image at once, with no fallback to the anonymous
+# path).
 #
 # Measured through the live webhook the same day, with no Secret in the
 # kyverno namespace, on a Pod carrying all three kinds of runner:
@@ -105,6 +105,29 @@
 #   kyverno.io/verify-images: {"ghcr.io/olafkfreund/tfactory-runner-nix:latest":"pass",
 #     "ghcr.io/olafkfreund/tfactory-runner-portal-ui:latest":"pass",
 #     "ghcr.io/olafkfreund/tfactory-runner-pytest:latest":"pass"}
+#
+# Factory#572 re-measured the same claim one level deeper, because the check
+# above and a `docker pull` both read the MANIFEST, while what Kyverno actually
+# fetches to verify a signature is the `.sig` TAG derived from the digest. A
+# package can serve one and not the other. With an EMPTY keychain
+# (`DOCKER_CONFIG` pointing at a directory holding `{}`): all seven first-party
+# packages return manifest=200 AND sig=200 anonymously. That is the measurement
+# to repeat before trusting this paragraph again -- not `tags/list`, not a pull.
+#
+# COUNTING NOTE, because this number has been wrong twice and TWO DIFFERENT
+# NUMBERS ARE BOTH CORRECT. The globs below name nineteen REPOSITORIES -- 5
+# services + 11 runners + 2 SkillAi + odin. That is not the same as the count of
+# images actually running, which is what a live-board measurement returns (17 at
+# the time of Factory#566's credential experiment) and which changes whenever a
+# workload starts or stops. Say which one you mean, and prefer deriving either
+# from the globs or from the cluster over quoting a number out of a comment.
+#
+# The reason NOT to re-add a credential later "just in case" is measured and
+# specific: a WRONG or EXPIRED credential unverifies EVERY covered image, not
+# just the ones that were private, because the keychain has no fallback to the
+# anonymous path. A dormant credential that expires is a whole-board red with no
+# cause anyone will think to look for. If a factory package is ever made private
+# again, wire the credential THEN, and expect the whole board to depend on it.
 #
 # Factory#564 (2026-08-05). THE RULES IN THIS FILE ONLY EVER SPEAK ABOUT IMAGES
 # THEIR GLOBS NAME. `required: true` below means "a MATCHED image must have a
@@ -123,14 +146,15 @@
 #    other rule in this file anchors on main. Copying one of them for a new
 #    SkillAi image would silently reject its signature.
 #
-# 2. `odin` is deliberately NOT given a rule here even though it is signed as
-#    of Odin#4 and verifies against the live registry. The `odin` GHCR package
-#    is PRIVATE and Kyverno holds no ghcr.io credential, so a rule would
-#    report the Factory#430 registry-auth ambiguity rather than a signature
-#    verdict -- a permanent misleading red that costs #522 its criterion. Its
-#    absence is not silent: `require-first-party-signature-coverage` reports it
-#    accurately as an uncovered first-party image until a rule can honestly be
-#    written. Tracked in Factory#572.
+# 2. `odin` now HAS a rule, `verify-odin-signature` at the bottom of this file.
+#    Factory#572. It was withheld while the `odin` GHCR package was private,
+#    because a rule Kyverno cannot read the signature for reports the
+#    Factory#430 registry-auth ambiguity rather than a signature verdict -- a
+#    permanent misleading red that would have cost #522 its criterion. The
+#    package was made public on 2026-08-07 and the withholding reason is gone.
+#    Note the ORDER that was followed and must keep being followed: signing
+#    first (Odin#4), then readability confirmed against the live registry, then
+#    the rule. Not the other way round.
 #
 # The general defect -- coverage by omission -- is closed by a separate policy,
 # `require-first-party-signature-coverage.yaml` in this directory, which fails
@@ -479,6 +503,72 @@ spec:
                     # publisher of these two images. See point 1 above for the
                     # non-main ref.
                     subjectRegExp: "^https://github\\.com/olafkfreund/SkillAi/\\.github/workflows/deploy-image\\.yml@refs/heads/core-mvp-foundation$"
+                    # Same Kyverno v1.18 requirement as the rules above: a
+                    # keyless attestor with neither `rekor` nor `roots` is
+                    # rejected outright and ArgoCD cannot apply the file.
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+    # Factory#572 (2026-08-07). `odin` -- the dashboard Deployment running in
+    # this namespace -- was the LAST first-party image with no rule here, and
+    # for eleven days it was the only `fail` on
+    # `require-first-party-signature-coverage`'s board. That board is now empty,
+    # which is the evidence that matters: the coverage policy is a control that
+    # was seen objecting to a real workload and then seen stopping when the gap
+    # it named was closed, rather than a rule that has only ever been quiet.
+    #
+    # THE IDENTITY BELOW WAS READ OFF THE SIGNATURE, NOT COPIED FROM A NEIGHBOUR.
+    # `verify-skillai-signature` above is the standing warning about why that
+    # matters: it anchors on refs/heads/core-mvp-foundation, and a rule copied
+    # from a main-anchored neighbour would have silently rejected every
+    # signature SkillAi produces. A wrong subject is indistinguishable from a
+    # right one until the day it denies something. Decoded from the Fulcio
+    # signing certificate on the running image's signature
+    # (sha256:d4ae0785...2cb94, the digest behind :sha-2749b26):
+    #
+    #   X509v3 Subject Alternative Name: critical
+    #     URI:https://github.com/olafkfreund/Odin/.github/workflows/deploy.yml@refs/heads/main
+    #   1.3.6.1.4.1.57264.1.1 (issuer): https://token.actions.githubusercontent.com
+    #   1.3.6.1.4.1.57264.1.5 (repo):   olafkfreund/Odin
+    #   1.3.6.1.4.1.57264.1.6 (ref):    refs/heads/main
+    #
+    # Reproduce with `cosign download signature ghcr.io/olafkfreund/odin:<tag>`
+    # and decode `.Cert.Raw`; do not take this comment's word for it.
+    #
+    # NO ALTERNATION, and that is a fact about the repository rather than a
+    # simplification: `.github/workflows/` in olafkfreund/Odin contains exactly
+    # one file, deploy.yml ("Deploy (CD -> ArgoCD)"), which builds, pushes and
+    # signs by digest. If Odin ever grows a second publishing workflow, widen
+    # this to `(deploy|<other>)\.yml` -- do NOT relax the anchors to a repo
+    # prefix, which would accept any workflow on any ref including
+    # refs/pull/N/merge.
+    #
+    # The `odin` GHCR package is PUBLIC as of 2026-08-07 and Kyverno reads it
+    # anonymously, which is the whole reason this rule can exist honestly. See
+    # the header for why no credential is wired, and what re-adding one would
+    # cost. If this rule ever reports `fail`, read the admission-controller log
+    # before triaging it as a signing problem: `no matching signatures` is a
+    # signature verdict, anything naming `ghcr.io/token` is registry auth.
+    - name: verify-odin-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [factory]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/olafkfreund/odin:*"
+          verifyDigest: false
+          mutateDigest: false
+          required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/olafkfreund/Odin/\\.github/workflows/deploy\\.yml@refs/heads/main$"
                     # Same Kyverno v1.18 requirement as the rules above: a
                     # keyless attestor with neither `rekor` nor `roots` is
                     # rejected outright and ArgoCD cannot apply the file.

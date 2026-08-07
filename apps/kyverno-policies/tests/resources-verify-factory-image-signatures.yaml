@@ -76,17 +76,25 @@ spec:
   initContainers: [{name: i, image: "ghcr.io/olafkfreund/aifactory-worker:v1"}]
   containers: [{name: c, image: "busybox:1.36"}]
 ---
-# DELIBERATELY UNCOVERED, Factory#572. `odin` is first-party and signed, but its
-# GHCR package is private and `kyverno-ghcr-pull` does not cover it, so a rule
-# here would report the Factory#430 registry-auth ambiguity as a permanent red.
-# Its absence is intentional and is reported honestly by
-# require-first-party-signature-coverage instead. If this case ever turns red,
-# a rule was added -- check the credential exists before celebrating.
+# Factory#572. This fixture used to be `uncovered-odin`, carrying the real
+# `ghcr.io/olafkfreund/odin:sha-2749b26`, asserting that NO rule spoke about it.
+# `verify-odin-signature` now does, so that Pod cannot stay here: a MATCHED
+# image sends the CLI to ghcr.io and Rekor, and this suite is offline by
+# deliberate choice (see the header). It moved to resources.yaml as
+# `covered-odin`, where the coverage policy can assert the same fact with no
+# network call.
+#
+# What stays here is the near-miss, which is the assertion this file is capable
+# of making. `ghcr.io/olafkfreund/odin:*` needs the literal `:`; a package whose
+# name merely STARTS with `odin` is a different package with no signer identity
+# of its own. Widen that glob to `odin*` and Odin's deploy.yml identity is
+# quietly placed in front of it -- the Factory#564 direction, and the one
+# failure direction an all-negative suite can actually detect.
 apiVersion: v1
 kind: Pod
-metadata: {name: uncovered-odin, namespace: factory}
+metadata: {name: near-odin-exporter, namespace: factory}
 spec:
-  containers: [{name: c, image: "ghcr.io/olafkfreund/odin:sha-2749b26"}]
+  containers: [{name: c, image: "ghcr.io/olafkfreund/odin-exporter:v1"}]
 ---
 # A DIGEST-PINNED first-party image is matched by none of these globs: they all
 # end in a literal `:`, and a digest reference has `@` there instead. This is
