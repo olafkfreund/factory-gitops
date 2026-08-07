@@ -235,6 +235,100 @@
 # run through 08:13Z, which is the only thing that did. So the new signal rides
 # a path that is already proven in both halves: in-cluster for a dead
 # controller, out-of-cluster for a dead cluster.
+#
+# ---------------------------------------------------------------------------
+# BARE JOBS (Factory#603)
+# ---------------------------------------------------------------------------
+#
+# Everything above watches CronJobs. A one-shot `Job` with no CronJob owner was
+# invisible in TWO independent ways: main() read `/apis/batch/v1/jobs` only to
+# attribute Jobs to an owning CronJob and discarded the rest, and job_state()
+# calls an unfinished Job `active`, which evaluate() skips so an in-flight retry
+# does not read as a failure. The side effect is that a Job stuck active
+# FOREVER was nobody's problem.
+#
+# `minio-create-bucket` is the case that made this load-bearing. It is the
+# ArgoCD PostSync hook that applies versioning, encryption-at-rest and ILM
+# retention to `factory-artifacts`, `factory-backups` and `factory-evidence` —
+# the tamper-resistance and retention halves of the compliance controls under
+# Factory#310/#320. Factory#508 fixed it so it now FAILS LOUDLY. Nothing was
+# reading the verdict: ArgoCD reports `apps/minio` Synced+Healthy regardless,
+# because `Synced` describes the manifest and not the hook's outcome. Making a
+# gate fail is half a job if nothing reads it.
+#
+# WHY BARE JOBS AND NOT ALL JOBS. A CronJob-owned Job that hangs is already
+# caught, one layer up, by STALENESS: its CronJob's lastSuccessfulTime ages past
+# tolerance and the existing `stale` finding fires. A bare Job has no such
+# second signal — no schedule, no last-success timestamp, no next run. So the
+# rules below are scoped to Jobs with no CronJob owner, which also avoids
+# opening a second issue beside the CronJob's own for one fault.
+#
+# THREE GRADES, NOT ONE. A flat severity is the cry-wolf failure this app keeps
+# arguing against, so:
+#   job_failed  (critical) — `conditions[Failed]=True` is TERMINAL. backoffLimit
+#       is exhausted or the deadline elapsed; no controller will retry it and
+#       there is no next run to clear it. That is the CronJob `never_succeeded`
+#       shape exactly: the work this object exists to do is not done and nothing
+#       is going to do it.
+#   job_stuck   (warning)  — active past JOB_STUCK_SECONDS. It may still finish;
+#       a slow image pull, a big restore, a busy node. Reported once, then quiet.
+#   job_wedged  (critical) — active past 4x that. It escalates ITSELF, with no
+#       state to remember, because a warning that never re-notifies would let a
+#       Job hang for a week behind a single quiet comment.
+#
+# CLOSE-ON-ABSENCE. A bare Job's record is emitted every run whether healthy or
+# not, so a stuck Job that finally completes reports `ok` and its issue closes on
+# the normal recovery path. A failed Job is terminal and can never report ok —
+# it closes when the Job is DELETED, which is the observable form of "someone
+# dealt with it" and is handled by the orphan sweep already in notify().
+#
+# ---------------------------------------------------------------------------
+# PODS LEFT `Unknown` BY A NODE THAT CAME BACK (Factory#613)
+# ---------------------------------------------------------------------------
+#
+# `Unknown` means the kubelet stopped reporting for a pod the API server still
+# has. When a node is stranded and then returns, the kubelet does not re-adopt
+# what it lost: on 2026-08-06 `k3d-agent-0-0` was stranded by the nightly
+# nixos-upgrade, came back Ready at 14:44:07Z, and `fleet-match-29767120-98nzc`
+# sat `Unknown` for over 30 hours afterwards. NO CONTROLLER OWNS THIS. Taint-
+# based eviction only fires while the node is NotReady; once it is Ready again
+# nothing revisits the pod.
+#
+# REAPING IS THE FIX, NOT EXCLUDING IT FROM HEALTH CHECKS. Both were on the
+# table and the choice matters:
+#   - Excluding `Unknown` from "is this namespace healthy?" makes the check
+#     green by narrowing what it looks at. The stale row is still there, the
+#     owning Job still counts an active pod that will never finish, and the next
+#     genuinely-Unknown pod is now excluded too. That is a waiver, not a fix.
+#   - Alerting on it and stopping would be WORSE than nothing: the finding could
+#     open and never close, which is precisely the cry-wolf state #613 is an
+#     instance of. It would add a second permanently-red signal to fix the first.
+# Deleting the pod makes the cluster's own answer true again, so every check
+# that asks the ordinary question gets the ordinary answer. The condition
+# closes because the condition is GONE, which is the only close worth having.
+#
+# A POD `Unknown` BECAUSE ITS NODE IS GONE IS A DIFFERENT THING, and is NOT
+# reaped. While the node is NotReady the pod's status is merely unknown rather
+# than wrong — the container may well still be running — and deleting it would
+# produce a Terminating ghost that outlives the delete. So the rule requires the
+# node to be Ready AND to have been Ready for ORPHAN_REAP_AFTER_SECONDS: the
+# kubelet has been back long enough to have re-adopted this pod and did not.
+# That is what makes the row stale rather than unknown. A node that is still
+# down is a node incident, already loud on its own terms.
+#
+# ROUTINE CLEANUP DOES NOT NOTIFY. A successful reap emits to the stream and
+# raises nothing — same treatment `app_error` already gets, for the same reason:
+# an issue per housekeeping action buries the findings that have no other
+# witness. What DOES notify is a reap that did not work (`orphans_unreaped`,
+# warning) — the delete was refused, or was issued and the pod is still there.
+# That is a fact about this watchdog's own ability to fix what it found, and it
+# must not read the same as a clean run.
+#
+# THE ONE WRITE VERB. This is the first thing this app is allowed to change, and
+# the grant is `pods: delete` — nothing else, no `pods/eviction`, no `nodes`
+# write, no `deletecollection`. It is deliberately narrow, and the predicate
+# above is narrower still: phase `Unknown` only, on a node that has been Ready
+# for a quarter of an hour. A Running pod can never match it.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -284,6 +378,20 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "nodes"]
     verbs: ["get", "list"]
+  # Factory#613. THE ONLY WRITE VERB THIS APP HAS, and it exists because no
+  # controller owns the case: a pod left `Unknown` by a node that was stranded
+  # and then came back Ready is never revisited by anything. Taint-based
+  # eviction only runs while the node is NotReady, so once it recovers the stale
+  # row is permanent -- `fleet-match-29767120-98nzc` sat that way for 30h+.
+  #
+  # Scoped as tightly as RBAC allows (`delete` on pods, not `deletecollection`,
+  # not `pods/eviction`) and far more tightly than that in the code: the
+  # predicate is phase `Unknown` on a node that has been Ready for at least
+  # ORPHAN_REAP_AFTER_SECONDS. A Running pod cannot match it, and a pod on a
+  # node that is still down is deliberately left alone.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -353,6 +461,11 @@ data:
                             how recent a container termination must be to be
                             reported (3600). Must stay above this CronJob's own
                             period or a kill can fall between two runs.
+      JOB_STUCK_SECONDS     how long a bare Job may run before it is a warning
+                            (3600); 4x that and it is a critical (#603)
+      ORPHAN_REAP_AFTER_SECONDS
+                            how long a node must have been Ready before a pod
+                            still `Unknown` on it is reaped (900) (#613)
       OBSERVE_URL           OpenObserve base url (default in-cluster service)
       OO_ORG                OpenObserve organization (default "default")
       OO_STREAM             target stream (default "job_health")
@@ -421,10 +534,20 @@ data:
     # transient container restart in the fleet a critical and mute the label
     # inside a week — the same cry-wolf failure this app exists to avoid, and it
     # would bury the very findings #598 is about.
+    # The two bare-Job criticals (#603) say the same thing the CronJob ones do.
+    # `job_failed` is TERMINAL — backoffLimit exhausted, no controller will retry
+    # it, and unlike a CronJob there is no next run to clear it, which is
+    # `never_succeeded` by another name. `job_wedged` is a Job that has been
+    # running past four times its ceiling: a hang is the failure mode no exit
+    # code will ever report. Deliberately NOT here: `job_stuck`, which is one
+    # ceiling's worth of overrun and may still finish, and `orphans_unreaped`,
+    # which is stale rows this watchdog could not clean up rather than a
+    # workload that is down.
     CRITICAL_CODES = {"never_succeeded", "stale", "reconcile_stalled",
                       "reconcile_unreadable",
                       "runtime_lost", "oom_killed", "evicted",
-                      "terminations_unreadable"}
+                      "terminations_unreadable",
+                      "job_failed", "job_wedged"}
 
     # Factory#443. ArgoCD's application controller re-examines every Application
     # every `timeout.reconciliation`. That key is UNSET in this cluster's
@@ -488,6 +611,17 @@ data:
                         "name, so it is recorded verbatim rather than guessed at",
         "terminations_unreadable": "cannot be read, so no container kill in this "
                                    "cluster is being attributed",
+        # Factory#603. A bare Job has no schedule and no next run, so the
+        # phrasing has to carry the fact that nothing is going to retry it.
+        "job_failed": "FAILED and nothing will retry it — it is a one-shot Job "
+                      "with no CronJob owner",
+        "job_stuck": "has been running well past its expected ceiling and may "
+                     "be hung",
+        "job_wedged": "IS HUNG: it has been running with no end in sight and no "
+                      "exit code will ever report it",
+        # Factory#613.
+        "orphans_unreaped": "left pods stuck `Unknown` that this watchdog could "
+                            "not reap, so every namespace health check stays red",
     }
 
     # "last success" is the CronJob word. For the ArgoCD record the same field
@@ -528,6 +662,16 @@ data:
         if s < 172800:
             return f"{s / 3600:.1f}h"
         return f"{s / 86400:.1f}d"
+
+
+    def _ago(seconds: float | None) -> str:
+        """`_dur` for a value that may legitimately be absent.
+
+        Some subjects have no "last success" at all — a reaped-orphan record, a
+        Job that has never completed — and a bare _dur(None) raises inside the
+        notification path, at the exact moment a finding is being delivered.
+        """
+        return "never" if seconds is None else f"{_dur(seconds)} ago"
 
 
     def estimate_period_seconds(schedule: str) -> int:
@@ -1119,17 +1263,254 @@ data:
         return out
 
 
-    def k8s_get(path: str):
+    # ---- BARE JOBS (Factory#603) --------------------------------------------
+    #
+    # How long a bare Job may run before it is worth saying something about, and
+    # the multiple of that at which "may still finish" becomes "is not going to".
+    # Deliberately generous: the point is to catch a HANG, not to police slow
+    # work, and a threshold that fires on every long restore would be muted
+    # inside a week.
+    JOB_STUCK_SECONDS = 3600
+    JOB_WEDGED_MULTIPLIER = 4
+
+    # Marks a record as a bare-Job finding, in the dedup key. Same trick as
+    # KILL_PREFIX: `/` is illegal in a Kubernetes object name, so a Job and a
+    # same-named CronJob in the same namespace can never share an issue.
+    JOB_PREFIX = "job/"
+
+    # ---- ORPHANED PODS (Factory#613) ----------------------------------------
+    #
+    # How long a node must have been Ready before a pod still `Unknown` on it
+    # counts as a stale row rather than an unknown one. The kubelet re-adopts
+    # what it can within seconds of re-registering; a quarter of an hour later it
+    # is not going to. Below this the pod is left alone -- see the header: a pod
+    # whose node is gone is not the same thing as a stale row, and deleting it
+    # only produces a Terminating ghost.
+    ORPHAN_REAP_AFTER_SECONDS = 900
+    ORPHAN_PREFIX = "orphan/"
+
+
+    def assess_bare_jobs(jobs: list[dict], now: datetime,
+                         stuck_after: int = JOB_STUCK_SECONDS) -> list[dict]:
+        """Pure. Every Job with no CronJob owner -> one health record each.
+
+        THE DEFECT THIS CLOSES: main() read the Job list only to attribute Jobs
+        to an owning CronJob and threw the rest away, and job_state() calls an
+        unfinished Job `active`, which the failure counter skips on purpose so an
+        in-flight retry does not read as a failure. Between them, a one-shot Job
+        that failed -- or that hung forever -- was seen by nothing.
+
+        SCOPED TO BARE JOBS. A CronJob-owned Job that hangs already surfaces one
+        layer up, as its CronJob's last success ages past tolerance. A bare Job
+        has no schedule, no last-success timestamp and no next run, so it has no
+        second signal at all. Reporting CronJob-owned Jobs here too would also
+        open a second issue beside the CronJob's own for a single fault.
+        """
+        out = []
+        for j in sorted(jobs, key=lambda j: ((j.get("metadata") or {}).get("namespace", ""),
+                                             (j.get("metadata") or {}).get("name", ""))):
+            meta = j.get("metadata") or {}
+            if any(r.get("kind") == "CronJob"
+                   for r in meta.get("ownerReferences") or []):
+                continue
+            st = j.get("status") or {}
+            state = job_state(j)
+            started = st.get("startTime") or meta.get("creationTimestamp")
+            running_for = (now - _parse_ts(started)).total_seconds() if started else 0.0
+            done = st.get("completionTime")
+            success_age = None if not done else (now - _parse_ts(done)).total_seconds()
+            wedged_after = stuck_after * JOB_WEDGED_MULTIPLIER
+
+            problems: list[tuple[str, str]] = []
+            if state == "failed":
+                problems.append((
+                    "job_failed",
+                    f"FAILED after {st.get('failed') or 0} failed pod(s). This is "
+                    "TERMINAL: a Job with no CronJob owner has no next run and no "
+                    "controller will retry it, so it stays failed until a human "
+                    "acts. ArgoCD reporting the owning Application Synced/Healthy "
+                    "is not a contradiction -- Synced describes the manifest, not "
+                    "a hook's outcome (Factory#508)",
+                ))
+            elif state == "active" and running_for > wedged_after:
+                problems.append((
+                    "job_wedged",
+                    f"HUNG: running for {_dur(running_for)} "
+                    f"(> {_dur(wedged_after)}, 4x the {_dur(stuck_after)} "
+                    "ceiling). A hang is the failure mode no exit code will ever "
+                    "report -- the Job is neither succeeded nor failed, so every "
+                    "check that reads a terminal condition sees nothing at all",
+                ))
+            elif state == "active" and running_for > stuck_after:
+                problems.append((
+                    "job_stuck",
+                    f"still running after {_dur(running_for)} "
+                    f"(> {_dur(stuck_after)} ceiling). It may yet finish -- a slow "
+                    f"pull or a big restore -- which is why this is a warning; it "
+                    f"escalates itself to critical at {_dur(wedged_after)}",
+                ))
+
+            out.append({
+                "_timestamp": int(now.timestamp() * 1_000_000),
+                "source": "job-watchdog",
+                "kind": "Job",
+                "namespace": meta.get("namespace", ""),
+                "cronjob": f"{JOB_PREFIX}{meta.get('name', '?')}",
+                "schedule": "",
+                "suspended": bool((j.get("spec") or {}).get("suspend")),
+                "status": problems[0][0] if problems else "ok",
+                "codes": [p[0] for p in problems],
+                "problems": [p[1] for p in problems],
+                "consecutive_failures": 0,
+                "surviving_jobs": 1,
+                "last_success_age_seconds": None if success_age is None else int(success_age),
+                "last_schedule_age_seconds": None,
+                "expected_period_seconds": stuck_after,
+                "tolerance_seconds": stuck_after,
+                "job_state": state,
+                "running_for_seconds": int(running_for),
+                "active_pods": st.get("active") or 0,
+                "succeeded_pods": st.get("succeeded") or 0,
+                "failed_pods": st.get("failed") or 0,
+                "backoff_limit": (j.get("spec") or {}).get("backoffLimit"),
+            })
+        return out
+
+
+    def assess_orphan_pods(pods: list[dict], nodes: list[dict], now: datetime,
+                           reaper, reap_after: int = ORPHAN_REAP_AFTER_SECONDS
+                           ) -> list[dict]:
+        """Reap pods left `Unknown` by a node that came back, and say so (#613).
+
+        `reaper(namespace, name) -> None | error string` does the delete; it is a
+        parameter so the whole rule is testable without a cluster.
+
+        THE PREDICATE IS THE WHOLE ARGUMENT. Phase `Unknown` alone is not enough:
+        while a node is NotReady the pod's status is merely unknown rather than
+        wrong, and the container may well still be running. Requiring the node to
+        be Ready AND to have been Ready for `reap_after` is what separates a
+        STALE row from an unknown one -- the kubelet has been back long enough to
+        re-adopt this pod and has not. Nothing else in Kubernetes revisits it:
+        taint-based eviction only runs while the node is NotReady.
+
+        A SUCCESSFUL REAP DOES NOT NOTIFY. The record carries no codes, so it
+        lands in the stream as evidence and raises nothing -- same treatment
+        `app_error` gets, and for the same reason. What notifies is a reap that
+        did NOT work: a refused delete, or one that was issued and left the pod
+        in place. That is a fact about this watchdog's own ability to fix what it
+        found and must never read like a clean run.
+
+        ONE RECORD PER NODE, because one node event strands many pods at once.
+        """
+        ready_for = {}
+        for n in nodes:
+            name = (n.get("metadata") or {}).get("name")
+            for c in (n.get("status") or {}).get("conditions") or []:
+                if c.get("type") != "Ready" or c.get("status") != "True":
+                    continue
+                if c.get("lastTransitionTime"):
+                    ready_for[name] = (
+                        now - _parse_ts(c["lastTransitionTime"])).total_seconds()
+
+        found: dict = {}
+        for p in pods:
+            if (p.get("status") or {}).get("phase") != "Unknown":
+                continue
+            meta = p.get("metadata") or {}
+            node = (p.get("spec") or {}).get("nodeName") or ""
+            settled = ready_for.get(node)
+            if settled is None or settled < reap_after:
+                continue  # node down, gone, or only just back -- not ours
+            ns, name = meta.get("namespace", ""), meta.get("name", "?")
+            # A delete was already issued and the pod is STILL here. Reissuing it
+            # changes nothing, so this is reported rather than retried forever:
+            # an unreported no-op loop is the silence this app exists to remove.
+            if meta.get("deletionTimestamp"):
+                err = ("a delete was already issued at "
+                       f"{meta['deletionTimestamp']} and the pod is still here; "
+                       "it needs --grace-period=0 --force, which this watchdog "
+                       "deliberately does not do unattended")
+            else:
+                err = reaper(ns, name)
+            found.setdefault(node, []).append({
+                "namespace": ns, "pod": name, "node": node,
+                "ready_for_seconds": int(settled),
+                "reaped": err is None,
+                "error": err,
+            })
+
+        records = []
+        for node, victims in sorted(found.items()):
+            failed = [v for v in victims if not v["reaped"]]
+            problems = [
+                f"{len(victims)} pod(s) were still `Unknown` on node `{node}`, "
+                f"which has been Ready for {_dur(victims[0]['ready_for_seconds'])}. "
+                "`Unknown` means the kubelet stopped reporting for a pod the API "
+                "server still has; nothing re-adopts it once the node recovers, "
+                "so the row is stale rather than unknown and every "
+                "\"no pods outside Running/Succeeded\" check stays permanently "
+                "red for a reason unrelated to the current state of the fleet",
+                f"REAPED {len(victims) - len(failed)} of {len(victims)}: "
+                + ", ".join(f"`{v['namespace']}/{v['pod']}`" for v in victims),
+            ]
+            for v in failed:
+                problems.append(
+                    f"COULD NOT REAP `{v['namespace']}/{v['pod']}`: {v['error']}")
+            records.append({
+                "_timestamp": int(now.timestamp() * 1_000_000),
+                "source": "job-watchdog",
+                "kind": "Pod",
+                "namespace": "cluster",
+                "cronjob": f"{ORPHAN_PREFIX}node/{node}",
+                "schedule": "",
+                "suspended": False,
+                "status": "orphans_unreaped" if failed else "ok",
+                # Housekeeping that worked notifies nobody; housekeeping that
+                # did not is the only thing here a human can act on.
+                "codes": ["orphans_unreaped"] if failed else [],
+                "problems": problems,
+                "consecutive_failures": 0,
+                "surviving_jobs": 0,
+                "last_success_age_seconds": None,
+                "last_schedule_age_seconds": None,
+                "expected_period_seconds": reap_after,
+                "tolerance_seconds": reap_after,
+                "node": node,
+                "victims": victims,
+            })
+        return records
+
+
+    def k8s_call(path: str, method: str = "GET"):
         with open(f"{SA}/token") as f:
             token = f.read().strip()
         req = urllib.request.Request(
             f"https://kubernetes.default.svc{path}",
             headers={"authorization": f"Bearer {token}", "accept": "application/json"},
-            method="GET",
+            method=method,
         )
         ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
         with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
-            return json.load(r)
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+
+    def k8s_get(path: str):
+        return k8s_call(path)
+
+
+    def reap_pod(ns: str, name: str) -> str | None:
+        """Delete one orphaned pod. Returns None on success, else the error.
+
+        Never raises: a refused delete is a FINDING (`orphans_unreaped`), not a
+        dead run. Taking the CronJob report and the heartbeat down because a
+        cleanup failed would trade a loud signal for a silent one.
+        """
+        try:
+            k8s_call(f"/api/v1/namespaces/{ns}/pods/{name}", "DELETE")
+            return None
+        except Exception as e:  # noqa: BLE001 — a failed reap is a finding
+            return repr(e)
 
 
     def emit(oo: str, org: str, stream: str, basic: str, records: list[dict]) -> None:
@@ -1199,10 +1580,11 @@ data:
     def issue_body(record: dict, sev: str) -> str:
         ns, name = record["namespace"], record["cronjob"]
         def fmt(field):
-            v = record.get(field)
-            return "never" if v is None else f"{_dur(v)} ago"
+            return _ago(record.get(field))
         is_cron = _subject_kind(record) == "CronJob"
-        is_pod = _subject_kind(record) == "Pod"
+        is_job = _subject_kind(record) == "Job"
+        is_orphan = name.startswith(ORPHAN_PREFIX)
+        is_pod = _subject_kind(record) == "Pod" and not is_orphan
         lines = [
             MARKER.format(ns=ns, name=name),
             f"**Severity: {sev.upper()}** — `{ns}/{name}`"
@@ -1222,6 +1604,27 @@ data:
                 f"- Last success: {fmt('last_success_age_seconds')}",
                 f"- Last schedule: {fmt('last_schedule_age_seconds')}",
             ]
+        elif is_job:
+            lines += [
+                f"- Job state: `{record['job_state']}` "
+                f"(active {record['active_pods']}, succeeded "
+                f"{record['succeeded_pods']}, failed {record['failed_pods']}, "
+                f"backoffLimit {record['backoff_limit']})",
+                f"- Running for: {_dur(record['running_for_seconds'])}",
+                f"- Completed: {fmt('last_success_age_seconds')}",
+                "- Owner: **none**. This is a bare Job, so there is no schedule, "
+                "no next run and no controller that will retry it.",
+            ]
+        elif is_orphan:
+            lines += ["| pod | node | node Ready for | reaped |",
+                      "|---|---|---|---|"]
+            lines += [
+                f"| `{v['namespace']}/{v['pod']}` | `{v['node']}` | "
+                f"{_dur(v['ready_for_seconds'])} | "
+                + ("yes" if v["reaped"] else f"NO — {v['error']}") + " |"
+                for v in record.get("victims") or []
+            ]
+            lines += [""]
         elif is_pod:
             # The victim table IS the evidence. `lastState` is destroyed the
             # moment a pod is replaced — rolling `fides-server` on 2026-08-06
@@ -1250,7 +1653,7 @@ data:
                 "and survives the controller that wrote it)",
                 f"- Oldest reconcile: {fmt('oldest_reconcile_age_seconds')}",
             ]
-        if not is_pod:
+        if not is_pod and not is_orphan:
             lines += [
                 f"- Tolerance: {_dur(record['tolerance_seconds'])} "
                 f"(period {_dur(record['expected_period_seconds'])})",
@@ -1272,6 +1675,44 @@ data:
                 "be closed automatically when this CronJob reports healthy again. "
                 "Closing it by hand while the CronJob is still unhealthy just "
                 "opens a fresh one on the next run.",
+            ]
+        elif is_job:
+            lines += [
+                "Where to look first:",
+                "",
+                "```",
+                f"kubectl --context factory -n {ns} describe job "
+                f"{name[len(JOB_PREFIX):]}",
+                f"kubectl --context factory -n {ns} logs "
+                f"job/{name[len(JOB_PREFIX):]} --all-containers --tail=100",
+                "```",
+                "",
+                "ArgoCD reporting the owning Application `Synced`/`Healthy` does "
+                "NOT contradict this: `Synced` describes the manifest, not the "
+                "outcome of a PreSync/PostSync hook (Factory#508, Factory#603).",
+                "",
+                "Raised automatically by the `job-watchdog` CronJob. A Job that "
+                "is merely slow closes itself when it completes. A `job_failed` "
+                "is TERMINAL and can never report healthy, so its issue closes "
+                "when the Job is DELETED — which is the observable form of "
+                "someone having dealt with it.",
+            ]
+        elif is_orphan:
+            lines += [
+                "Where to look first:",
+                "",
+                "```",
+                "kubectl --context factory get pods -A "
+                "--field-selector status.phase=Unknown -o wide",
+                "kubectl --context factory get nodes",
+                "```",
+                "",
+                "These pods are reaped, not merely reported: nothing in "
+                "Kubernetes owns this case, because taint-based eviction only "
+                "runs while the node is NotReady and once it recovers the stale "
+                "row is permanent (Factory#613). A successful reap says nothing "
+                "at all — this issue exists only because the reap did not work, "
+                "and it closes on the next run that manages it.",
             ]
         elif is_pod:
             lines += [
@@ -1407,12 +1848,19 @@ data:
                             + issue_body(r, sev)})
                 eprint(f"NOTIFIED  {name} [still {sev}] -> {repo}#{issue['number']}")
             elif action == "close":
+                # A subject can report healthy with NO "last success" at all — a
+                # reaped orphan, a Job that is simply no longer stuck. `_dur`
+                # raises on None, and it would raise in the middle of delivering
+                # a notification, which is the one place this app must not fall
+                # over. So the timing clause is written only when there is one.
+                last = r.get("last_success_age_seconds")
+                why = (f": {_success_label(r)} {_ago(last)}, within its "
+                       f"{_dur(r['tolerance_seconds'])} tolerance"
+                       if last is not None else
+                       " and the condition this issue describes is gone")
                 gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
                    {"body": f"RECOVERED. `{r['namespace']}/{name}` now reports "
-                            f"healthy: {_success_label(r)} "
-                            f"{_dur(r['last_success_age_seconds'])} ago, within its "
-                            f"{_dur(r['tolerance_seconds'])} tolerance. "
-                            "Closing automatically."})
+                            f"healthy{why}. Closing automatically."})
                 gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
                    {"state": "closed", "state_reason": "completed"})
                 eprint(f"RECOVERED {name} -> closed {repo}#{issue['number']}")
@@ -1518,6 +1966,10 @@ data:
         pod_window = int(
             os.environ.get("POD_TERMINATION_WINDOW_SECONDS", POD_WINDOW_SECONDS)
         )
+        job_stuck = int(os.environ.get("JOB_STUCK_SECONDS", JOB_STUCK_SECONDS))
+        reap_after = int(
+            os.environ.get("ORPHAN_REAP_AFTER_SECONDS", ORPHAN_REAP_AFTER_SECONDS)
+        )
         oo = os.environ.get(
             "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080"
         ).rstrip("/")
@@ -1589,6 +2041,19 @@ data:
         ]
         records.append(assess_argocd(apps, apps_err, now, reconcile_tol))
         records += assess_pod_terminations(pods, nodes, pods_err, now, pod_window)
+        # Factory#603. The Jobs with no CronJob owner were already in hand and
+        # were simply discarded; these are the ArgoCD PreSync/PostSync hooks and
+        # every one-shot Job in the fleet, none of which had a monitor at all.
+        records += assess_bare_jobs(jobs, now, job_stuck)
+        # Factory#613. The only thing in this app that CHANGES the cluster, and
+        # the only case where reporting alone would have made things worse: a
+        # finding that can open and never close is what teaches people to ignore
+        # the label. Skipped entirely when the pod list could not be read --
+        # assess_pod_terminations has already turned that into a critical, and
+        # deleting on the strength of an empty list is the one mistake here with
+        # a blast radius.
+        if pods_err is None:
+            records += assess_orphan_pods(pods, nodes, now, reap_pod, reap_after)
 
         # Namespace-qualified now that the watch is cluster-wide: two namespaces
         # may hold same-named CronJobs, and a bare name would make the operator's
@@ -1609,9 +2074,12 @@ data:
             return 4
 
         bad = [f"{r['namespace']}/{r['cronjob']}" for r in records if r["status"] != "ok"]
+        kinds: dict = {}
+        for r in records:
+            kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
         eprint(
             f"reported {len(records)} subject(s) to '{stream}' "
-            f"({len(records) - 1} CronJob(s) + ArgoCD reconciliation): "
+            f"({', '.join(f'{v} {k}' for k, v in sorted(kinds.items()))}): "
             f"{len(records) - len(bad)} ok, {len(bad)} unhealthy"
             + (f" ({', '.join(bad)})" if bad else "")
         )
@@ -2047,6 +2515,22 @@ data:
             assert "pods, nodes, pods_err = [], [], repr(e)" in body_of_main, \
                 "an unreadable pod list must degrade to a finding, not a dead run"
 
+            # Factory#603 / #613, and for the same invisible-from-every-other-
+            # angle reason as the four above: drop either call and every other
+            # record still lands, the run still goes green and the heartbeat is
+            # still stamped. The only difference is that bare Jobs go back to
+            # having no monitor and orphaned pods go back to being nobody's.
+            assert "assess_bare_jobs(" in body_of_main, \
+                "main must score the Jobs with no CronJob owner"
+            assert "assess_orphan_pods(" in body_of_main and \
+                "reap_pod" in body_of_main, \
+                "main must reap orphaned pods, not merely describe them"
+            # The reap must never run off an empty pod list: an unreadable list
+            # is already a critical, and deleting on the strength of it is the
+            # one mistake in this file with a blast radius.
+            assert "if pods_err is None:" in body_of_main, \
+                "reaping must be skipped when the pod list could not be read"
+
         # Same-named CronJobs in two namespaces must stay two findings, not one.
         # Cluster-wide listing makes name collisions reachable for the first
         # time; if the issue marker collided, the second namespace's outage would
@@ -2359,6 +2843,274 @@ data:
         assert kill_marker in {
             MARKER.format(ns=r["namespace"], name=r["cronjob"]) for r in recs}
 
+        # ---- BARE JOBS (Factory#603) ----------------------------------------
+        #
+        # The live case is `minio-create-bucket`: an ArgoCD PostSync hook with no
+        # CronJob owner, fixed by Factory#508 to fail loudly, watched by nothing.
+        # Enumerating CronJobs could never see it, and job_state() calls an
+        # unfinished Job `active` so a hang was nobody's problem either.
+        def bare(name, *, state="active", started="2026-07-26T11:00:00Z",
+                 completed=None, failed=0, owner=None):
+            if state == "succeeded":
+                st = {"succeeded": 1, "completionTime": completed,
+                      "conditions": [{"type": "Complete", "status": "True"}]}
+            elif state == "failed":
+                st = {"failed": failed or 1,
+                      "conditions": [{"type": "Failed", "status": "True"}]}
+            else:
+                st = {"active": 1}
+            st["startTime"] = started
+            return {
+                "metadata": {
+                    "name": name, "namespace": "factory",
+                    "creationTimestamp": started,
+                    **({"ownerReferences": [{"kind": "CronJob", "uid": owner}]}
+                       if owner else {}),
+                },
+                "spec": {"backoffLimit": 0},
+                "status": st,
+            }
+
+        # 1. A FAILED bare Job is a CRITICAL, because it is terminal: no
+        #    controller retries it and there is no next run to clear it.
+        mc = assess_bare_jobs([bare("minio-create-bucket", state="failed")], now)[0]
+        assert len(assess_bare_jobs([bare("x", state="failed")], now)) == 1
+        assert mc["status"] == "job_failed", mc
+        assert mc["kind"] == "Job" and mc["cronjob"] == "job/minio-create-bucket"
+        assert severity_of(mc) == "critical", mc
+        assert notify_action(mc, None, now, 24) == "open"
+
+        # 2. A SUCCEEDED one is silent. The record is still emitted — that is
+        #    what lets a recovered Job close its own issue below — but it says
+        #    nothing to anyone.
+        ok_job = assess_bare_jobs(
+            [bare("minio-create-bucket", state="succeeded",
+                  completed="2026-07-26T11:55:00Z")], now)[0]
+        assert ok_job["status"] == "ok", ok_job
+        assert severity_of(ok_job) is None
+        assert notify_action(ok_job, None, now, 24) is None
+        assert ok_job["last_success_age_seconds"] == 300, ok_job
+
+        # 3. THE HANG, which is the failure mode no exit code will ever report,
+        #    and the reason a flat severity would be wrong. Three grades, and
+        #    the boundaries are mutation pairs: one second either side.
+        def state_at(started):
+            return assess_bare_jobs([bare("h", started=started)], now)[0]["status"]
+
+        assert state_at("2026-07-26T11:00:00Z") == "ok"          # 3600s exactly
+        assert state_at("2026-07-26T10:59:59Z") == "job_stuck"    # 3601s
+        assert state_at("2026-07-26T08:00:00Z") == "job_stuck"    # 14400s exactly
+        assert state_at("2026-07-26T07:59:59Z") == "job_wedged"   # 14401s
+        stuck = assess_bare_jobs([bare("h", started="2026-07-26T10:00:00Z")], now)[0]
+        wedged = assess_bare_jobs([bare("h", started="2026-07-26T00:00:00Z")], now)[0]
+        # A Job an hour over may still finish; one four times over will not.
+        # Grading both critical is the cry-wolf failure, grading both warning
+        # means a week-long hang never re-surfaces after one quiet comment.
+        assert severity_of(stuck) == "warning", stuck
+        assert severity_of(wedged) == "critical", wedged
+        # It escalates ITSELF as the clock runs, with nothing to remember.
+        assert notify_action(wedged, iss("warning", "2026-07-26T11:59:00Z"),
+                             now, 24) == "escalate"
+
+        # 4. CronJob-OWNED JOBS ARE NOT SCORED HERE. Their hang already surfaces
+        #    one layer up as their CronJob's last success ageing out, and a
+        #    second issue beside the CronJob's own for one fault is the fan-out
+        #    this app argues against everywhere else.
+        assert assess_bare_jobs([bare("cb-1", owner="cred-broker")], now) == []
+        assert len(assess_bare_jobs(
+            [bare("cb-1", owner="cred-broker"), bare("hook")], now)) == 1
+
+        # 5. The dedup key cannot collide with a same-named CronJob. Without the
+        #    prefix, a bare Job called `cred-broker` would silently absorb the
+        #    CronJob's outage into its own issue.
+        assert MARKER.format(ns="factory", name=mc["cronjob"]) != \
+            MARKER.format(ns="factory", name="minio-create-bucket")
+
+        # 6. THE BODY carries Job furniture and none of anyone else's.
+        jbody = issue_body(mc, "critical")
+        assert "Owner: **none**" in jbody, jbody
+        assert "Job state: `failed`" in jbody, jbody
+        assert "Surviving Jobs" not in jbody and "Freshest reconcile" not in jbody
+        assert "Synced` describes the manifest" in jbody, jbody
+        assert issue_title(mc, "critical") == (
+            "[critical] job/minio-create-bucket FAILED and nothing will retry it "
+            "— it is a one-shot Job with no CronJob owner"), issue_title(mc, "critical")
+
+        # 7. CLOSE-ON-ABSENCE, driven through notify() rather than trusted. A
+        #    stuck Job that finishes CLOSES its issue; a finding that can open
+        #    and never close is worse than no alert at all.
+        calls.clear()
+        stub_issues.clear()
+        globals()["gh"] = fake_gh
+        try:
+            assert notify("t", "o/r", [stuck], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues")], writes()
+            stub_issues.append({
+                "number": 7, "title": "t", "created_at": "2026-07-26T11:00:00Z",
+                "updated_at": "2026-07-26T11:00:00Z",
+                "body": issue_body(stuck, "warning"),
+                "labels": [{"name": ISSUE_LABEL},
+                           {"name": SEVERITY_LABELS["warning"]}]})
+            # Still stuck: reported once, then completely quiet.
+            calls.clear()
+            assert notify("t", "o/r", [stuck], now, 24) == 0
+            assert not writes(), writes()
+            # It finished. Comment + close, on the ordinary recovery path.
+            calls.clear()
+            done = assess_bare_jobs(
+                [bare("h", state="succeeded", started="2026-07-26T10:00:00Z",
+                      completed="2026-07-26T11:58:00Z")], now)[0]
+            assert notify("t", "o/r", [done], now, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues/7/comments"),
+                                ("PATCH", "/repos/o/r/issues/7")], writes()
+        finally:
+            globals()["gh"] = real_gh
+
+        # ---- ORPHANED PODS (Factory#613) ------------------------------------
+        #
+        # The live case: `k3d-agent-0-0` was stranded by the nightly
+        # nixos-upgrade on 2026-08-06, came back Ready at 14:44:07Z, and
+        # `fleet-match-29767120-98nzc` sat `Unknown` for 30h+ afterwards.
+        # Nothing owns this: taint-based eviction only runs while the node is
+        # NotReady, so once it recovers the stale row is permanent.
+        def unknown_pod(name, node, *, ns="factory", deleting=None, phase="Unknown"):
+            return {
+                "metadata": {"name": name, "namespace": ns,
+                             **({"deletionTimestamp": deleting} if deleting else {})},
+                "spec": {"nodeName": node},
+                "status": {"phase": phase},
+            }
+
+        def notready(name, since):
+            return {"metadata": {"name": name},
+                    "status": {"conditions": [
+                        {"type": "Ready", "status": "False",
+                         "lastTransitionTime": since}]}}
+
+        reaped: list = []
+
+        def ok_reaper(ns, name):
+            reaped.append((ns, name))
+            return None
+
+        def broken_reaper(ns, name):
+            reaped.append((ns, name))
+            return "HTTPError(403 Forbidden)"
+
+        stranded = datetime(2026, 8, 7, 21, 0, tzinfo=timezone.utc)
+        back = term_node("k3d-agent-0-0", "2026-08-06T14:44:07Z")
+        orphan_pods = [unknown_pod("fleet-match-29767120-98nzc", "k3d-agent-0-0")]
+
+        # 1. THE REAP. The node has been Ready for 30h and the kubelet never
+        #    re-adopted this pod, so the row is STALE, not unknown.
+        reaped.clear()
+        rec = assess_orphan_pods(orphan_pods, [back], stranded, ok_reaper)[0]
+        assert reaped == [("factory", "fleet-match-29767120-98nzc")], reaped
+        assert rec["cronjob"] == "orphan/node/k3d-agent-0-0", rec
+        # 2. ...AND IT SAYS NOTHING. Routine housekeeping that worked is evidence
+        #    in the stream, never an issue: an issue per cleanup buries the
+        #    findings that have no other witness. Same rule `app_error` gets.
+        assert rec["status"] == "ok" and rec["codes"] == [], rec
+        assert severity_of(rec) is None
+        assert notify_action(rec, None, stranded, 24) is None
+
+        # 3. A POD WHOSE NODE IS STILL DOWN IS NOT THE SAME THING and is left
+        #    alone -- its status is unknown rather than wrong, the container may
+        #    still be running, and deleting it only makes a Terminating ghost.
+        reaped.clear()
+        assert assess_orphan_pods(
+            orphan_pods, [notready("k3d-agent-0-0", "2026-08-07T20:00:00Z")],
+            stranded, ok_reaper) == []
+        # Nor is one whose node only just came back: the kubelet re-adopts what
+        # it can within seconds, and this is the window that lets it.
+        assert assess_orphan_pods(
+            orphan_pods, [term_node("k3d-agent-0-0", "2026-08-07T20:55:00Z")],
+            stranded, ok_reaper) == []
+        # Nor one whose node is no longer in the cluster at all.
+        assert assess_orphan_pods(orphan_pods, [], stranded, ok_reaper) == []
+        assert reaped == [], "nothing may be deleted in any of those three cases"
+
+        # 4. THE MUTATION PAIR on the settle window: one second either side.
+        edge_now = datetime(2026, 8, 7, 12, 0, 0, tzinfo=timezone.utc)
+        assert assess_orphan_pods(
+            orphan_pods, [term_node("k3d-agent-0-0", "2026-08-07T11:45:01Z")],
+            edge_now, ok_reaper) == []                                   # 899s
+        assert len(assess_orphan_pods(
+            orphan_pods, [term_node("k3d-agent-0-0", "2026-08-07T11:44:59Z")],
+            edge_now, ok_reaper)) == 1                                   # 901s
+
+        # 5. ONLY `Unknown`. This is the guard that keeps a delete verb safe: a
+        #    predicate that drifted phase-agnostic would reap the fleet.
+        reaped.clear()
+        for phase in ("Running", "Pending", "Succeeded", "Failed"):
+            assert assess_orphan_pods(
+                [unknown_pod("live", "k3d-agent-0-0", phase=phase)],
+                [back], stranded, ok_reaper) == [], phase
+        assert reaped == [], "only phase Unknown may ever be deleted"
+
+        # 6. A REAP THAT DID NOT WORK IS A FINDING, and a warning rather than a
+        #    critical: stale rows are not a workload being down.
+        reaped.clear()
+        refused = assess_orphan_pods(orphan_pods, [back], stranded, broken_reaper)[0]
+        assert refused["status"] == "orphans_unreaped", refused
+        assert severity_of(refused) == "warning", refused
+        assert "403" in " ".join(refused["problems"]), refused
+        assert notify_action(refused, None, stranded, 24) == "open"
+        # A pod already asked to go and still here is reported, NOT deleted
+        # again: reissuing a delete that did nothing is a silent no-op loop.
+        reaped.clear()
+        again = assess_orphan_pods(
+            [unknown_pod("fleet-match-29767120-98nzc", "k3d-agent-0-0",
+                         deleting="2026-08-07T20:00:00Z")],
+            [back], stranded, ok_reaper)[0]
+        assert reaped == [], "a pod already Terminating must not be re-deleted"
+        assert again["status"] == "orphans_unreaped", again
+        assert "grace-period=0" in " ".join(again["problems"]), again
+
+        # 7. ONE RECORD PER NODE. One node event strands many pods, and one
+        #    issue per victim is CFactory#306 by volume.
+        reaped.clear()
+        many_recs = assess_orphan_pods(
+            [unknown_pod(f"p-{i}", "k3d-agent-0-0", ns=f"ns-{i}") for i in range(4)],
+            [back], stranded, ok_reaper)
+        assert len(many_recs) == 1 and len(many_recs[0]["victims"]) == 4
+        assert len(reaped) == 4
+
+        # 8. THE BODY, and its own furniture only.
+        obody = issue_body(refused, "warning")
+        assert "fleet-match-29767120-98nzc" in obody and "NO — " in obody
+        assert "Surviving Jobs" not in obody and "Freshest reconcile" not in obody
+        assert "Job state" not in obody, obody
+        assert "taint-based eviction" in obody, obody
+
+        # 9. CLOSE-ON-ABSENCE, again through notify(). The unreaped finding opens,
+        #    the next run reaps successfully, and the issue CLOSES -- including
+        #    the close comment, which has no "last success" to quote and must not
+        #    raise while delivering a notification.
+        calls.clear()
+        stub_issues.clear()
+        globals()["gh"] = fake_gh
+        try:
+            assert notify("t", "o/r", [refused], stranded, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues")], writes()
+            stub_issues.append({
+                "number": 8, "title": "t", "created_at": "2026-08-07T20:00:00Z",
+                "updated_at": "2026-08-07T20:00:00Z",
+                "body": issue_body(refused, "warning"),
+                "labels": [{"name": ISSUE_LABEL},
+                           {"name": SEVERITY_LABELS["warning"]}]})
+            calls.clear()
+            assert notify("t", "o/r", [rec], stranded, 24) == 1
+            assert writes() == [("POST", "/repos/o/r/issues/8/comments"),
+                                ("PATCH", "/repos/o/r/issues/8")], writes()
+        finally:
+            globals()["gh"] = real_gh
+
+        # Every new code that can reach a human needs a title phrase, or
+        # issue_title raises mid-incident and the notification is lost.
+        for c in ("job_failed", "job_stuck", "job_wedged", "orphans_unreaped"):
+            assert c in TITLE_PHRASE, c
+
         print("selftest OK")
         return 0
 
@@ -2415,6 +3167,18 @@ spec:
                 # and the overlap costs only a repeated record for an already
                 # de-duplicated finding.
                 - { name: POD_TERMINATION_WINDOW_SECONDS, value: "3600" }
+                # Factory#603. How long a bare Job may run before it is a
+                # warning; 4x that (4h) and it is a critical. Deliberately
+                # generous — the point is to catch a HANG, not to police slow
+                # work, and a ceiling that fires on every long restore is muted
+                # inside a week. The longest-running bare Job in this fleet is
+                # minio-create-bucket, which completes in seconds.
+                - { name: JOB_STUCK_SECONDS, value: "3600" }
+                # Factory#613. How long a node must have been Ready before a pod
+                # still `Unknown` on it is a stale row rather than an unknown
+                # one. The kubelet re-adopts what it can within seconds of
+                # re-registering; 15 minutes later it is not going to.
+                - { name: ORPHAN_REAP_AFTER_SECONDS, value: "900" }
                 - { name: OO_STREAM, value: "job_health" }
                 - { name: OO_ORG, value: "default" }
                 # Where unhealthy findings go so a human passively meets them.
