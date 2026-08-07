@@ -197,6 +197,34 @@ patches:
   #     flag pointing at a Secret nobody maintains puts that whole-fleet failure
   #     in front of Factory#522's Enforce flip in exchange for nothing.
   #
+  # THE REMOVAL WAS MUTATION-CHECKED, 2026-08-07 (Factory#566). Asserting that a
+  # deletion closes a failure mode is not the same as showing it, so: one server
+  # dry-run Pod carrying all 17 covered images through the real admission
+  # webhook, both controllers restarted between states so the 60m image-verify
+  # cache is cold.
+  #
+  #   flag present, no Secret                ->   0 failures  (the state #177 found)
+  #   flag present, Secret holding a bad PAT ->  16 failures  (5 services + 11 runners)
+  #   flag REMOVED, bad Secret still present ->   0 failures  (this file, today)
+  #
+  # Row 3 is the one that matters: the same invalid credential is still sitting
+  # in the namespace and can no longer do any harm, because nothing reads it.
+  # `--v=2` on the admission controller shows the mechanism directly --
+  #
+  #   with the flag:     setup registry client... insecure=false secrets=kyverno-ghcr-pull
+  #   without the flag:  setup registry client... insecure=false secrets=
+  #
+  # -- so re-adding the flag is what re-arms this, not the Secret appearing.
+  #
+  # A NOTE ON MEASURING IT AGAIN, because the first attempt was a FALSE NEGATIVE.
+  # Row 3 initially reported 16 failures: ArgoCD selfHeal had restored the flag
+  # mid-probe, so the run measured the unpatched config. It was caught only
+  # because residency of the removed arg was re-checked AFTER the probe rather
+  # than before. To redo this, suspend `spec.syncPolicy.automated` on the
+  # `kyverno` Application for the duration and restore it from a recorded value
+  # -- and check residency last. Same lesson as Factory#620: pick the instrument
+  # deliberately and prove it stayed applied.
+  #
   # IF A FACTORY PACKAGE EVER GOES PRIVATE AGAIN, the credential comes back and
   # it goes on BOTH verifying controllers, not one. They build registry clients
   # independently (`internal.WithRegistryClient()` in cmd/kyverno/main.go and
@@ -211,10 +239,14 @@ patches:
   # `kubectl create secret` rather than `kubectl apply` (Factory#448/#565), is
   # kept in docs/image-signature-admission.md.
   #
-  # `odin` is still a PRIVATE package and is deliberately still not given a
-  # signature rule for exactly that reason -- Factory#572. Do not add one and a
-  # credential together as a single change: a rule in front of an unreadable
-  # image reports the Factory#430 registry-auth ambiguity, not a verdict.
+  # `odin` WAS a private package, and was deliberately left without a signature
+  # rule for exactly that reason -- a rule in front of an unreadable image
+  # reports the Factory#430 registry-auth ambiguity, not a verdict. It went
+  # public on 2026-08-07 and is now anonymously verifiable like the rest
+  # (manifest and `.sig` tag both 200 to an anonymous token, and `cosign verify`
+  # passes with an empty keychain), so Factory#572 gives it a rule with no
+  # credential involved. The ordering rule stands for the next package: never
+  # add a rule and a credential as a single change.
   #
   # AND KEEP THE FAILURE SIGNATURE, because the two are reported identically.
   # A read failure names the token endpoint; a signature verdict never does:
