@@ -161,7 +161,7 @@
 # on ANY `ghcr.io/olafkfreund/*` image in `factory` that no glob here names.
 # When you add a rule to this file, add its glob to that policy's mirror list
 # IN THE SAME COMMIT. Read the long comment at the top of that file first; it
-# records why the obvious catch-all shape (a sixth verifyImages rule with
+# records why the obvious catch-all shape (a catch-all verifyImages rule with
 # `required: true` and no attestor) was measured and rejected.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
