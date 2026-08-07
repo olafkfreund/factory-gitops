@@ -85,19 +85,26 @@
 #    verify Job Pod.
 #
 # Factory#524 (2026-08-05). The eleven `tfactory-runner-*` images -- the
-# sandbox that generated code is built and executed in -- are now covered by
+# sandbox that generated code is built and executed in -- are covered by
 # `verify-tfactory-runner-signature` below. Two of them (tfactory-runner-nix,
-# tfactory-runner-portal-ui) are PRIVATE GHCR packages and used to report
-# `fail` because Kyverno read ghcr.io anonymously. Factory#563 wired a
-# read:packages credential into both verifying controllers; all eleven verify
-# once the `kyverno-ghcr-pull` Secret exists in the kyverno namespace. If those
-# two are red, that is a registry-auth failure, not a signature verdict -- read
-# the comment on that rule before triaging it as a signing problem.
+# tfactory-runner-portal-ui) were PRIVATE GHCR packages and reported `fail`
+# because Kyverno reads ghcr.io anonymously and cannot retrieve a signature it
+# cannot read.
 #
-# Factory#566: once that Secret exists, a WRONG or EXPIRED credential in it
-# unverifies ALL SIXTEEN covered images, not just the two private ones. There
-# is no fallback to the anonymous path. Check the Secret before anything else
-# when the whole board goes red at once.
+# CLOSED by Factory#563 on 2026-08-07: both packages were made PUBLIC, so all
+# sixteen covered images are readable with no credential at all. Kyverno holds
+# no ghcr.io Secret and needs none -- see apps/kyverno/manifests/
+# kustomization.yaml, which also records why the dormant
+# `--imagePullSecrets=kyverno-ghcr-pull` flag was removed rather than left in
+# place (Factory#566: a wrong or expired credential unverifies all sixteen at
+# once, with no fallback to the anonymous path).
+#
+# Measured through the live webhook the same day, with no Secret in the
+# kyverno namespace, on a Pod carrying all three kinds of runner:
+#
+#   kyverno.io/verify-images: {"ghcr.io/olafkfreund/tfactory-runner-nix:latest":"pass",
+#     "ghcr.io/olafkfreund/tfactory-runner-portal-ui:latest":"pass",
+#     "ghcr.io/olafkfreund/tfactory-runner-pytest:latest":"pass"}
 #
 # Factory#564 (2026-08-05). THE RULES IN THIS FILE ONLY EVER SPEAK ABOUT IMAGES
 # THEIR GLOBS NAME. `required: true` below means "a MATCHED image must have a
@@ -118,7 +125,7 @@
 #
 # 2. `odin` is deliberately NOT given a rule here even though it is signed as
 #    of Odin#4 and verifies against the live registry. The `odin` GHCR package
-#    is PRIVATE and `kyverno-ghcr-pull` does not exist yet, so a rule would
+#    is PRIVATE and Kyverno holds no ghcr.io credential, so a rule would
 #    report the Factory#430 registry-auth ambiguity rather than a signature
 #    verdict -- a permanent misleading red that costs #522 its criterion. Its
 #    absence is not silent: `require-first-party-signature-coverage` reports it
@@ -350,53 +357,55 @@ spec:
     # runner-images.yml are three separate publishing workflows, and dropping
     # any one of them stops a real Job from verifying.
     #
-    # PRIVATE PACKAGES -- READ THIS BEFORE TRIAGING A RED.
+    # THE TWO FORMERLY-PRIVATE RUNNERS -- READ THIS BEFORE TRIAGING A RED.
     #
-    # `tfactory-runner-nix` and `tfactory-runner-portal-ui` are PRIVATE GHCR
-    # packages; the other nine are public. Kyverno used to read ghcr.io
-    # anonymously -- no imagePullSecret in the kyverno namespace -- so it could
-    # not retrieve a signature it could not read, and these two reported `fail`
-    # while every other runner reported `pass`.
+    # `tfactory-runner-nix` and `tfactory-runner-portal-ui` were PRIVATE GHCR
+    # packages while the other nine were public. Kyverno reads ghcr.io
+    # anonymously -- there is no imagePullSecret in the kyverno namespace -- so
+    # it could not retrieve a signature it could not read, and these two
+    # reported `fail` while every other runner reported `pass`.
     #
-    # FIXED by Factory#563: kyverno-admission-controller and
-    # kyverno-reports-controller now run with
-    # `--imagePullSecrets=kyverno-ghcr-pull`, a read:packages-only ghcr.io
-    # credential. See apps/kyverno/manifests/kustomization.yaml for why both
-    # controllers hold it and why the Secret is not in this repo. If these two
-    # go red, check the Secret before suspecting the signatures:
+    # CLOSED by Factory#563 on 2026-08-07: both packages are now PUBLIC. The
+    # glob below already named them, so no rule changed and none needed to --
+    # the gap was read access, never coverage. Verified anonymously, with an
+    # empty credential store, which is exactly what Kyverno does:
     #
-    #   kubectl -n kyverno get secret kyverno-ghcr-pull
+    #   $ DOCKER_CONFIG=<empty> cosign verify \
+    #       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    #       --certificate-identity-regexp '<the subjectRegExp below>' \
+    #       ghcr.io/olafkfreund/tfactory-runner-nix:latest
+    #   Subject: .../workflows/nix-runner-image.yml@refs/heads/main
     #
-    # Factory#566, measured: if that Secret exists but holds a wrong or expired
-    # credential, ALL SIXTEEN covered images fail, not just these two. The
-    # keychain has no fallback to the anonymous path. A whole-board red is the
-    # credential; a two-image red is the missing credential.
+    #   ghcr.io/olafkfreund/tfactory-runner-portal-ui:latest
+    #   Subject: .../workflows/portal-ui-runner-image.yml@refs/heads/main
     #
-    # That fail is a REGISTRY-AUTH failure, not a signature verdict. This is
-    # exactly the Factory#430 ambiguity, so the distinguishing evidence is
-    # recorded here rather than left to be re-derived. Kyverno v1.18.2 against
-    # this rule with an empty credential store, which is what Kyverno does:
+    # and through the live webhook, on a Pod carrying both, zero warnings and
+    # `kyverno.io/verify-images` reporting `pass` for each.
     #
-    #   failed to verify image ghcr.io/olafkfreund/tfactory-runner-nix:latest:
-    #   .attestors[0].entries[0].keyless: GET https://ghcr.io/token?scope=
-    #   repository%3Aolafkfreund%2Ftfactory-runner-nix%3Apull&service=ghcr.io:
-    #   UNAUTHORIZED: authentication required
+    # IT WAS NOT FIXED WITH A CREDENTIAL. That path was built (a
+    # `--imagePullSecrets=kyverno-ghcr-pull` flag on both verifying
+    # controllers) and is now removed: the Secret was never created, and
+    # Factory#566 measured that a wrong or EXPIRED one unverifies ALL SIXTEEN
+    # covered images rather than degrading to the anonymous path. See
+    # apps/kyverno/manifests/kustomization.yaml.
     #
-    # The same image, same anchored identity, WITH a read credential:
-    # `cosign verify` passes. Both images are correctly signed. Contrast that
-    # with a real signature verdict, which reads `no matching signatures` or
-    # `no signatures found` and never names ghcr.io/token.
-    #
-    # Factory#563 originally proposed making both packages public. Container
-    # package visibility has no REST endpoint (PATCH returns 404) and the UI
-    # toggle would not commit, so the credential path was taken instead -- and
-    # it is the better end state: it covers any factory package that goes
-    # private in future, whereas a visibility flip has to be repeated per
-    # package and can be undone silently.
-    #
-    # It was NOT fixed by excluding these two images from the rule. An
+    # It was also NOT fixed by excluding these two images from the rule. An
     # exclusion would have permanently unverified the sandbox that generated
     # code is built and executed in, which is the opposite of the point.
+    #
+    # IF EITHER GOES RED AGAIN, decide first which failure it is -- Kyverno
+    # writes `unverified image` for both, which is the whole of Factory#430:
+    #
+    #   registry-auth   names ghcr.io/token and says UNAUTHORIZED; the package
+    #                   went private again, and nothing here will fix it
+    #   signature       says `no matching signatures`, `subject mismatch` or
+    #                   `issuer mismatch`, and never touches the token endpoint
+    #
+    # Confirm the read half in one call, no cluster involved:
+    #
+    #   curl -s "https://ghcr.io/token?scope=repository%3Aolafkfreund%2F<pkg>%3Apull&service=ghcr.io"
+    #
+    # A private package answers that with `denied` and 403s the manifest.
     - name: verify-tfactory-runner-signature
       match:
         any:
