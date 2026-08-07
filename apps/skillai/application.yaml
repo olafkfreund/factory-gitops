@@ -5,8 +5,16 @@
 # Tailscale sidecar in the app Pod (see docs/sidecar-pattern.md).
 #
 # NOTE: targetRevision is core-mvp-foundation (SkillAi's default branch), not main.
-# Until the SkillAi deploy/k8s directory is merged there, ArgoCD reports
-# ComparisonError on the missing path — that's expected, same as the other apps.
+# The deploy/k8s directory now exists on that branch and this Application is
+# Synced/Healthy; the earlier note here about an expected ComparisonError on a
+# missing path is stale.
+#
+# Because the manifests are in ANOTHER repo, nothing in factory-gitops can read
+# or check them. That is why pgvector/pgvector:pg17 was the one image of
+# Factory#573's twelve that the pinning change here could not reach: it is
+# declared in olafkfreund/SkillAi (pinned there — Factory#588). The digest-pin
+# step in .github/workflows/manifest-validate.yml names this Application
+# explicitly for that reason, so the boundary is reported rather than silent.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:

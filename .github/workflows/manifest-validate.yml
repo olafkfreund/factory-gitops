@@ -209,6 +209,196 @@ jobs:
 
           exit "$fail"
 
+      - name: Assert third-party images in `factory` are pinned to a digest
+        run: |
+          set -uo pipefail
+
+          # Factory#588. #140 pinned eleven third-party images to digests and
+          # deliberately left the policy asserting they STAY pinned to a later
+          # change (Factory#573 sequences it that way so the control lands
+          # green). That later change never came, and until this step existed
+          # NOTHING checked the pins -- not this workflow, not Kyverno.
+          #
+          # That matters more than a missing to-do, because of the shape of the
+          # gap. The eleven were not passing a check; there was no check. They
+          # were pinned once by hand on 2026-08-06 and then unobserved. A
+          # revert, a bad merge, or an `images:` transformer would have taken
+          # any of them back to a mutable tag with nothing to say so -- and
+          # #140 found exactly such a transformer already in the repo, in
+          # apps/observe, silently unpinning openobserve on every build while
+          # the source file read as correctly pinned.
+          #
+          # The three Kyverno policies do not cover this and say so in their
+          # own text: verify-factory-image-signatures and
+          # require-first-party-signature-coverage are both scoped to
+          # `ghcr.io/olafkfreund/*`, and the latter's closing comment states
+          # that third-party digest pinning "is a separate policy against a
+          # separate set of manifests, tracked in Factory#573". This is that
+          # assertion, in CI rather than at admission, which is where it can
+          # fail on the PR that breaks it instead of after the sync.
+          #
+          # SCOPE IS DERIVED, NOT LISTED. The set of images to check is read
+          # from the ArgoCD Applications themselves: every Application whose
+          # `spec.destination.namespace` is `factory` is in scope, which is
+          # exactly how Factory#573 defines its own boundary. There is no
+          # hand-maintained list of images and no allowlist of directories, so
+          # an app added tomorrow is checked the day it lands (#117's lesson)
+          # and apps/kyverno, apps/keda, apps/fides and bootstrap -- which are
+          # on mutable tags but deploy elsewhere -- are excluded because of
+          # what they declare, not because somebody remembered to exempt them.
+          #
+          # RENDERED, NOT SOURCE. `kustomize build` output is what ArgoCD
+          # ships; #140 caught the observe transformer only by counting pinned
+          # refs in the rendered output, where the count came back 1 of 2.
+          #
+          # WHAT THIS DOES NOT COVER, and it is the point of Factory#588: an
+          # Application in scope whose manifests live in ANOTHER repo cannot be
+          # read from here at all. `skillai` is one -- it targets `factory` and
+          # its manifests are in olafkfreund/SkillAi -- and it is the reason
+          # eleven of the twelve images got pinned and the twelfth did not.
+          # That is declared below rather than filtered out silently, and an
+          # UNdeclared external Application in scope FAILS, so the next one
+          # cannot go unnoticed the way this one nearly did.
+
+          # One line per Application that targets `factory` from another repo,
+          # each carrying the issue tracking its pin. An entry here is a line
+          # in a diff a reviewer sees, which is the only reason it is allowed
+          # to be an exception at all.
+          is_external_declared() {
+            case "$1" in
+              skillai) return 0 ;;   # olafkfreund/SkillAi deploy/k8s -- Factory#588
+              *)       return 1 ;;
+            esac
+          }
+
+          # Discover by CONTENT, same as the Kyverno steps below: an
+          # Application added anywhere is seen, whatever its file is called.
+          mapfile -t APPS < <(
+            git ls-files -z '*.yaml' '*.yml' | tr '\0' '\n' | sort | while read -r f; do
+              grep -qE '^apiVersion:[[:space:]]*"?argoproj\.io/' "$f" || continue
+              grep -qE '^kind:[[:space:]]*"?Application"?[[:space:]]*$' "$f" || continue
+              printf '%s\n' "$f"
+            done
+          )
+          # Rule 4.7, same shape as every other guard in this file.
+          if [ "${#APPS[@]}" -eq 0 ]; then
+            echo "::error::no ArgoCD Application discovered -- this gate checked nothing"
+            exit 1
+          fi
+          echo "discovered ${#APPS[@]} ArgoCD Application(s)"
+
+          fail=0; inscope=0; images=0; unreachable=0
+
+          for a in "${APPS[@]}"; do
+            # All four fields in one read so a multi-document file cannot
+            # pair one Application's name with another's destination.
+            while IFS=$'\t' read -r name repo path ns; do
+              [ "$ns" = "factory" ] || continue
+              inscope=$((inscope + 1))
+
+              # An Application this gate cannot parse is not an Application
+              # this gate may pass. `.spec.sources` (multi-source) and Helm
+              # sources both land here.
+              if [ -z "$name" ] || [ "$name" = "null" ] || [ -z "$repo" ] || [ "$repo" = "null" ] \
+                 || [ -z "$path" ] || [ "$path" = "null" ]; then
+                echo "::error file=$a::an Application targeting \`factory\` declares no single source.repoURL/source.path this gate can read (multi-source or Helm?) -- it cannot be checked, so it cannot pass"
+                fail=1
+                continue
+              fi
+
+              case "$repo" in
+                *olafkfreund/factory-gitops*) ;;
+                *)
+                  unreachable=$((unreachable + 1))
+                  if is_external_declared "$name"; then
+                    echo "--  external  $name -> $repo ($path) -- targets \`factory\`, manifests not in this repo, declared"
+                  else
+                    echo "::error file=$a::Application \`$name\` deploys to \`factory\` from $repo, which this gate cannot read. Pin its images in that repo, then declare it in is_external_declared() with the tracking issue."
+                    fail=1
+                  fi
+                  continue ;;
+              esac
+
+              if [ ! -d "$path" ]; then
+                echo "::error file=$a::source path \`$path\` does not exist -- this gate cannot check \`$name\`"
+                fail=1
+                continue
+              fi
+
+              if [ -f "$path/kustomization.yaml" ]; then
+                if ! rendered=$(kustomize build "$path" 2>&1); then
+                  echo "::error file=$a::kustomize build \`$path\` failed -- this gate cannot check \`$name\`"
+                  fail=1
+                  continue
+                fi
+              else
+                # `find -exec cat` rather than `cat "$path"/*.yaml "$path"/*.yml`:
+                # an unmatched glob is passed through literally, cat exits
+                # non-zero on it, and GitHub runs this step under `bash -e`, so
+                # the whole step died at the first such directory. infra/cloudflared
+                # holds no .yml file and is the first one reached alphabetically.
+                rendered=$(find "$path" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -exec cat {} +)
+              fi
+
+              # An empty render is not a passing render -- same reasoning as the
+              # zero-output guard on `kustomize build` in the step above. Without
+              # this, a directory that renders to nothing contributes no images
+              # and no complaint, which reads exactly like a clean app.
+              if [ -z "$(printf '%s' "$rendered" | tr -d '[:space:]')" ]; then
+                echo "::error file=$a::\`$path\` rendered no manifests -- this gate checked nothing for \`$name\`"
+                fail=1
+                continue
+              fi
+
+              mapfile -t REFS < <(
+                printf '%s\n' "$rendered" \
+                  | sed -nE 's/^[[:space:]]*-?[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+).*/\1/p' \
+                  | sort -u
+              )
+              for i in "${REFS[@]}"; do
+                [ -n "$i" ] || continue
+                # First-party images are covered by the two signature policies
+                # and carry an immutable sha- build tag. Stated boundary, same
+                # split as docs/image-digest-pinning.md.
+                case "$i" in ghcr.io/olafkfreund/*) continue ;; esac
+                images=$((images + 1))
+                case "$i" in
+                  *@sha256:*) echo "ok  pinned    $name  $i" ;;
+                  *) echo "::error file=$a::\`$name\` runs third-party image \`$i\` in \`factory\` on a mutable tag -- pin it as image:tag@sha256:... (Factory#573)"
+                     fail=1 ;;
+                esac
+              done
+            done < <(yq -r 'select(.kind == "Application") | [.metadata.name, .spec.source.repoURL, .spec.source.path, .spec.destination.namespace] | @tsv' "$a")
+          done
+
+          # Both counters are guards, not decoration. Narrowing the namespace
+          # match, or widening the first-party skip, would otherwise leave this
+          # step reporting success having examined nothing -- which is the
+          # defect it exists to close, reproduced inside its own fix.
+          if [ "$inscope" -eq 0 ]; then
+            echo "::error::no Application targets the \`factory\` namespace -- discovery broke; this gate checked nothing"
+            exit 1
+          fi
+          if [ "$images" -eq 0 ]; then
+            echo "::error::not one third-party image reference was examined across $inscope Application(s) -- this gate reported green having checked nothing"
+            exit 1
+          fi
+          echo "examined $images third-party image reference(s) across $inscope Application(s) targeting \`factory\`; $unreachable declared out of this repo"
+
+          # What this still does NOT catch, so a green tick is not read as more
+          # than it is:
+          #   - Whether a pinned digest is the RIGHT image. A pin to a wrong or
+          #     malicious digest is immutable and passes here. Provenance for
+          #     these images is the gap Factory#573 records as unclosable:
+          #     they publish no signature under an identity we could pin.
+          #   - Staleness. A pinned digest never moves, including past a CVE
+          #     fix, and nothing refreshes these (factory-gitops#139).
+          #   - The cluster. This reads manifests, not running Pods; an image
+          #     applied by hand, or by an operator, is invisible here.
+          #   - Any Application in scope whose manifests are in another repo:
+          #     declared above, checked in that repo, and nowhere else.
+          exit "$fail"
+
       - name: Validate Kyverno policies with Kyverno's own policy validation
         run: |
           set -uo pipefail
