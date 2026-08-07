@@ -296,15 +296,20 @@ data:
             # check still runs so the weak signal is not lost, but a clean window
             # cannot promote this to a pass: 98% of the trail went unread and
             # saying "ok" to that is the defect, not the workaround for it.
+            fallback = evaluate(entries, now, stale_hours)
             return emit(
-                "degraded",
-                6,
+                # A break the fallback DID find is an alert, not a degradation:
+                # "could not check the rest" and "the part I could check is
+                # broken" are different records, and filing the second under
+                # `degraded` would hide it from a status=alert query.
+                "alert" if fallback else "degraded",
+                5 if fallback else 6,
                 [
                     f"COULD NOT CHECK the full chain: {err}. Needs GET /api/audit/chain "
                     f"(CFactory#312) on the deployed cockpit image; falling back to the "
                     f"newest-{len(entries)} window, which cannot attest to the rest of "
                     f"the trail. See factory-gitops#146.",
-                    *evaluate(entries, now, stale_hours),
+                    *fallback,
                 ],
                 entries=len(entries),
             )
