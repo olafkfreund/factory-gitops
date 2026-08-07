@@ -92,15 +92,38 @@ spec:
       # the next mount, BEFORE the container starts. A uid-65532 process would
       # never actually see the 0644 state.
       #
-      # Still not done here, for two reasons that are about verification rather
-      # than permissions: that recursive re-apply runs over a multi-GB
-      # observability volume on every start, and this image is distroless with
-      # no shell, so `kubectl exec` cannot confirm the result — it has to be
-      # proved by ingest and query. That belongs in a change that can be watched,
-      # not in a hardening sweep that cannot even roll to the cluster (ArgoCD
-      # self-heals hand-applied patches in about twelve seconds). Factory#621.
+      # That reasoning was then MEASURED end to end on a throwaway 100Mi
+      # local-path PVC (namespace fsg621, deleted after), because the claim is
+      # about kubelet and needs nothing from openobserve or its data:
+      #
+      #   arm A  root writer, policy unset -> /data drwxrwsrwx 0 65532,
+      #                                       oldfile -rw-r--r-- 0 65532
+      #                                       (reproduces observe-data exactly)
+      #   arm B  OnRootMismatch            -> oldfile -rw-r--r--  UNCHANGED
+      #   arm C  Always (control)          -> oldfile -rw-rw-r--  promoted
+      #   arm D  runAsUser 65532, unset    -> -rw-rw-r--, read OK, WRITE OK
+      #
+      # So the flip is safe and is what lands here, and fsGroupChangePolicy is
+      # deliberately LEFT UNSET so it keeps defaulting to Always.
+      #
+      # DO NOT ADD fsGroupChangePolicy: OnRootMismatch.
+      # Arm B is the measured proof that it silently breaks this volume: it
+      # inspects only the top-level dir, /data is already drwxrwsrwx 0 65532,
+      # so the recursive pass is skipped and the 5033 pre-existing Parquet/WAL
+      # files stay group-read-only. uid 65532 then hits EACCES on historical
+      # data while new writes succeed — /healthz stays 200 throughout, and the
+      # thing that would report the failure is the thing that is broken.
+      # Arm C is what makes arm B mean anything: without it a negative result
+      # cannot tell "the walk was skipped" from "the walk does nothing".
+      #
+      # The walk it optimises away is not a real cost anyway: observe-data
+      # measured 1.1G across 5033 files, not the multi-GB this comment once
+      # feared. Factory#621.
       securityContext:
         fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: openobserve
