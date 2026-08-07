@@ -1,4 +1,5 @@
-# Audit-anchor freshness/integrity alert (Factory#313, #319, #381).
+# Audit-anchor freshness/integrity alert (Factory#313, #319, #381,
+# factory-gitops#146).
 #
 # There is NO Prometheus/Alertmanager/kube-state-metrics in this cluster —
 # OpenObserve (apps/observe) is the only telemetry backend. This CronJob verifies
@@ -17,6 +18,15 @@
 # status=ok every day is what makes "this check stopped running" a query rather
 # than a thing somebody has to happen to notice. apps/job-watchdog watches the
 # schedule side of the same job.
+#
+# factory-gitops#146 FIXED WHAT IT WAS LOOKING AT. The check read `GET /api/audit`,
+# which serves the newest 100 rows. Against a 5,380-row trail that window is ids
+# ~5280-5380: the standing fork at 2178 sits outside it, as does 98% of the trail,
+# so the job reported `ok` daily on a chain with a known anomaly and would have
+# missed any edit to a row older than the last hundred. It now reads
+# `GET /api/audit/chain` (CFactory#312), which walks every row and recomputes
+# every HMAC, and takes its verdict from that. `/api/audit` is still read, because
+# it is the only surface carrying entry timestamps and freshness comes from there.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -35,14 +45,34 @@ data:
     store dies, the chain stops being written and its external attestation
     silently lapses — exactly the failure Factory#313/#319 has no alert for.
 
-    This checker reads the read-only /api/audit surface and alerts when the chain
-    is unreachable, empty, broken (a prev_hash link does not match), or STALE
-    (newest entry older than STALE_HOURS). Stdlib only; no HMAC secret needed —
-    link integrity is checked structurally, full HMAC re-verification stays
-    CFactory's job.
+    This checker reads two read-only surfaces and alerts when the chain is
+    unreachable, empty, anomalous, or STALE (newest entry older than STALE_HOURS):
+
+      GET /api/audit/chain  the WHOLE trail (CFactory#312). Walks every row and
+                            recomputes every HMAC server-side, returning a
+                            verdict of ok / forked / tampered plus the row count
+                            it actually walked. This is the integrity authority.
+      GET /api/audit        the newest 100 rows. Read only for entry timestamps,
+                            because /api/audit/chain carries none, and as the
+                            degraded fallback below.
+
+    Stdlib only; no HMAC secret needed — the recompute happens inside CFactory,
+    which is the only thing that holds the key.
+
+    COULD-NOT-CHECK IS NOT OK (factory-gitops#146). If /api/audit/chain is absent
+    — a cockpit image predating CFactory#312 answers 404 — the job reports
+    `degraded` and exits NON-ZERO. It does not fall silent and it does not report
+    `ok`. That "a check that cannot run reads as a pass" failure is the entire
+    defect class this job exists to catch, and it would be absurd for the job to
+    commit it. The old newest-100 structural check still runs underneath so the
+    weaker signal is not lost while the deploy catches up, but it cannot promote
+    the run back to `ok`. This red clears itself the moment CFactory#312 reaches
+    the deployed image; it is transient by construction, not an alarm wired on
+    forever (which was CFactory#306's own defect).
 
     ALERTING (Factory#381): every run POSTs a record to the OpenObserve
-    `job_health` stream — status `ok` or `alert`, with the problem text — and
+    `job_health` stream — status `ok`, `alert` or `degraded`, with the problem
+    text, the chain verdict and the row count actually walked — and
     THEN exits non-zero if there were problems. The emit is the notification; the
     exit code is kept for anything that reads it. If the emit itself fails that is
     printed loudly, and the check's own exit code still wins, because a delivery
@@ -71,7 +101,13 @@ data:
         print(*a, file=sys.stderr, flush=True)
 
 
-    def notify(status: str, problems: list[str], entries: int | None = None) -> None:
+    def notify(
+        status: str,
+        problems: list[str],
+        entries: int | None = None,
+        verdict: str | None = None,
+        rows: int | None = None,
+    ) -> None:
         """Best-effort durable alert record into OpenObserve.
 
         Same stream, same credentials and same /_json ingest as
@@ -97,6 +133,11 @@ data:
             "status": status,
             "problems": problems,
             "entries": entries,
+            # factory-gitops#146: `rows` is how many the server actually walked.
+            # It is the field that tells "the chain is sound" from "the check
+            # looked at a hundred rows out of 5,380 and said fine".
+            "verdict": verdict,
+            "rows": rows,
         }
         try:
             req = urllib.request.Request(
@@ -126,8 +167,81 @@ data:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+    def fetch(base: str, path: str) -> tuple[dict, str]:
+        """GET a JSON surface -> (payload, error). A non-empty error means the
+        surface could not be read, and no caller may treat that as healthy."""
+        req = urllib.request.Request(f"{base}{path}", method="GET")
+        key = os.environ.get("API_KEY")
+        if key:
+            req.add_header("authorization", f"Bearer {key}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r), ""
+        except urllib.error.HTTPError as e:
+            return {}, f"{path} HTTP {e.code}"
+        except Exception as e:  # noqa: BLE001 — any failure is a real problem
+            return {}, f"cannot reach {path}: {e!r}"
+
+
+    def stale(entries: list[dict], now: datetime, stale_hours: float) -> list[str]:
+        """Freshness, from /api/audit — the only surface carrying entry
+        timestamps. `stale_hours <= 0` disables it (see the README: on a quiet
+        control plane this can fire without a real fault)."""
+        if stale_hours <= 0 or not entries:
+            return []
+        newest = max(_parse_ts(str(e["ts"])) for e in entries)
+        age_h = (now - newest).total_seconds() / 3600.0
+        if age_h > stale_hours:
+            return [f"anchor STALE: newest entry is {age_h:.1f}h old (> {stale_hours}h)"]
+        return []
+
+
+    def chain_problems(report: dict) -> list[str]:
+        """The whole-trail verdict from /api/audit/chain -> problems (empty == healthy).
+
+        CFactory recomputed every HMAC over every row to produce this, so there is
+        nothing left for this job to re-derive — it reads the verdict:
+
+          tampered  a mutated/duplicate/dangling row. The real one.
+          forked    a concurrent-append fork this deploy has NOT declared. After
+                    CFactory#310 serialised the appends a new fork should be
+                    impossible, so an undeclared one means that regressed.
+          ok        no anomalies, or only forks configuration already explains.
+
+        Declared forks come back in `acknowledged_forks` and are REPORTED, never
+        alerted on: the live chain forked once at entry 2178 under the pre-#310
+        write race, every HMAC in it is valid, and relinking it is precisely the
+        edit the chain exists to detect — so it is never going away, and colouring
+        it red forever would rebuild the always-on alarm of CFactory#306.
+
+        `rows` is checked because a verdict computed over nothing is not a pass —
+        that is the same "the check did not really run" hole as the 100-row window.
+        """
+        verdict = str(report.get("verdict") or "<missing>")
+        rows = report.get("rows")
+        if not isinstance(rows, int) or rows <= 0:
+            return [
+                f"/api/audit/chain walked rows={rows!r} — the check did not really run"
+            ]
+        if verdict == "ok":
+            return []
+        findings = report.get("findings") or []
+        detail = "; ".join(
+            f"id={f.get('id')} {f.get('kind')}: {f.get('detail')}" for f in findings[:5]
+        ) or "(no detail)"
+        return [
+            f"chain verdict {verdict.upper()} over {rows} rows, "
+            f"{len(findings)} undeclared finding(s): {detail}"
+        ]
+
+
     def evaluate(entries: list[dict], now: datetime, stale_hours: float) -> list[str]:
-        """Pure chain check -> list of problems (empty == healthy)."""
+        """Structural link check over the /api/audit window -> problems.
+
+        DEMOTED by factory-gitops#146 from the integrity authority to the
+        degraded fallback for when /api/audit/chain is absent. It can only ever
+        attest to the newest 100 rows; chain_problems() is what covers the trail.
+        """
         problems: list[str] = []
         if not entries:
             return ["audit chain is EMPTY — no anchored entries at all"]
@@ -156,14 +270,7 @@ data:
                 )
                 break
             prev = e.get("entry_hash")
-        if stale_hours > 0:
-            newest = _parse_ts(str(rows[-1]["ts"]))
-            age_h = (now - newest).total_seconds() / 3600.0
-            if age_h > stale_hours:
-                problems.append(
-                    f"anchor STALE: newest entry is {age_h:.1f}h old (> {stale_hours}h)"
-                )
-        return problems
+        return problems + stale(rows, now, stale_hours)
 
 
     def main() -> int:
@@ -171,37 +278,63 @@ data:
             "CFACTORY_URL", "http://cfactory.factory.svc.cluster.local:3111"
         ).rstrip("/")
         stale_hours = float(os.environ.get("STALE_HOURS", "26"))
-        req = urllib.request.Request(f"{base}/api/audit", method="GET")
-        key = os.environ.get("API_KEY")
-        if key:
-            req.add_header("authorization", f"Bearer {key}")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                payload = json.load(r)
-        except urllib.error.HTTPError as e:
-            return alert(3, [f"/api/audit HTTP {e.code} — audit surface unreachable"])
-        except Exception as e:  # noqa: BLE001 — any failure is a real alert
-            return alert(3, [f"cannot reach /api/audit: {e!r}"])
+        now = datetime.now(timezone.utc)
 
+        # /api/audit first: it is the only surface with entry timestamps, so
+        # freshness comes from here whichever path below runs.
+        payload, err = fetch(base, "/api/audit")
+        if err:
+            return emit("alert", 3, [f"{err} — audit surface unreachable"])
         entries = payload.get("entries")
         if not isinstance(entries, list):
-            return alert(4, [f"/api/audit gave no entries list: keys={sorted(payload)}"])
+            return emit("alert", 4, [f"/api/audit gave no entries list: keys={sorted(payload)}"])
 
-        problems = evaluate(entries, datetime.now(timezone.utc), stale_hours)
+        report, err = fetch(base, "/api/audit/chain")
+        if err:
+            # COULD NOT CHECK -> `degraded`, non-zero, never `ok`. A cockpit image
+            # predating CFactory#312 answers 404 here. The newest-100 structural
+            # check still runs so the weak signal is not lost, but a clean window
+            # cannot promote this to a pass: 98% of the trail went unread and
+            # saying "ok" to that is the defect, not the workaround for it.
+            return emit(
+                "degraded",
+                6,
+                [
+                    f"COULD NOT CHECK the full chain: {err}. Needs GET /api/audit/chain "
+                    f"(CFactory#312) on the deployed cockpit image; falling back to the "
+                    f"newest-{len(entries)} window, which cannot attest to the rest of "
+                    f"the trail. See factory-gitops#146.",
+                    *evaluate(entries, now, stale_hours),
+                ],
+                entries=len(entries),
+            )
+
+        verdict, rows = str(report.get("verdict") or ""), report.get("rows")
+        problems = chain_problems(report) + stale(entries, now, stale_hours)
         if problems:
-            return alert(5, problems, len(entries))
-        eprint(f"OK: audit chain intact, {len(entries)} entries, fresh (<{stale_hours}h)")
+            return emit("alert", 5, problems, len(entries), verdict, rows)
+        acked = report.get("acknowledged_forks") or []
+        eprint(
+            f"OK: whole audit chain verified, verdict={verdict}, {rows} rows walked, "
+            f"{len(acked)} declared fork(s) {acked}, fresh (<{stale_hours}h)"
+        )
         # Emit on the healthy path too: a daily status=ok record is what turns
         # "this check silently stopped running" into a query instead of a hope.
-        notify("ok", [], len(entries))
-        return 0
+        return emit("ok", 0, [], len(entries), verdict, rows)
 
 
-    def alert(code: int, problems: list[str], entries: int | None = None) -> int:
-        """Print, DELIVER, then still fail. All three, in that order."""
+    def emit(
+        status: str,
+        code: int,
+        problems: list[str],
+        entries: int | None = None,
+        verdict: str | None = None,
+        rows: int | None = None,
+    ) -> int:
+        """Print, DELIVER, then return the exit code. All three, in that order."""
         for p in problems:
-            eprint(f"ALERT: {p}")
-        notify("alert", problems, entries)
+            eprint(f"{status.upper()}: {p}")
+        notify(status, problems, entries, verdict, rows)
         return code
 
 
@@ -228,9 +361,31 @@ data:
         assert evaluate(
             [windowed[0], {**windowed[1], "prev_hash": "WRONG"}], now, 26
         ), "tamper inside the window must still alert"
-        stale = [{"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-01T00:00:00"}]
-        assert evaluate(stale, now, 26), "stale chain must alert"
-        assert evaluate(stale, now, 0) == [], "stale disabled (<=0) must pass"
+        old = [{"id": 1, "prev_hash": None, "entry_hash": "a", "ts": "2026-07-01T00:00:00"}]
+        assert evaluate(old, now, 26), "stale chain must alert"
+        assert evaluate(old, now, 0) == [], "stale disabled (<=0) must pass"
+
+        # factory-gitops#146: the whole-trail verdict is now the authority.
+        live = {"verdict": "ok", "rows": 5380, "findings": [], "acknowledged_forks": [2178]}
+        assert chain_problems(live) == [], (
+            "a DECLARED fork must not alert — entry 2178 is permanent, and an "
+            "alarm that is always on is not an alarm (CFactory#306)"
+        )
+        assert chain_problems(
+            {**live, "verdict": "forked", "findings": [{"id": 9001, "kind": "forked", "detail": "x"}]}
+        ), "an UNdeclared fork must alert — after CFactory#310 it means serialisation regressed"
+        assert chain_problems(
+            {**live, "verdict": "tampered", "findings": [{"id": 42, "kind": "mutated", "detail": "x"}]}
+        ), "tamper must alert"
+        assert chain_problems({**live, "rows": 0}), (
+            "a verdict computed over 0 rows is 'the check did not run', not 'ok' — "
+            "the same hole as the 100-row window"
+        )
+
+        # COULD NOT CHECK must surface as an error, not an exception and not a pass.
+        # Port 9 (discard) is closed, so this needs no network.
+        payload, err = fetch("http://127.0.0.1:9", "/api/audit/chain")
+        assert err and payload == {}, "an unreadable surface must report an error, not raise"
         print("selftest OK")
         return 0
 
