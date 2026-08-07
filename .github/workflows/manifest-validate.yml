@@ -407,9 +407,12 @@ jobs:
           # from a pass, and precisely how #143 happened one level up. So the
           # case count is read back out of the summary and a zero is a failure:
           #
-          #   1. non-zero exit    -- a case did not get the result it expected
-          #   2. no summary line  -- the CLI did not get as far as running
-          #   3. zero cases       -- it ran, and it ran nothing
+          #   1. non-zero exit      -- a case did not get the result it expected
+          #   2. a non-zero failure count, independently of the exit code, so a
+          #      future release that reports failures and still exits 0 cannot
+          #      quietly turn this step green
+          #   3. no summary line    -- the CLI did not get as far as running
+          #   4. zero cases         -- it ran, and it ran nothing
           fail=0
           for f in "${SUITES[@]}"; do
             out=$(kyverno test "$(dirname "$f")" -f "$(basename "$f")" 2>&1)
@@ -424,7 +427,7 @@ jobs:
               echo "::error file=$f::kyverno test printed no summary -- this gate cannot confirm it ran anything"
             elif [ $((passed + failed)) -eq 0 ]; then
               echo "::error file=$f::kyverno test ran 0 cases -- a suite that tests nothing cannot pass (#143)"
-            elif [ "$rc" -ne 0 ]; then
+            elif [ "$rc" -ne 0 ] || [ "$failed" -ne 0 ]; then
               echo "::error file=$f::$failed of $((passed + failed)) Kyverno test case(s) failed -- a rule does not do what this suite says it does"
             else
               echo "ok  kyverno-test  $f  ($passed case(s) against Kyverno v1.18.2)"
