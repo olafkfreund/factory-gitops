@@ -159,6 +159,20 @@ spec:
     spec:
       # RFC-0005 Tier A: this SA can create/read the ephemeral Nix-lane Jobs.
       serviceAccountName: tfactory-sandbox
+      # Factory#550. This pod DOES need its SA token, and says so rather than
+      # inheriting the default. tools/runners/kube_sandbox.py calls
+      # `kubernetes_asyncio.config.load_incluster_config()` to create every
+      # Nix-lane verify Job, and core/mcp_credentials.py reads
+      # /var/run/secrets/kubernetes.io/serviceaccount/token directly. Verified in
+      # the running image: kubernetes_asyncio is installed at
+      # .venv/lib/python3.14/site-packages. Setting this false stops verification.
+      #
+      # The chart already agreed in substance (templates/deployment.yaml renders
+      # `automountServiceAccountToken: {{ .Values.rbac.jobSandbox.enabled }}`,
+      # which is true) while values.yaml still declared `false` on the
+      # ServiceAccount. Factory#504's gate now compares the value, so that
+      # internal contradiction cannot come back.
+      automountServiceAccountToken: true
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       # Factory#503. Every CronJob in this namespace has carried this set since
