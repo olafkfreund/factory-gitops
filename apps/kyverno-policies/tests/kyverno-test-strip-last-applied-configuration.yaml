@@ -1,0 +1,120 @@
+# Kyverno CLI test for strip-last-applied-configuration-from-secrets
+# (factory-gitops#145, Factory#565).
+#
+# Run it with the SAME Kyverno version the cluster runs (v1.18.2 today):
+#
+#   kyverno test apps/kyverno-policies/tests -f kyverno-test-strip-last-applied-configuration.yaml
+#
+# THE BAR THIS SUITE HAS TO CLEAR. The first implementation of this rule was
+# schema-valid, applied cleanly, reported Ready -- and stripped nothing:
+# `patchStrategicMerge` with `kubectl.kubernetes.io/last-applied-configuration:
+# null` is silently a no-op against a live Secret. Nothing about the policy's
+# status said so; only reading a mutated Secret did. So this suite is written
+# around `patchedResources`, which compares the OBJECT the rule produced rather
+# than the fact that it ran: a rule that fires and changes nothing shows up as
+# `Resource diff`, which is the only signal that would have caught that bug.
+#
+# Measured, restoring exactly that shape (mutation check on the PR):
+#   - `patchStrategicMerge` ADDING a marker annotation instead of removing --
+#     the canary shape from the policy's own header, a rule that fires and
+#     strips nothing -- fails 5 of these 8 cases.
+#   - Dropping the `~1` escaping from the JSON Pointer fails 3 of 8.
+#   - Dropping the `kyverno` namespace exclusion fails 1 of 8.
+#   - The literal `...: null` form is not observable here at all: Kyverno
+#     v1.18.2 refuses to load it ("required variables are not provided"),
+#     `kyverno test` then reports every case `Skip / Invalid Policy` and counts
+#     all 8 as PASSED. `kyverno apply` exits 1 on it, so the neighbouring step
+#     in manifest-validate.yml is what catches that one. See #148.
+#
+# WHAT EACH CASE ASSERTS
+#
+#   strips-sole-annotation          the annotation goes, `annotations: {}` stays
+#   strips-and-keeps-siblings       only that key goes; labels, other
+#                                   annotations, `.type` and `.data` survive --
+#                                   this is what pins the `~1` JSON Pointer
+#                                   escaping of the `/` in the key
+#   strips-in-an-unknown-namespace  scope is a deny-list: a namespace nobody has
+#                                   created yet is in scope on day one
+#   admits-*                        a Secret that never carried the annotation
+#                                   is neither mutated nor rejected. Two shapes:
+#                                   no annotations map at all, and a map without
+#                                   the key. NOTE the honest limit -- these two
+#                                   also pass with the `preconditions` block
+#                                   DELETED, because the CLI engine treats
+#                                   `op: remove` on an absent path as a no-op
+#                                   rather than an error. They pin the required
+#                                   behaviour, they do not prove the guard is
+#                                   what produces it; the policy header's live
+#                                   `kubectl create secret generic` check does.
+#   excluded-in-kube-system         boot-time control-plane material, and the
+#   excluded-in-kyverno             webhook's own CA/TLS -- a self-dependency
+#                                   that must never be able to wedge rotation.
+#                                   Both carry the annotation on purpose.
+#   configmap-out-of-scope          kinds: [Secret] only
+#
+# `skip` is the expected non-mutating result: the rule was reached and had
+# nothing to do (precondition false), or was never reached (excluded namespace,
+# wrong kind). It is not a pass and it is not a failure.
+#
+# ---------------------------------------------------------------------------
+# TWO THINGS THIS SUITE CANNOT ASSERT, BOTH TOOL LIMITS, NEITHER A GAP IN THE
+# POLICY.
+#
+# 1. UPDATE. The rule matches `operations: [CREATE, UPDATE]` and the UPDATE half
+#    is the one that runs constantly -- every re-apply of an existing Secret.
+#    `kyverno test` v1.18.2 evaluates every resource as a CREATE and has no knob
+#    for the admission operation (no `operation` field on a test result, no
+#    flag, no values-file entry). Measured: replacing CREATE with DELETE in the
+#    rule's operations list makes the CLI report `pass: 0, fail: 0, skip: 0` --
+#    so the list IS honoured, and only the CREATE half of it is reachable here.
+#    The UPDATE path is covered by the live-webhook evidence in the policy's own
+#    header (the `kubectl apply` warning that IS the rule working).
+#
+# 2. Anything that stops the rule producing a result. A resource with no result
+#    is reported `Excluded` by this CLI and satisfies ANY expected result. So
+#    narrowing the match, or deleting the rule, turns these cases green rather
+#    than red. Measured and filed as factory-gitops#148; it applies to every
+#    suite in this directory.
+# ---------------------------------------------------------------------------
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: strip-last-applied-configuration-from-secrets
+policies:
+  - ../manifests/strip-last-applied-configuration-from-secrets.yaml
+resources:
+  - resources-strip-last-applied-configuration.yaml
+results:
+  # --- MUST MUTATE: the annotation is removed and nothing else changes.
+  - policy: strip-last-applied-configuration-from-secrets
+    rule: remove-last-applied-configuration
+    kind: Secret
+    result: pass
+    patchedResources: patched-strip-last-applied-configuration.yaml
+    resources:
+      - strips-sole-annotation
+      - strips-and-keeps-siblings
+      - strips-in-an-unknown-namespace
+  # --- MUST NOT MUTATE AND MUST NOT REJECT: no annotation to remove.
+  - policy: strip-last-applied-configuration-from-secrets
+    rule: remove-last-applied-configuration
+    kind: Secret
+    result: skip
+    resources:
+      - admits-secret-with-no-annotations
+      - admits-secret-with-other-annotations-only
+  # --- MUST NOT MUTATE: excluded namespaces, annotation present.
+  - policy: strip-last-applied-configuration-from-secrets
+    rule: remove-last-applied-configuration
+    kind: Secret
+    result: skip
+    resources:
+      - excluded-in-kube-system
+      - excluded-in-kyverno
+  # --- MUST NOT MUTATE: out of kind scope.
+  - policy: strip-last-applied-configuration-from-secrets
+    rule: remove-last-applied-configuration
+    kind: ConfigMap
+    result: skip
+    resources:
+      - configmap-out-of-scope

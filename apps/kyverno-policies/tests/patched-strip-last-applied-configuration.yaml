@@ -1,0 +1,42 @@
+# Expected patched Secrets for strip-last-applied-configuration.
+#
+# This file IS the assertion. `kyverno test` compares the whole object, so
+# anything the rule touched beyond the one annotation shows up here as a diff:
+# `.data`, `.type`, labels and sibling annotations are all pinned by being
+# written out unchanged. The first Secret in particular keeps an EMPTY
+# annotations map -- `op: remove` on the last key leaves `{}` behind, it does
+# not delete `metadata.annotations`.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: strips-sole-annotation
+  namespace: factory
+  annotations: {}
+type: Opaque
+data:
+  token: c3VwZXItc2VjcmV0
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: strips-and-keeps-siblings
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: argocd
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+    managed-by: argocd
+type: Opaque
+data:
+  server-secret: c3VwZXItc2VjcmV0
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: strips-in-an-unknown-namespace
+  namespace: a-namespace-that-did-not-exist-yet
+  annotations: {}
+type: Opaque
+data:
+  k: c3VwZXItc2VjcmV0

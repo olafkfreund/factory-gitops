@@ -1,0 +1,125 @@
+# Kyverno CLI test for verify-factory-image-signatures (factory-gitops#145).
+#
+# Run it with the SAME Kyverno version the cluster runs (v1.18.2 today, check
+# with `kubectl -n kyverno get deploy kyverno-admission-controller -o
+# jsonpath='{.spec.template.spec.containers[0].image}'`) -- glob behaviour is
+# version-sensitive, and a test that passes on a different engine proves
+# nothing about admission:
+#
+#   kyverno test apps/kyverno-policies/tests -f kyverno-test-verify-factory-image-signatures.yaml
+#
+# This suite is OFFLINE. Nothing in it reaches ghcr.io, Fulcio or Rekor, and it
+# therefore says nothing about whether any signature verifies. It tests one
+# thing: the SCOPE of the six verifyImages rules -- which image references they
+# speak about, and, the point of the file, which ones they must not.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE ADDING A "MUST MATCH" CASE. IT WILL NOT DO WHAT YOU THINK.
+#
+# `kyverno test` v1.18.2 reports a resource for which a rule produced NO result
+# as `Excluded`, and an Excluded row satisfies ANY expected result -- `skip`,
+# `pass` and `fail` alike. Measured, on this repo, with this CLI:
+#
+#   - a `results` entry naming a rule that does not exist in the policy at all
+#     is reported Excluded and PASSES;
+#   - re-scoping require-first-party-signature-coverage to a namespace that
+#     does not exist makes its rule evaluate nothing, and its 15-case suite
+#     still reports "15 tests passed and 0 tests failed".
+#
+# So a positive assertion cannot fail. Narrowing a glob until it covers nothing,
+# or deleting a rule outright, turns every case about it Excluded and green.
+# That is the tool, not this file, and it is filed as factory-gitops#148.
+#
+# The consequence for this suite: only NEGATIVE space is assertable. Every case
+# below asserts that no rule speaks about an image, which fails the moment a
+# glob WIDENS -- the Factory#564 direction, where `skillai:*` grown to
+# `skillai*` silently pulls a `skillai-*` package under SkillAi's non-main ref
+# anchor. Measured, as the mutation check on the PR that added this file:
+#
+#   `skillai:*`   -> `skillai*`            4 of 84 cases fail
+#   `cfactory:*`  -> `cfactory*`           4 of 84 cases fail
+#   namespaces: [factory] -> [factory, default]   2 of 84 cases fail
+#   `aifactory:*` -> `aifactory:v*`        0 fail -- the narrowing direction,
+#                                          which is the #148 hole above
+#
+# That opposite direction is covered by a different control:
+# require-first-party-signature-coverage reports any first-party image running
+# in `factory` that its mirror list does not name, and that policy has its own
+# suite in kyverno-test.yaml. It is not a complete substitute -- the mirror is a
+# hand-maintained copy of these globs -- which is why #148 stays open.
+#
+# The positive half WAS checked by hand when this file was written -- all nine
+# references (aifactory, aifactory `-nix`, pfactory, tfactory, cfactory,
+# cfactory-frontend, tfactory-runner-pytest, skillai, skillai-migrator) match
+# their rule, none silently. Reproduce it with one Pod per reference:
+#
+#   kyverno apply apps/kyverno-policies/manifests/verify-factory-image-signatures.yaml \
+#     --resource <(printf 'apiVersion: v1\nkind: Pod\nmetadata: {name: p, namespace: factory}\nspec:\n  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:no-such-tag"}]\n')
+#
+# Those cases are deliberately NOT committed. A MATCHED image sends the CLI to
+# ghcr.io -- verdict `fail` when it is reachable, `error` when it is not -- so
+# committing them would put a third-party network dependency inside the required
+# status check, in exchange for assertions that cannot fail. That trade is only
+# worth revisiting if #148 is fixed.
+# ---------------------------------------------------------------------------
+#
+# `skip` is the expected result throughout. It reads as "this rule has nothing
+# to say about this image", which for a verifyImages rule means the reference
+# matched none of its `imageReferences` globs, or the Pod was out of namespace
+# scope. Each of the six rules is asserted against every fixture, because the
+# claim being made is not per-rule: NO rule in this policy may speak about any
+# of these images. That cross-product is what catches a glob widened in one
+# rule toward a name that belongs to another.
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: verify-factory-image-signatures
+policies:
+  - ../manifests/verify-factory-image-signatures.yaml
+resources:
+  - resources-verify-factory-image-signatures.yaml
+results:
+  - policy: verify-factory-image-signatures
+    rule: verify-aifactory-signature
+    kind: Pod
+    result: skip
+    resources: &no-rule-may-match
+      - near-aifactory-worker
+      - near-pfactory-planner
+      - near-tfactory-runner-bare
+      - near-cfactory-backend
+      - near-cfactory-frontend-preview
+      - near-skillai-worker
+      - near-skillai-migrator-tools
+      - near-miss-in-initcontainer
+      - uncovered-odin
+      - digest-pinned-first-party
+      - other-owner-same-name
+      - other-registry-same-name
+      - thirdparty-out-of-scope
+      - covered-image-wrong-namespace
+  - policy: verify-factory-image-signatures
+    rule: verify-pfactory-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match
+  - policy: verify-factory-image-signatures
+    rule: verify-tfactory-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match
+  - policy: verify-factory-image-signatures
+    rule: verify-cfactory-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match
+  - policy: verify-factory-image-signatures
+    rule: verify-tfactory-runner-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match
+  - policy: verify-factory-image-signatures
+    rule: verify-skillai-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match

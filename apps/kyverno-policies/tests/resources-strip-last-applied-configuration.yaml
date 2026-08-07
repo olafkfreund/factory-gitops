@@ -1,0 +1,141 @@
+# Test fixtures for strip-last-applied-configuration-from-secrets
+# (factory-gitops#145).
+#
+# The annotation values here are the real shape of the leak: client-side
+# `kubectl apply` writes the WHOLE submitted manifest into the annotation,
+# `.data` included, so the base64 of every key ends up in metadata where
+# `kubectl describe secret` prints it unredacted. `c3VwZXItc2VjcmV0` is
+# "super-secret" and is the only thing in this repo that is supposed to look
+# like a credential.
+---
+# The plain case, and the one the policy exists for. The annotation is the only
+# one on the Secret, so removing it leaves an empty annotations map -- not a
+# missing one. That is asserted exactly in the patched fixture: a rule that
+# deleted the whole `metadata.annotations` key would be doing more than it says.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: strips-sole-annotation
+  namespace: factory
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","kind":"Secret","metadata":{"name":"strips-sole-annotation","namespace":"factory"},"data":{"token":"c3VwZXItc2VjcmV0"}}
+type: Opaque
+data:
+  token: c3VwZXItc2VjcmV0
+---
+# SURGICAL REMOVAL. Sibling annotations, labels, `.data` and `.type` must all
+# survive untouched -- the policy's own words are "it does not touch .data,
+# .type, ownership, or any other annotation". This is also what guards the JSON
+# Pointer escaping: `/` inside the annotation key is written `~1`, and an
+# unescaped key addresses a different path entirely.
+#
+# `argocd` because ArgoCD's own signing material lives there and was one of the
+# 25 leaking Secrets found when the policy was written.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: strips-and-keeps-siblings
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: argocd
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: '{"data":{"server-secret":"c3VwZXItc2VjcmV0"}}'
+    argocd.argoproj.io/sync-options: Prune=false
+    managed-by: argocd
+type: Opaque
+data:
+  server-secret: c3VwZXItc2VjcmV0
+---
+# NAMESPACE SCOPE IS A DENY-LIST, NOT AN ALLOW-LIST. A namespace nobody has
+# created yet must be in scope on the day it is created; an allow-list would
+# leak again on every new namespace. This fixture is that promise.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: strips-in-an-unknown-namespace
+  namespace: a-namespace-that-did-not-exist-yet
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: '{"data":{"k":"c3VwZXItc2VjcmV0"}}'
+type: Opaque
+data:
+  k: c3VwZXItc2VjcmV0
+---
+# THE LOAD-BEARING PROMISE. A Secret that never carried the annotation must be
+# admitted untouched. It is the common case -- every `kubectl create secret`,
+# every cert-manager renewal, every ServiceAccount token write -- and the
+# policy's `preconditions` block exists to keep JSON Patch `op: remove` away
+# from the absent path that would reject it.
+#
+# Measured limit, so nobody reads more into a green run than is there: this
+# case also passes with the precondition DELETED, because the CLI engine treats
+# `op: remove` on a missing path as a no-op rather than an error. It pins the
+# behaviour, it does not prove which line produces it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admits-secret-with-no-annotations
+  namespace: factory
+type: Opaque
+data:
+  token: c3VwZXItc2VjcmV0
+---
+# Same guard, the other shape: `metadata.annotations` EXISTS but does not hold
+# the key. The precondition's `|| ''` fallback covers the first case (the whole
+# map is absent, so the JMESPath resolves to null); this one covers the second
+# (the map is there, the key is not). Both must skip, and they fail
+# differently if the guard is written carelessly.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: admits-secret-with-other-annotations-only
+  namespace: factory
+  annotations:
+    managed-by: helm
+type: Opaque
+data:
+  token: c3VwZXItc2VjcmV0
+---
+# EXCLUSION 1. kube-system holds k3s control-plane material written by the API
+# server itself, during boot, before anything should depend on an admission
+# webhook. Carries the annotation on purpose: the exclusion, not the absence of
+# a leak, is what must keep the rule quiet.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: excluded-in-kube-system
+  namespace: kube-system
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: '{"data":{"k":"c3VwZXItc2VjcmV0"}}'
+type: Opaque
+data:
+  k: c3VwZXItc2VjcmV0
+---
+# EXCLUSION 2, and the one that can wedge a cluster. `kyverno` holds Kyverno's
+# OWN webhook CA and TLS Secrets. Routing those writes through Kyverno's own
+# webhook is a self-dependency: cert rotation must never be able to block on the
+# thing it is rotating certs for.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: excluded-in-kyverno
+  namespace: kyverno
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: '{"data":{"tls.key":"c3VwZXItc2VjcmV0"}}'
+type: Opaque
+data:
+  tls.key: c3VwZXItc2VjcmV0
+---
+# KIND SCOPE. ConfigMaps carry this annotation too and are NOT in scope: their
+# contents are not secret, and widening the rule would put every ConfigMap write
+# in the cluster through the webhook for no gain. If this case turns red the
+# rule has grown a scope nobody agreed to.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: configmap-out-of-scope
+  namespace: factory
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: '{"data":{"log-level":"debug"}}'
+data:
+  log-level: debug
