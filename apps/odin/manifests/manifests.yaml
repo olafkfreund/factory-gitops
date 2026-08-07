@@ -32,6 +32,11 @@ spec:
           value: "b33eac69aaa94e2ab426f2934eabfb96"
         - name: RADARR_API_KEY
           value: "7d825135970740c1bc5845badc47c4ed"
+        # Keeps CPython from trying to write .pyc into a now read-only /app.
+        # Not load-bearing (a failed .pyc write is non-fatal) but it is the
+        # configuration that was actually measured, so it is the one shipped.
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
         resources:
           limits:
             cpu: "500m"
@@ -52,19 +57,42 @@ spec:
           # Changing that means moving the mount off /root and giving the image
           # a non-root USER — an Odin image change, not a manifest one.
           #
-          # readOnlyRootFilesystem: false is likewise kept: uvicorn runs with
-          # --reload against /app and Python writes __pycache__ there.
+          # readOnlyRootFilesystem — THIS HALF OF THE EXCEPTION IS NOW CLOSED.
           #
-          # What was missing and is added: seccompProfile RuntimeDefault and
-          # drop ALL. Measured against the live image sha-50b5932 with
-          # --cap-drop ALL --security-opt no-new-privileges:
-          #   INFO: Uvicorn running on http://0.0.0.0:8000
-          #   INFO: Application startup complete.
-          #   GET / -> 200
-          # A root container with no capabilities is still root, but it is a
-          # materially smaller target than root with the full default set.
+          # It previously read: "kept: uvicorn runs with --reload against /app
+          # and Python writes __pycache__ there." Re-checked against the image
+          # that is actually running (sha-2749b26) and the --reload half is not
+          # true: the live process is
+          #     cat /proc/1/cmdline -> `python backend/main.py`
+          # with no --reload anywhere. The __pycache__ half was true
+          # (/app/backend/__pycache__ exists) but that is a writable-rootfs
+          # symptom, not a requirement — PYTHONDONTWRITEBYTECODE below removes
+          # the need, and CPython treats a failed .pyc write as non-fatal anyway.
+          #
+          # Measured on the live image before flipping it, proved by request:
+          #   --cap-drop ALL --security-opt no-new-privileges
+          #                                          -> Running, GET / 200
+          #   ... + PYTHONDONTWRITEBYTECODE=1        -> Running, GET / 200
+          #   ... + --read-only --tmpfs /tmp         -> Running, GET / 200
+          #                                             "Application startup complete."
+          #
+          # The one path that could have made a read-only rootfs "Running and
+          # useless" is SSH: Odin polls the fleet over ssh. It is safe here
+          # because ssh_base_args() in backend/main.py puts the mux socket in
+          # ODIN_SSH_MUX_DIR, default /tmp/odin-ssh-mux (an emptyDir below), and
+          # sets StrictHostKeyChecking=no. ssh appending to a known_hosts under
+          # /root/.ssh already fails today — that path is a readOnly secret
+          # mount — and it is non-fatal, so a read-only / changes nothing there.
+          #
+          # runAsNonRoot: false — this half of the exception STANDS, unchanged,
+          # and for the reason recorded above: the odin-ssh-key Secret is mounted
+          # at /root/.ssh and /root is drwx------ root root (re-measured today on
+          # the live pod), so a non-root uid could not traverse to its own key.
+          # Moving the mount off /root is an Odin image change, not a manifest
+          # one. Note this is a mount PATH decision, so it is fixable in a repo
+          # we own rather than a genuine third-party constraint: Factory#622.
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsNonRoot: false
           seccompProfile: { type: RuntimeDefault }
           capabilities:
@@ -73,11 +101,18 @@ spec:
         - name: ssh-key
           mountPath: /root/.ssh
           readOnly: true
+        # Required by readOnlyRootFilesystem above: ODIN_SSH_MUX_DIR defaults to
+        # /tmp/odin-ssh-mux and backend/main.py os.makedirs() it at import time.
+        # Without a writable /tmp the process dies before it serves anything.
+        - name: tmp
+          mountPath: /tmp
       volumes:
       - name: ssh-key
         secret:
           secretName: odin-ssh-key
           defaultMode: 256
+      - name: tmp
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

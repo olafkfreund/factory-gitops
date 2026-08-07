@@ -44,12 +44,72 @@ spec:
     spec:
       enableServiceLinks: false
       # OpenObserve image runs as root by default; fsGroup lets it own the PVC dir.
-      securityContext: { fsGroup: 65532 }
+      #
+      # Factory#521 — this pod had fsGroup and NOTHING else: no seccomp profile,
+      # no capability drop, no no-new-privileges. It was the last Deployment in
+      # this namespace still on the container-runtime defaults, i.e. it kept all
+      # 14 default capabilities and the unconfined seccomp profile.
+      #
+      # Everything below was measured against this exact image before it was
+      # applied, because a wrong guess here is a CrashLoop on the cluster's only
+      # observability backend. Probed with `docker run` on the pinned digest,
+      # proved by REQUEST rather than by container status (#521 warns a container
+      # can stay Running and useless):
+      #
+      #   baseline (runtime defaults)                 /healthz 200, /web/ 200
+      #   --cap-drop ALL --security-opt               /healthz 200, /web/ 200
+      #     no-new-privileges                          <- what is applied here
+      #   ... + --user 65532:65532                    /healthz 200, /web/ 200
+      #   ... + --read-only --tmpfs /tmp              PANIC, exit 101:
+      #       "create cache dir success: Os { code: 30, kind: ReadOnlyFilesystem }"
+      #       at src/config/src/config.rs:3114
+      #
+      # So `readOnlyRootFilesystem: true` is NOT available on this image: it
+      # builds a cache directory outside /tmp at startup and panics when it
+      # cannot. That is a real finding, not a guess — Factory#322 tracks the
+      # rootfs epic and this workload is a documented non-starter for it.
+      #
+      # `runAsNonRoot`/`runAsUser: 65532` DOES work on a fresh volume (third
+      # probe above) and is deliberately still NOT set here — but for a smaller
+      # reason than first recorded, and the correction is worth keeping.
+      #
+      # The first version of this comment said the uid flip needs a chown of the
+      # existing volume because fsGroup fixes group ownership and not the mode
+      # bits. That was challenged and then MEASURED, read-only, against the live
+      # observe-data PVC:
+      #
+      #   /data                    drwxrwsrwx  0 65532     <- group rw, setgid
+      #   /data/wal, /data/db ...  drwxrwsr-x  0 65532     <- group rw, setgid
+      #   *.parquet, *.wal         -rw-r--r--  0 65532     <- group READ ONLY
+      #
+      # So both halves were half right. kubelet's SetVolumeOwnership DID apply
+      # group-rw and setgid recursively at mount — the directories prove it. The
+      # FILES are 0644 because the root process created them after that pass
+      # (they are dated today; the directories are dated the last pod start).
+      #
+      # Which means the flip is NOT a data migration: fsGroupChangePolicy
+      # defaults to Always, so kubelet re-applies the recursive chown+chmod on
+      # the next mount, BEFORE the container starts. A uid-65532 process would
+      # never actually see the 0644 state.
+      #
+      # Still not done here, for two reasons that are about verification rather
+      # than permissions: that recursive re-apply runs over a multi-GB
+      # observability volume on every start, and this image is distroless with
+      # no shell, so `kubectl exec` cannot confirm the result — it has to be
+      # proved by ingest and query. That belongs in a change that can be watched,
+      # not in a hardening sweep that cannot even roll to the cluster (ArgoCD
+      # self-heals hand-applied patches in about twelve seconds). Factory#621.
+      securityContext:
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: openobserve
           # Pinned, NOT latest. public.ecr.aws/zinclabs is the official ECR mirror.
           image: public.ecr.aws/zinclabs/openobserve:v0.90.3@sha256:f77856199bff2097e0355d66e59d5792064ff8ff831ea5f580b3650fa5457136
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           ports:
             - { containerPort: 5080, name: http }
             - { containerPort: 5081, name: grpc }

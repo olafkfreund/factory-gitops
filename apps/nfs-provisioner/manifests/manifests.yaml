@@ -131,13 +131,55 @@ spec:
       # built on.
       #
       # What IS safe was measured the same way and is applied below:
-      # seccompProfile RuntimeDefault and allowPrivilegeEscalation: false. With
-      # no-new-privileges plus the two adds the server still reports
-      #   starting RLIMIT_NOFILE rlimit.Cur 1024 -> ending rlimit.Cur 1048576
-      #   Running NFS server!
-      # and without SYS_RESOURCE that same raise logs "operation not permitted"
-      # — which is the documented reason for the SYS_RESOURCE add, confirmed
-      # rather than taken on trust.
+      # seccompProfile RuntimeDefault and allowPrivilegeEscalation: false.
+      #
+      # CORRECTION, Factory#521 re-examination 2026-08-07. The paragraph that
+      # used to sit here said: "without SYS_RESOURCE that same raise logs
+      # 'operation not permitted' — which is the documented reason for the
+      # SYS_RESOURCE add, confirmed rather than taken on trust." That was a
+      # MISREAD, and it is the kind of misread that turns an exception into a
+      # permanent hole: it proved the capability does something, not that
+      # removing it breaks anything. Upstream logs that line at klog level W
+      # (server.go:99) and carries on. Re-measured on this exact digest, three
+      # configurations, each run to the same end state:
+      #
+      #   default caps + DAC_READ_SEARCH + SYS_RESOURCE
+      #     -> rlimit.Cur 1024 -> 1048576 ... "Running NFS server!"
+      #   default caps + DAC_READ_SEARCH (SYS_RESOURCE dropped)
+      #     -> W "Error setting RLIMIT_NOFILE ... operation not permitted"
+      #        ... "Running NFS server!"          <- STILL STARTS
+      #   default caps, NEITHER add
+      #     -> same warning ... "Running NFS server!"   <- STILL STARTS
+      #        and ganesha still wrote its export tree (ganesha.log, v4old/)
+      #
+      # All three then exit 255 on the identical unrelated line — "Failed to
+      # create config: unable to load in-cluster configuration" — because the
+      # probe had no kube API. Same failure in every arm, and it happens AFTER
+      # ganesha is up, so the three are comparable.
+      #
+      # So SYS_RESOURCE is NOT required for the NFS server to run. What it
+      # actually buys is fd headroom: the soft limit stays at 1024 without it.
+      # Note the hard limit in the live pod is 524288, and raising the SOFT
+      # limit up to the hard limit needs no capability at all — measured in this
+      # image: `ulimit -n 524288` succeeds unprivileged. The cap is only needed
+      # because upstream asks for 1048576, which is above that hard limit.
+      #
+      # KEPT ANYWAY, on a corrected and much narrower justification: this is an
+      # availability tradeoff, not a hard requirement. 1024 fds on the NFS
+      # server that backs tfactory-data-rwx (#781) is a real "Too many open
+      # files" risk, and the alternative — wrapping the entrypoint in a shell to
+      # raise ulimit — means changing the command of the cluster's storage
+      # provisioner to save one capability on a container that is ALREADY root
+      # with the full default set (DAC_OVERRIDE, SETUID, SETGID, SETPCAP...).
+      # Next to root-with-default-caps these two adds are a rounding error. The
+      # exposure worth removing here is root itself, and root is proven required
+      # by the rpcbind/rpc.statd evidence above. Anyone revisiting this should
+      # go after root, not after these two capabilities.
+      #
+      # DAC_READ_SEARCH is likewise not needed to START (third arm above), but
+      # its job is cross-uid traversal at SERVE time, which the probe could not
+      # exercise without a kube API. Untested at serve time, so it stays; that
+      # is a gap in this evidence and is stated rather than papered over.
       securityContext:
         seccompProfile: { type: RuntimeDefault }
       containers:
@@ -158,13 +200,24 @@ spec:
             - { name: statd-udp, containerPort: 662, protocol: UDP }
           securityContext:
             # DAC_READ_SEARCH: traverse exported trees regardless of the
-            # requesting uid. SYS_RESOURCE: raise this process's own
-            # file-descriptor limit (see the measured RLIMIT_NOFILE line above).
-            # Both are load-bearing for RWX provisioning — do not remove.
+            # requesting uid — not needed to start, kept for serve-time
+            # traversal, which this evidence does not cover.
+            # SYS_RESOURCE: fd headroom only. NOT required to start — measured,
+            # see the correction in the pod-level comment above. Kept as an
+            # availability tradeoff, not as a requirement.
             # No `drop: [ALL]` here, deliberately; see the pod-level comment.
             capabilities:
               add: ["DAC_READ_SEARCH", "SYS_RESOURCE"]
             allowPrivilegeEscalation: false
+          # Factory#521 — this was the ONLY workload in the namespace with
+          # neither limits nor requests, i.e. an unbounded root container that
+          # the scheduler could not reason about. Measured steady state is
+          # 2m CPU / 28Mi, so the memory limit is ~18x headroom: an OOMKill here
+          # takes the `nfs` storageClass down, so it is sized to never bind in
+          # normal operation while still capping a runaway.
+          resources:
+            requests: { cpu: 10m, memory: 64Mi }
+            limits: { memory: 512Mi }
           args:
             - "-provisioner=factory.io/nfs"
           env:
