@@ -70,15 +70,35 @@ spec:
       # rootfs epic and this workload is a documented non-starter for it.
       #
       # `runAsNonRoot`/`runAsUser: 65532` DOES work on a fresh volume (third
-      # probe above) but is deliberately NOT set here, and this is the reason:
-      # this pod has been running as root against `observe-data` since it was
-      # created, so every Parquet file and the SQLite metadata store under /data
-      # is owned by uid 0. fsGroup 65532 fixes group ownership, not the mode
-      # bits, so a uid-65532 process would find its own existing data
-      # group-readable and not group-writable. Flipping the uid needs a chown of
-      # the existing volume in the same change, which is a maintenance window
-      # with a backup, not a drive-by edit inside a hardening sweep. Tracked
-      # separately rather than silently skipped: Factory#621.
+      # probe above) and is deliberately still NOT set here — but for a smaller
+      # reason than first recorded, and the correction is worth keeping.
+      #
+      # The first version of this comment said the uid flip needs a chown of the
+      # existing volume because fsGroup fixes group ownership and not the mode
+      # bits. That was challenged and then MEASURED, read-only, against the live
+      # observe-data PVC:
+      #
+      #   /data                    drwxrwsrwx  0 65532     <- group rw, setgid
+      #   /data/wal, /data/db ...  drwxrwsr-x  0 65532     <- group rw, setgid
+      #   *.parquet, *.wal         -rw-r--r--  0 65532     <- group READ ONLY
+      #
+      # So both halves were half right. kubelet's SetVolumeOwnership DID apply
+      # group-rw and setgid recursively at mount — the directories prove it. The
+      # FILES are 0644 because the root process created them after that pass
+      # (they are dated today; the directories are dated the last pod start).
+      #
+      # Which means the flip is NOT a data migration: fsGroupChangePolicy
+      # defaults to Always, so kubelet re-applies the recursive chown+chmod on
+      # the next mount, BEFORE the container starts. A uid-65532 process would
+      # never actually see the 0644 state.
+      #
+      # Still not done here, for two reasons that are about verification rather
+      # than permissions: that recursive re-apply runs over a multi-GB
+      # observability volume on every start, and this image is distroless with
+      # no shell, so `kubectl exec` cannot confirm the result — it has to be
+      # proved by ingest and query. That belongs in a change that can be watched,
+      # not in a hardening sweep that cannot even roll to the cluster (ArgoCD
+      # self-heals hand-applied patches in about twelve seconds). Factory#621.
       securityContext:
         fsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
