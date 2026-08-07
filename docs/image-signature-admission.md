@@ -1193,15 +1193,25 @@ Do NOT skip a phase. Each is a separate, small PR.
 
 4. **Enforce.** Flip `validationFailureAction: Audit` -> `Enforce`.
 
-   **Not yet.** Two preconditions remain, and three of the five are settled.
+   **Not yet.** Re-measured 2026-08-07 (Factory#522). Most of the table has
+   cleared; two rows have not, and one row is new.
 
    | # | Precondition | State |
    | --- | --- | --- |
-   | 0 | The policy has been observed denying and admitting | **Met**, 2026-08-05 |
-   | 1 | Every image a rule matches is readable by Kyverno | **Met**, 2026-08-07 — Factory#563 |
-   | 1b | The credential that makes it readable cannot go stale unnoticed | **Moot** — there is no credential; Factory#566 |
-   | 2 | Runner coverage is actually evidenced | Open — Factory#562 |
-   | 3 | The DNS repair behind Factory#430 is declarative | Open — olafkfreund/nixos_config#1232 |
+   | 0 | The policy has been observed denying and admitting | **Met** — re-observed 2026-08-07 with the *shipped* attestors |
+   | 1 | Every image a rule matches is readable by Kyverno | **Met**, 2026-08-07 — all 19 packages read anonymously, `.sig` included |
+   | 1b | The credential that makes it readable cannot go stale unnoticed | **Moot** by deletion, 2026-08-07 — there is no credential; Factory#566 |
+   | 2 | Runner coverage is actually evidenced | **Met** — `apps/kyverno-runner-probe`, Factory#562 closed |
+   | 3 | The DNS repair behind Factory#430 is declarative | **Open** — olafkfreund/nixos_config#1232 |
+   | 4 | No image a rule matches is unsigned | **Open** — Factory#640, two retained `skillai` ReplicaSets, see below |
+   | 5 | Report freshness is checked population-wide, not read as a green board | **Met** — `check-report-freshness.sh`, see below |
+
+   Row 1b is moot rather than fixed, which is the stronger outcome. All seven
+   first-party packages were made public, so
+   `--imagePullSecrets=kyverno-ghcr-pull` had nothing left to read and was
+   deleted from both controllers (PR #177). The failure mode described below it
+   is gone by construction, not documented around. Re-arming it takes a reviewed
+   gitops commit re-adding the flag — not a token quietly expiring.
 
    **1. Two runner packages are private (Factory#563). Closed.**
    `tfactory-runner-nix` and `tfactory-runner-portal-ui` were private GHCR
@@ -1342,6 +1352,257 @@ Do NOT skip a phase. Each is a separate, small PR.
 
    From the point of the flip, unsigned images matching a rule are denied at
    admission.
+
+## Re-measurement, 2026-08-07 (Factory#522)
+
+Everything above was measured while two runner packages were private and a
+registry credential was in play. Both facts have changed, so the evidence was
+re-taken rather than inherited. Recommendation first: **do not flip yet**, for
+one concrete reason, which is row 4 and is fixable in a day.
+
+### The board is not green, and that is the finding
+
+```
+$ ./apps/kyverno-policies/check-report-freshness.sh
+results     : 71  (fail=2)
+FAIL: 2 failing result(s):
+      ReplicaSet/skillai-app-6f4644867b: failed to verify image
+        ghcr.io/olafkfreund/skillai:97c1b06eefa1: no signatures found
+      ReplicaSet/skillai-app-55d8b87f5: failed to verify image
+        ghcr.io/olafkfreund/skillai:42578c7dc32a: no signatures found
+```
+
+These are **genuine signature verdicts**, not the Factory#430 registry-auth
+ambiguity — the message says `no signatures found` and never names
+`ghcr.io/token`, and `skillai` is public and readable anonymously. They are two
+retained ReplicaSets on `skillai` tags that predate SkillAi#303 adding signing.
+The currently *running* skillai image (`5ecfd51ba504`) verifies fine.
+
+The blast radius is narrower than it looks, and the reason is worth recording
+because it is not obvious. The `kyverno` ConfigMap's `resourceFilters` contains
+`[ReplicaSet,*,*]`, so ReplicaSets are excluded from **admission** — while the
+reports controller runs `--skipResourceFilters=true`, which is why they appear
+in **background scans**. Verified both ways: a server dry-run CREATE and UPDATE
+of one of these ReplicaSets produces no `kyverno.io/verify-images` annotation at
+all, so nothing evaluates at admission.
+
+Under Enforce, therefore:
+
+- These two ReplicaSets are not themselves denied. They sit at zero replicas.
+- A `kubectl rollout undo` of `skillai-app`, or anything else that scales one of
+  them up, **is** denied at the Pod level — case B below is exactly that image.
+- The Deployment path is not filtered and denies immediately. This is the real
+  shipped rule, live, on the object kind ArgoCD actually drives:
+
+  ```
+  $ kubectl replace --dry-run=server -f skillai-deployment-on-the-old-tag.json
+  Warning: policy verify-factory-image-signatures.autogen-verify-skillai-signature:
+    failed to verify image ghcr.io/olafkfreund/skillai:42578c7dc32a:
+    .attestors[0].entries[0].keyless: no signatures found
+  Warning: policy verify-factory-image-signatures.autogen-verify-skillai-signature:
+    unverified image ghcr.io/olafkfreund/skillai:42578c7dc32a
+  deployment.apps/skillai-app replaced (server dry run)
+  ```
+
+  Under Audit that is a warning. Under Enforce it is a denied ArgoCD sync. Note
+  the second, generic `unverified image` line following the specific one — that
+  pair is the source of the Factory#430 confusion and it is still flattened at
+  admission time.
+
+**So the fix before flipping is small: roll `skillai-app` forward onto a signed
+image and let the unsigned ReplicaSets age out of `revisionHistoryLimit`.** Do
+not exclude them; an exclusion carried for a reason that stops being true is the
+defect Factory#521 found twice.
+
+### Observing the deny, with the shipped attestors
+
+The 2026-08-05 run used hand-written attestors. This one copies them **verbatim**
+from the rules in `verify-factory-image-signatures.yaml`, so what was observed is
+the configuration that would actually be enforced. Same confinement as before:
+temporary ClusterPolicy, never committed, unlabelled for ArgoCD, `background:
+false`, `useCache: false`, matching `kinds: [Pod]` in a throwaway namespace only.
+The match block was read back before any Pod was submitted, and the real policy
+was never touched.
+
+**Case B — unsigned. Not a synthetic image: the exact reference carried by
+`ReplicaSet/skillai-app-55d8b87f5`, retained in `factory` right now.**
+
+```
+Error from server: admission webhook "mutate.kyverno.svc-ignore" denied the request:
+
+resource Pod/siggate-522/probe-b-unsigned was blocked due to the following policies
+
+tmp-522-enforce-probe:
+  b-deny-unsigned-real-replicaset-image: 'failed to verify image
+    ghcr.io/olafkfreund/skillai:42578c7dc32a:
+    .attestors[0].entries[0].keyless: no signatures found'
+```
+
+**Case C — wrong identity, using two REAL identities and no invented branch.**
+SkillAi publishes from `refs/heads/core-mvp-foundation`, not `main`. Anchoring
+its rule to `main` — the copy-paste mistake the policy header warns about — is
+therefore a realistic error with a real signature to test against:
+
+```
+  c-deny-anchored-to-wrong-ref: 'failed to verify image
+    ghcr.io/olafkfreund/skillai:5ecfd51ba504:
+    .attestors[0].entries[0].keyless: subject mismatch:
+    expected ^https://github\.com/olafkfreund/SkillAi/\.github/workflows/deploy-image\.yml@refs/heads/main$,
+    received https://github.com/olafkfreund/SkillAi/.github/workflows/deploy-image.yml@refs/heads/core-mvp-foundation'
+```
+
+### What the old `subjectRegExp` accepted, measured
+
+The narrowing landed earlier (Factory#522 item 2, PR #112). What had not been
+done is showing it **rejects** something, on the same image, with only the regex
+varied. Case D is case C's image under the OLD repo-prefix-only shape:
+
+```
+  rule   : d-admit-under-old-loose-pattern
+  subject: ^https://github\.com/olafkfreund/SkillAi/
+  result : {"ghcr.io/olafkfreund/skillai:5ecfd51ba504":"pass"}   <- ADMITTED
+```
+
+Same image, same webhook, same namespace, one field different: **the loose
+pattern admits what the anchored pattern denies.** The `kyverno.io/verify-images`
+annotation is quoted rather than the bare "created (server dry run)" line
+precisely because it proves the rule *evaluated and verified* rather than merely
+failing to match.
+
+A survey of what is actually published is the other half, and it is reassuring:
+every currently signed first-party tag carries the exact anchored identity, so
+the narrowing rejects **nothing that is real today**. Its value is prospective —
+it closes `some-other.yml@refs/heads/main`, `deploy.yml@refs/heads/attacker-branch`
+and `deploy.yml@refs/pull/99/merge`, any of which a workflow with
+`id-token: write` could mint.
+
+### `Ignore` has a cost this document had not named
+
+Two "admits" in this run were **not** admits. The kyverno controllers were being
+rolled at that moment (by the Factory#566 flag removal), and with
+`failurePolicy: Ignore` a webhook call that cannot be made is skipped and the
+Pod is admitted silently — indistinguishable from a pass:
+
+```
+kyverno.io/verify-images annotation: absent    <- nothing evaluated
+kubectl apply --dry-run=server: pod created    <- looks identical to a pass
+```
+
+That is a real bypass window on every Kyverno restart, upgrade and eviction, and
+it is the honest cost of the `Ignore` recommendation above. It does not change
+that recommendation — `Fail` turns the same window into a cluster-wide outage,
+which is worse on a single-node cluster — but "Ignore is free" would be wrong.
+
+**Practical consequence: never read `created (server dry run)` as evidence of a
+pass.** Read the `kyverno.io/verify-images` annotation. An admit with no
+annotation is a rule that did not run.
+
+### Report freshness: why "all passing" is not evidence
+
+`check-report-freshness.sh` in `apps/kyverno-policies/` exists because a
+PolicyReport **carries only its most recent scan**. It has no history, so a
+period during which scanning was broken leaves no trace once scanning resumes.
+Factory#501 had reports frozen at 2026-07-26 for eleven days and that gap is
+completely invisible today. A point-in-time green board is a reading of a
+self-erasing artifact.
+
+The script replaces that reading with three population-wide assertions:
+
+1. **`results[].timestamp`, never `metadata.creationTimestamp`** (Factory#444).
+   The report object is created once and updated in place.
+2. **The oldest result in the whole population** against the scan cycle, not any
+   single result. The rescan is a ~1h *rolling* cycle per resource, so one
+   report standing still is normal and proves nothing.
+3. **Population size.** A resource that stops being scanned produces *no* result,
+   not a stale one — a shrinking board looks exactly as green as a working one.
+
+Its guards were mutation-checked rather than assumed: tightening the bound to 1s
+reds it with the five stalest resources named, raising the population floor above
+the actual count reds it, and pointing it at a nonexistent policy reds it on both
+counts instead of passing quietly.
+
+One run bounds staleness; it does not prove the cycle is turning. For that, run
+it twice more than the bound apart and check the oldest timestamp **advances**.
+And a fresh timestamp is still not a fresh registry verdict: the positive-only
+image-verify cache has a 60m TTL, so real detection latency for a revoked
+signature is up to interval + TTL, roughly two hours.
+
+### Escape hatch: `apps/kyverno-policies/PANIC.sh`
+
+Written and tested **before** anything was applied, because this policy rides on
+`mutate.kyverno.svc-ignore`, which intercepts pods, deployments, replicasets,
+statefulsets, daemonsets, jobs and cronjobs in every namespace except
+`kube-system` and `kyverno`.
+
+Measured while testing it, all three worth knowing:
+
+- **The webhook index is not 0.** `mutate.kyverno.svc-ignore` sits at index 1;
+  index 0 is Factory#620's netpol gate, the one webhook in the cluster with
+  `failurePolicy: Fail`. A hardcoded index would have disabled the netpol gate
+  and left the signature gate armed. The script looks the index up by name.
+- **Level 2 held for between 10 and 20 seconds.** A healthy Kyverno reconciles
+  its own webhook configuration and restored the selector. Level 2 is therefore
+  not a durable off-switch while Kyverno is running — levels 1 and 3 are — and
+  the script says so instead of implying otherwise.
+- **The first version of level 2 failed and reported success.** The API server
+  rejected its sentinel label value (leading underscore) and the script printed
+  "defanged" anyway. It now asserts the field actually changed and exits non-zero
+  if not. An escape hatch that lies about having fired is worse than none,
+  because it reads as "level 2 did not help, escalate". This is the same class of
+  false-negative instrument that cost Factory#620 two of its three.
+
+Level 1's ordering is also measured, not assumed: `kyverno-policies` syncs with
+`selfHeal: true`, and a patch to a git-managed field
+(`webhookTimeoutSeconds: 30 -> 29`) was reverted **within 6 seconds**. So
+auto-sync must be disabled *before* patching the live policy to Audit, or the
+patch silently reverts.
+
+A caution on instrument choice, since it wasted a measurement here: an *added*
+annotation is not reverted by selfHeal and ArgoCD keeps reporting `Synced`,
+because the three-way merge only considers fields ArgoCD manages. Annotating the
+policy is therefore a false-negative test for "is selfHeal working". Test a field
+that is declared in git. `reconciledAt` was checked to rule out a stranded
+controller first.
+
+### Recommendation
+
+**Flip to Enforce once row 4 is cleared, and not before.** Concretely:
+
+1. Roll `skillai-app` onto a signed image and let the two unsigned ReplicaSets
+   age out (Factory#640). This is the only precondition standing between here
+   and the flip that is inside this repo's control.
+
+   Do **not** clear it by excluding zero-replica ReplicaSets from the rule's
+   `match`. That converts a true statement into silence, and it hides exactly
+   the case that bites: these are not inert. ReplicaSets are excluded from
+   admission by the `[ReplicaSet,*,*]` entry in the `kyverno` ConfigMap's
+   `resourceFilters`, but the Deployment path is not filtered and denies, and a
+   `kubectl rollout undo` scales one of them up and is denied at the Pod level.
+   It is a latent denial armed for the moment someone reaches for a rollback
+   during an incident.
+2. Keep `failurePolicy: Ignore`, with the restart-window bypass named above
+   accepted explicitly rather than overlooked.
+3. Flip, and run `check-report-freshness.sh` twice across a scan interval
+   afterwards — not once.
+
+Residual risks, named rather than implied away:
+
+- **The restart bypass.** Every Kyverno rollout admits unverified images for the
+  duration. Inherent to `Ignore`.
+- **Row 3, the undeclared DNS repair.** A `k3d cluster delete && create` reopens
+  Factory#430 by hand-repair loss. Under Enforce the first symptom is fleet-wide
+  admission failure, not a red report. This is the largest remaining risk and it
+  lives outside this repo.
+- **Glob narrowing is silent.** Narrowing a rule's `imageReferences` makes it
+  stop speaking, and both the signature board and the coverage board stay quiet,
+  because the coverage policy reads a hand-maintained mirror list rather than the
+  globs it mirrors. Only `apps/kyverno-runner-probe`, which reads the live
+  `verify-images` annotation, catches it. Do not phrase the Enforce criterion on
+  the two boards alone.
+- **Coverage is by glob, not by default.** `required: true` means "a matched
+  image must be signed", not "every image must match a rule" (Factory#564).
+- **Signatures attest provenance, not contents.** A verified signature proves the
+  named workflow published the image. It says nothing about what is in it.
 
 ## Notes
 
