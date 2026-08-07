@@ -1,9 +1,9 @@
 # Verify cosign keyless signatures on factory container images at admission.
 #
-# AUDIT MODE ONLY. validationFailureAction: Audit means an unsigned or
-# wrongly-signed image is REPORTED (ClusterPolicyReport + a PolicyViolation
-# event) but the Pod is still admitted. See docs/image-signature-admission.md
-# for the enforce path, and Factory#522 for the blockers still open.
+# ENFORCING. validationFailureAction: Enforce means an unsigned or
+# wrongly-signed image is DENIED at admission -- the Pod is not created. This
+# was Audit until Factory#522; see docs/image-signature-admission.md, and
+# ./PANIC.sh 1 to return it to Audit if a deny turns out to be wrong.
 #
 # Signer identity verified per repo:
 #   issuer  = https://token.actions.githubusercontent.com  (GitHub Actions OIDC)
@@ -180,11 +180,30 @@ metadata:
 spec:
   # AUDIT/WARN ONLY — report to PolicyReports, do NOT deny.
   #
-  # Do NOT flip this to Enforce here. Factory#522 tracks the flip as a separate
-  # change with its own blockers, the load-bearing one being that nothing has
-  # ever observed this policy DENY anything. A control has to be seen failing
-  # when its subject is bad before it is trusted to gate real deployments.
-  validationFailureAction: Audit
+  # ENFORCE since Factory#522. Both preconditions were met before the flip:
+  # a real admission deny was observed with the shipped attestors (not a test
+  # verdict), and the board reached 0 fail with every gated running image
+  # verified SIGNED against the registry anonymously -- not read off a report.
+  #
+  # WHAT THIS NOW BLOCKS: creation of any pod/deployment/replicaset/statefulset/
+  # daemonset/job/cronjob, in every namespace except kube-system and kyverno,
+  # whose image matches a glob below and has no readable cosign signature from
+  # the declared identity. Third-party images match no glob and are unaffected.
+  #
+  # HOW TO BACK OUT: ./PANIC.sh 1 -- returns the gate to Audit and suspends
+  # ArgoCD auto-sync so it stays there. Level 1 is almost always the one you
+  # want; Kyverno stays healthy and every other policy keeps working.
+  #
+  # KNOWN RESIDUALS, accepted deliberately at flip time:
+  #   - failurePolicy: Ignore below means a Kyverno restart admits unverified
+  #     for the duration of the window. A skipped webhook is indistinguishable
+  #     from a pass at the CLI; read kyverno.io/verify-images to tell them
+  #     apart (Factory#642).
+  #   - nixos_config#1232 (undeclared DNS repair) was open at flip time and was
+  #     assessed as the larger residual risk. Flipped anyway, on the operator's
+  #     explicit instruction.
+  #   - Narrowing a glob is silence, not a red (factory-gitops#181).
+  validationFailureAction: Enforce
   # If Kyverno itself is down / registry is unreachable, admit rather than
   # block. Signature verification is a report signal here, not a gate.
   failurePolicy: Ignore
