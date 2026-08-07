@@ -15,7 +15,8 @@
 # way this job can fail to do its work is an explicit exit 1 below -- missing
 # tools, zero kustomizations discovered, zero YAML discovered, a build that
 # produces no output, a file this gate cannot validate and has not been told to
-# skip.
+# skip, zero Kyverno policies discovered, zero Kyverno test suites discovered,
+# and a test suite that runs zero cases.
 name: manifest validation (blocking)
 
 on:
@@ -332,6 +333,119 @@ jobs:
           #   - Cluster-side admission of the policy object itself: CRD schema
           #     drift, or another controller's webhook rejecting it.
           #   - kyverno.io v1alpha1 policy kinds, which this repo does not use.
+          exit "$fail"
+
+      - name: Run the Kyverno policy test suites
+        run: |
+          set -uo pipefail
+
+          # #143. The step above proves a policy LOADS. It cannot prove the
+          # policy EVALUATES, and that is not a subtlety -- it is the whole
+          # gap. `kyverno apply` there is handed a bare ConfigMap probe that
+          # no rule in this repo matches, so every rule reports "not matched"
+          # and nothing is executed. A rule can carry a dead expression and
+          # still load with a healthy rule count.
+          #
+          # Measured during Factory#574, against five deliberate breakages of
+          # require-first-party-signature-coverage. The live admission webhook
+          # REJECTED four of them (bogus precondition operator, foreach-only
+          # variable in `message`, `deny` removed, empty `match` kinds) and
+          # ACCEPTED the fifth:
+          #
+          #   jmesPath: ... | [?regex_matchTYPO('^ghcr\.io/olafkfreund/', @)]
+          #
+          #   $ kubectl apply --dry-run=server -f ...
+          #   clusterpolicy.kyverno.io/... configured (server dry run)
+          #   $ kyverno apply ... --resource /tmp/kyverno-probe.yaml -v 4
+          #   pass: 0, fail: 0, warn: 0, error: 0, skip: 0
+          #
+          # An unknown JMESPath function makes the variable resolve empty, the
+          # precondition never fires, and the rule silently stops reporting
+          # anything. Schema-valid, Ready, healthy `.status.rulecount`, and
+          # measuring nothing -- Factory#430's shape exactly. The suite built
+          # in Factory#564 catches it on the first case, and until this step
+          # existed no workflow ran it (`grep -rn "kyverno test" .github/`
+          # returned nothing).
+          #
+          # This step is only worth its runtime because it runs the SAME
+          # v1.18.2 CLI pinned above, matching the cluster's admission
+          # controller. JMESPath and glob behaviour are version-sensitive, so
+          # a suite green on another minor proves nothing about admission.
+
+          # Discover by CONTENT, not by path -- #117's lesson, and the reason
+          # the issue asked for it here specifically. `kyverno test <dir>`
+          # recurses looking for files literally named kyverno-test.yaml, so
+          # handing it the repo root would silently ignore a suite named
+          # anything else. Instead each suite FILE is found by what is in it
+          # and then run by name with -f, so a new suite is run the day it
+          # lands whatever it is called and wherever it sits.
+          #
+          # Quotes optional for the same reason as above: a discovery regex
+          # that missed `apiVersion: "cli.kyverno.io/v1alpha1"` would make the
+          # suite invisible rather than merely unrun, which is #117 reproduced
+          # inside its own fix.
+          mapfile -t SUITES < <(
+            git ls-files -z '*.yaml' '*.yml' | tr '\0' '\n' | sort | while read -r f; do
+              grep -qE '^apiVersion:[[:space:]]*"?cli\.kyverno\.io/' "$f" || continue
+              grep -qE '^kind:[[:space:]]*"?Test"?[[:space:]]*$' "$f" || continue
+              printf '%s\n' "$f"
+            done
+          )
+
+          # Rule 4.7, same shape as every other guard in this file. This repo
+          # HAS a test suite. Finding none means discovery broke, or a suite
+          # was deleted rather than fixed.
+          if [ "${#SUITES[@]}" -eq 0 ]; then
+            echo "::error::no Kyverno test suite discovered -- this gate tested nothing"
+            exit 1
+          fi
+          echo "discovered ${#SUITES[@]} Kyverno test suite(s)"
+
+          # The exit code is NOT the whole gate, for the same reason it was not
+          # in the step above. `kyverno test` on a directory holding no cases
+          # prints "No test yamls available" and exits 0 -- indistinguishable
+          # from a pass, and precisely how #143 happened one level up. So the
+          # case count is read back out of the summary and a zero is a failure:
+          #
+          #   1. non-zero exit    -- a case did not get the result it expected
+          #   2. no summary line  -- the CLI did not get as far as running
+          #   3. zero cases       -- it ran, and it ran nothing
+          fail=0
+          for f in "${SUITES[@]}"; do
+            out=$(kyverno test "$(dirname "$f")" -f "$(basename "$f")" 2>&1)
+            rc=$?
+            counts=$(printf '%s\n' "$out" \
+              | sed -n 's/.*Test Summary:[[:space:]]*\([0-9]\{1,\}\) tests passed and \([0-9]\{1,\}\) tests failed.*/\1 \2/p' \
+              | tail -1)
+            passed=${counts%% *}
+            failed=${counts##* }
+
+            if [ -z "$counts" ]; then
+              echo "::error file=$f::kyverno test printed no summary -- this gate cannot confirm it ran anything"
+            elif [ $((passed + failed)) -eq 0 ]; then
+              echo "::error file=$f::kyverno test ran 0 cases -- a suite that tests nothing cannot pass (#143)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "::error file=$f::$failed of $((passed + failed)) Kyverno test case(s) failed -- a rule does not do what this suite says it does"
+            else
+              echo "ok  kyverno-test  $f  ($passed case(s) against Kyverno v1.18.2)"
+              continue
+            fi
+
+            printf '%s\n' "$out" | grep -Ev '^\s*$' | tail -30
+            fail=1
+          done
+
+          # What this still does NOT catch:
+          #   - Any policy no suite covers. Today that is
+          #     verify-factory-image-signatures and
+          #     strip-last-applied-configuration-from-secrets: they load, they
+          #     are never evaluated here, and a dead expression in either would
+          #     still ship green. Coverage of policies by suites is not itself
+          #     measured -- adding a policy does not fail this step.
+          #   - Signature verification. No case here reaches a registry or
+          #     rekor, by design; the suite is offline rule logic only.
+          #   - Anything the webhook checks at admission time that the CLI does
+          #     not, which is why the `kyverno apply` step above stays.
           exit "$fail"
 
   # Second gate, deliberately NOT the required status check (branch protection
