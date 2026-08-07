@@ -434,7 +434,7 @@ jobs:
               continue
             fi
 
-            printf '%s\n' "$out" | grep -Ev '^\s*$' | tail -30
+            printf '%s\n' "$out" | grep -Ev '^[[:space:]]*$' | tail -30
             fail=1
           done
 
