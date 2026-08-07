@@ -191,65 +191,92 @@ lost if the cluster is ever recreated.
 
 ### Blockers after this change
 
-1. **~~Kyverno cannot read the private GHCR packages.~~ CLOSED.** All five
-   factory GHCR packages — `aifactory`, `pfactory`, `tfactory`, `cfactory`,
-   `cfactory-frontend` — are public as of 2026-08-05, and Kyverno verifies all
-   of them anonymously. No `imageRegistryCredentials` wiring is needed.
+1. **~~Kyverno cannot read the private GHCR packages.~~ CLOSED — Factory#563.**
 
-   **Reopened for the runner images, Factory#524 (2026-08-05); addressed by a
-   credential instead of by visibility, Factory#563 — wiring landed, Secret
-   still to be created, see [Status](#status).** Two of the eleven
-   `tfactory-runner-*` packages — `tfactory-runner-nix` and
-   `tfactory-runner-portal-ui` — *are* private. They are correctly signed and
-   were unverifiable by Kyverno, because Kyverno had no GHCR credential at all:
-   it ran with `--registryCredentialHelpers=default,google,amazon,azure,github`
-   and no imagePullSecret in the `kyverno` namespace, which means it read
-   ghcr.io anonymously.
+   All five service packages — `aifactory`, `pfactory`, `tfactory`, `cfactory`,
+   `cfactory-frontend` — went public on 2026-08-05. The gap reopened for the
+   runner images on the same day (Factory#524): two of the eleven
+   `tfactory-runner-*` packages, `tfactory-runner-nix` and
+   `tfactory-runner-portal-ui`, were private. They were correctly signed and
+   unverifiable anyway, because Kyverno has no GHCR credential at all — it runs
+   with `--registryCredentialHelpers=default,google,amazon,azure,github` and no
+   imagePullSecret in the `kyverno` namespace, so it reads ghcr.io anonymously.
 
-   This is the Factory#430 ambiguity in the flesh, so the distinguishing
-   evidence is recorded rather than left to be re-derived. Kyverno v1.18.2
-   against this rule with an empty credential store (what Kyverno actually
-   has):
+   **Closed on 2026-08-07 by making both packages public**, matching the nine
+   framework runners and all five service packages. `verify-tfactory-runner-signature`
+   already named them — its glob is `ghcr.io/olafkfreund/tfactory-runner-*` — so
+   **no policy rule changed and none needed to. The gap was read access, never
+   coverage.** Verified with an empty credential store, which is exactly what
+   Kyverno has:
 
    ```
-   failed to verify image ghcr.io/olafkfreund/tfactory-runner-nix:latest:
-   .attestors[0].entries[0].keyless: GET https://ghcr.io/token?scope=
-   repository%3Aolafkfreund%2Ftfactory-runner-nix%3Apull&service=ghcr.io:
-   UNAUTHORIZED: authentication required
-   ```
-
-   Same image, same anchored identity, **with** a read credential:
-
-   ```
-   $ cosign verify --certificate-oidc-issuer=... \
-       --certificate-identity-regexp='<the rule regexp>' \
-       --registry-username=olafkfreund --registry-password="$(gh auth token)" \
+   $ DOCKER_CONFIG=<empty> cosign verify \
+       --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+       --certificate-identity-regexp='^https://github\.com/olafkfreund/TFactory/\.github/workflows/(nix-runner-image|portal-ui-runner-image|runner-images)\.yml@refs/heads/main$' \
        ghcr.io/olafkfreund/tfactory-runner-nix:latest
-   The following checks were performed on each of these signatures: ...
+   Subject: .../workflows/nix-runner-image.yml@refs/heads/main
+
+   ... tfactory-runner-portal-ui:latest
+   Subject: .../workflows/portal-ui-runner-image.yml@refs/heads/main
    ```
 
-   Both pass. The failure is a registry-auth failure, not a signature verdict —
-   a real signature verdict reads `no matching signatures` / `no signatures
-   found` and never names `ghcr.io/token`.
+   and through the live webhook, no Secret in the `kyverno` namespace, a server
+   dry-run of a Pod carrying both plus a public runner — zero warnings, and the
+   annotation Kyverno writes onto what it admits:
 
-   **The fix taken: give Kyverno a ghcr.io read credential.** Factory#563
-   originally proposed making both packages public, matching the nine framework
-   runners and all five service packages. Container package visibility has no
-   REST endpoint (`PATCH user/packages/container/<name>` returns 404), so it is
-   a UI-only operation — and the UI toggle would not commit, twice. The
-   credential path was taken instead, and it is the better end state anyway:
-   it covers *any* factory package that goes private in future, whereas a
-   visibility flip has to be repeated per package and can be undone silently
-   from a settings page nobody watches.
+   ```
+   kyverno.io/verify-images: {"ghcr.io/olafkfreund/tfactory-runner-nix:latest":"pass",
+     "ghcr.io/olafkfreund/tfactory-runner-portal-ui:latest":"pass",
+     "ghcr.io/olafkfreund/tfactory-runner-pytest:latest":"pass"}
+   ```
 
-   The rule deliberately does *not* exclude these two images. An accurate red
+   All eleven runner packages and all five service packages now answer an
+   anonymous `ghcr.io/token` request with a token that reads their manifests.
+   `odin` still does not — it 403s — which is why it still has no rule
+   (Factory#572).
+
+#### The credential path, built and then removed
+
+   A `--imagePullSecrets=kyverno-ghcr-pull` flag on both verifying controllers
+   was the first fix attempted, on the assumption that visibility could not be
+   changed (`PATCH user/packages/container/<name>` returns 404; it is a UI-only
+   operation, and the toggle would not commit at the time). **The flag is now
+   removed**, and not for tidiness:
+
+   - the Secret it named was never created — `kubectl -n kyverno get secret
+     kyverno-ghcr-pull` returns NotFound — so it was inert; and
+   - the mutation check on it found a new Enforce blocker, Factory#566.
+
+   | State | Warnings | Which |
+   | --- | --- | --- |
+   | No flag, no credential | 2 | the two private runners |
+   | Flag live, credential absent | 2 | the two private runners |
+   | Flag live, credential **wrong** | 16 | everything |
+   | Both packages public, no flag, no credential | **0** | — |
+
+   Row 3 is why the flag is gone. A wrong or **expired** credential does not
+   degrade to the anonymous path — it unverifies the whole fleet, and classic
+   PATs default to 30-day expiry. `failurePolicy: Ignore` does not cover it,
+   because Kyverno is healthy and returning a considered fail. Leaving a dormant
+   flag pointing at a Secret nobody maintains puts that failure mode in front of
+   Factory#522's Enforce flip in exchange for nothing. Row 4 is the state today.
+
+   The rule deliberately does *not* exclude the two images. An accurate red
    naming a real gap was the point while the gap stood, and an exclusion would
    have permanently unverified the sandbox that generated code executes in.
 
-#### How the credential is wired
+#### If a factory package goes private again
 
-   `apps/kyverno/manifests/kustomization.yaml` adds one flag to two
-   Deployments:
+   Then the credential comes back, and it goes on **both** verifying
+   controllers. They build registry clients independently
+   (`internal.WithRegistryClient()` in `cmd/kyverno/main.go` and
+   `cmd/reports-controller/main.go`): `kyverno-admission-controller` verifies at
+   admission, `kyverno-reports-controller` verifies on the background scan. A
+   credential on only one leaves half the evidence broken — admission-time
+   warnings clearing while the PolicyReport board keeps the same images red, or
+   the reverse. `kyverno-background-controller` builds no registry client
+   (generate / mutateExisting only) and `kyverno-cleanup-controller` verifies
+   nothing, so neither needs it.
 
    ```yaml
    - target: { group: apps, version: v1, kind: Deployment,
@@ -260,145 +287,59 @@ lost if the cluster is ever recreated.
          value: --imagePullSecrets=kyverno-ghcr-pull
    ```
 
-   **Not `imageRegistryCredentials`.** An earlier revision of this document
-   suggested a policy-level block of that name. That field does exist in the
-   ClusterPolicy CRD, but *only* under `rules[].context[].imageRegistry` — the
-   context-variable lookup. There is no such field under `verifyImages`, so it
-   cannot supply credentials to signature verification. Checked against the
-   live v1.18.2 CRD; the only path in the schema is
-
-   ```
-   spec.rules[].context[].imageRegistry.imageRegistryCredentials
-   ```
-
-   The flag is the mechanism. `--imagePullSecrets` is read by
-   `setupRegistryClient` (`cmd/internal/registry.go`), which builds a
-   namespace-scoped secret lister over the `kyverno` namespace and appends a
-   keychain for the named secrets.
-
-   **Both controllers need it, and for different evidence.** Each builds its
-   own registry client via `internal.WithRegistryClient()`:
-
-   | Controller | Path it covers | Needs the credential |
-   |---|---|---|
-   | `kyverno-admission-controller` | admission-time verification (the webhook) | yes |
-   | `kyverno-reports-controller` | the background scan, `--backgroundScan=true`, 1h interval (Factory#444) | yes |
-   | `kyverno-background-controller` | generate / mutateExisting only, builds no registry client | no |
-   | `kyverno-cleanup-controller` | report pruning, no verification | no |
-
-   Crediting only one leaves half the evidence broken in a way that reads as a
-   contradiction: admission-time warnings clear while the PolicyReport board
-   keeps reporting the same two images as failures, or the reverse.
-
-   **The Secret is not in this repo.** There is no SOPS and no sealed-secrets
-   here (`docs/secrets-management.md`), so `kyverno-ghcr-pull` is created
-   out-of-band, exactly like `factory/ghcr-pull`, `minio-creds` and the rest.
-   Create it with `kubectl create secret docker-registry`, **never** `kubectl
-   apply` — an apply writes the full plaintext token into the
-   `kubectl.kubernetes.io/last-applied-configuration` annotation, readable by
-   anyone with get-secret. That is Factory#448, and it is already live on
-   `factory/ghcr-pull` (Factory#565).
+   The Secret is not in this repo — there is no SOPS and no sealed-secrets
+   (`docs/secrets-management.md`), so it is created out-of-band exactly like
+   `factory/ghcr-pull` and `minio-creds`. Create it with `kubectl create secret
+   docker-registry`, never `kubectl apply`: an apply writes the full plaintext
+   into the `kubectl.kubernetes.io/last-applied-configuration` annotation, which
+   is Factory#448 and already happened to `factory/ghcr-pull` (Factory#565).
 
    ```bash
-   # PAT scope: read:packages AND NOTHING ELSE.
-   # Never put the token on a command line -- argv is world-readable via /proc.
-   printf '%s' "$PAT" > /dev/shm/pat
+   printf '%s' "$PAT" > /dev/shm/pat            # never on the command line
    kubectl create secret docker-registry kyverno-ghcr-pull -n kyverno \
-     --docker-server=ghcr.io \
-     --docker-username=olafkfreund \
-     --docker-password="$(cat /dev/shm/pat)"
-   shred -u /dev/shm/pat
-
-   # then confirm nothing leaked into an annotation
-   kubectl get secret kyverno-ghcr-pull -n kyverno -o json | jq '.metadata.annotations'
-   # -> null
+     --docker-server=ghcr.io --docker-username=olafkfreund \
+     --docker-password="$(cat /dev/shm/pat)"; shred -u /dev/shm/pat
    ```
 
-   **Why a classic PAT and not fine-grained.** Fine-grained package permissions
-   are repository-scoped, and both packages are linked to no repository at all
-   — their Dockerfiles omit `org.opencontainers.image.source`, which is also
-   why they never inherited TFactory's public visibility (TFactory#952). A
-   classic PAT holding the single `read:packages` scope is the least privilege
-   GHCR actually offers here. Do not substitute a broader token: this
-   credential sits in a component that reads every image reference in the
-   fleet, and a broad token wired into an admission controller is a worse
-   outcome than the gap it closes. GHCR's `/token` endpoint is not an escape
-   hatch either — for an authenticated request it hands back base64 of the same
-   PAT rather than a scoped, short-lived registry JWT, so there is no narrower
-   credential to mint.
+   The PAT needs `read:packages` **and nothing else** — this credential sits in
+   a component that reads every image reference in the fleet. A fine-grained PAT
+   cannot be used: the runner packages are unlinked from any repository
+   (TFactory#952 — their Dockerfiles omit `org.opencontainers.image.source`) and
+   fine-grained package permissions are repository-scoped, so a classic PAT with
+   the single `read:packages` scope is the least privilege GHCR offers.
 
-   **Applying the flag before the Secret exists is safe.**
-   `generateKeychainForPullSecrets` (`pkg/registryclient/utils.go`) treats a
-   NotFound secret as "skip, log at v4, carry on"; only a non-NotFound error
-   propagates. With the Secret absent the flag is a no-op and the anonymous
-   path for the nine public runners and five service images is untouched. The
-   keychain is re-resolved from the lister on *every* image resolution
-   (`autoRefreshSecrets.Resolve`, `pkg/registryclient/authn.go`), so creating
-   the Secret later needs no redeploy — but the verification cache holds the
-   failed result for `--imageVerifyCacheTTLDuration` (1h default), so
+   Applying the flag before the Secret exists is safe:
+   `generateKeychainForPullSecrets` in `pkg/registryclient/utils.go` treats a
+   NotFound secret as skip-and-continue. The keychain is re-resolved from the
+   secret lister on every image resolution (`autoRefreshSecrets.Resolve` in
+   `pkg/registryclient/authn.go`), so creating the Secret later needs no
+   redeploy — though the verify cache holds a failed result for
+   `--imageVerifyCacheTTLDuration` (1h default), so
+   `kubectl -n kyverno rollout restart` on both Deployments makes it immediate.
+
+#### Telling the two failures apart
+
+   Kyverno writes `unverified image` for a registry-read failure and for a
+   signature verdict alike. That is the whole of Factory#430, so the
+   distinguishing evidence is recorded rather than left to be re-derived. A read
+   failure names the token endpoint:
+
+   ```
+   failed to verify image ghcr.io/olafkfreund/tfactory-runner-nix:latest:
+   .attestors[0].entries[0].keyless: GET https://ghcr.io/token?scope=
+   repository%3Aolafkfreund%2Ftfactory-runner-nix%3Apull&service=ghcr.io:
+   UNAUTHORIZED: authentication required
+   ```
+
+   A signature verdict reads `no matching signatures`, `subject mismatch` or
+   `issuer mismatch`, and never touches `ghcr.io/token`. Settle the read half
+   without the cluster:
 
    ```bash
-   kubectl -n kyverno rollout restart deploy/kyverno-admission-controller
-   kubectl -n kyverno rollout restart deploy/kyverno-reports-controller
+   curl -s "https://ghcr.io/token?scope=repository%3Aolafkfreund%2F<pkg>%3Apull&service=ghcr.io"
    ```
 
-   makes it take effect immediately.
-
-#### What was measured
-
-   Live `factory` cluster, Kyverno v1.18.2, 2026-08-05. One server dry-run over
-   a Pod carrying all sixteen covered images — 2 private runners, 9 public
-   runners, 5 services — is the probe throughout.
-
-   | State | Warnings | Which |
-   | --- | --- | --- |
-   | No flag, no credential (before) | 2 | the two private runners |
-   | Flag live, credential absent | 2 | the two private runners |
-   | Flag live, credential **wrong** | 16 | everything |
-   | Flag live, credential removed again | 2 | the two private runners |
-
-   Rows 2 and 4 are the regression check: adding the flag changes nothing for
-   the fourteen images that already verified anonymously, and both controllers
-   log a clean registry-client setup rather than a startup error —
-
-   ```
-   setup registry client...  insecure=false  secrets=kyverno-ghcr-pull
-   ```
-
-   — on `kyverno-admission-controller` and `kyverno-reports-controller` alike.
-   The board held at 65 pass / 0 fail / 0 warn / 0 error across all four states
-   (which is *not* evidence of runner coverage — see Factory#562).
-
-   Row 3 is the mutation check, and it found more than it was looking for: the
-   credential is not merely load-bearing, it is fleet-wide load-bearing once it
-   exists. That is Factory#566 and a new Enforce blocker; see [Phased path to
-   Enforce](#phased-path-to-enforce).
-
-   That the two images are correctly *signed* — that read access was the only
-   thing missing — is settled separately, against the rule's exact anchored
-   identity:
-
-   ```
-   $ cosign verify --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-       --certificate-identity-regexp='^https://github\.com/olafkfreund/TFactory/\.github/workflows/(nix-runner-image|portal-ui-runner-image|runner-images)\.yml@refs/heads/main$' \
-       ghcr.io/olafkfreund/tfactory-runner-nix:latest
-   The following checks were performed on each of these signatures: ...
-   subject: .../workflows/nix-runner-image.yml@refs/heads/main
-
-   ... tfactory-runner-portal-ui:sha-bbd4400
-   subject: .../workflows/portal-ui-runner-image.yml@refs/heads/main
-   ```
-
-   Both match the rule's three-way workflow alternation exactly.
-
-#### Status
-
-   The flag is live on both controllers. **The Secret is not yet created** — it
-   needs a classic PAT scoped `read:packages` and nothing else, which only a
-   human can mint (GitHub has no PAT-creation API). Until it exists the two
-   private runners keep reporting the registry-auth failure, exactly as before,
-   and nothing else is affected. Create it with the `kubectl create secret
-   docker-registry` command above, then rollout-restart both controllers.
+   A private package answers `denied` and 403s the manifest.
 
 2. **`background: false` froze every report at admission.** A long-lived Pod was
    evaluated once, ever, and its report stayed green across arbitrarily many
@@ -524,8 +465,8 @@ cosign verify \
 ```
 
 It still has **no** rule in `verify-factory-image-signatures`, deliberately. The
-`odin` GHCR package is **private**, and the `kyverno-ghcr-pull` Secret that
-Factory#563 wired the controllers to use does not exist yet:
+`odin` GHCR package is **private** — the only first-party package that still is
+after Factory#563 — and Kyverno holds no ghcr.io credential at all, by design:
 
 ```bash
 $ curl -s "https://ghcr.io/token?scope=repository%3Aolafkfreund%2Fodin%3Apull&service=ghcr.io"
@@ -1150,10 +1091,10 @@ Do NOT skip a phase. Each is a separate, small PR.
    `verify-tfactory-runner-signature` covers all eleven `tfactory-runner-*`
    images. Nine verified anonymously from the start; `tfactory-runner-nix` and
    `tfactory-runner-portal-ui` failed with `UNAUTHORIZED: authentication
-   required` because they are private GHCR packages. Closed by Factory#563 —
-   Kyverno now holds a `read:packages` ghcr.io credential rather than the
-   packages being made public. See [How the credential is
-   wired](#how-the-credential-is-wired).
+   required` because they were private GHCR packages. Closed by Factory#563 on
+   2026-08-07 — both packages were made public, so all eleven verify
+   anonymously and Kyverno needs no credential. See [Blockers after this
+   change](#blockers-after-this-change).
 
 3c. **Observe a deny (Factory#522).** **Done 2026-08-05.** The policy has been
    seen rejecting a wrong-identity image and an unsigned image, admitting a
@@ -1164,39 +1105,38 @@ Do NOT skip a phase. Each is a separate, small PR.
 
 4. **Enforce.** Flip `validationFailureAction: Audit` -> `Enforce`.
 
-   **Not yet.** Three preconditions remain, and two of the five are met.
+   **Not yet.** Two preconditions remain, and three of the five are settled.
 
    | # | Precondition | State |
    | --- | --- | --- |
    | 0 | The policy has been observed denying and admitting | **Met**, 2026-08-05 |
-   | 1 | Every image a rule matches is readable by Kyverno | **Met**, 2026-08-05 — Factory#563 |
-   | 1b | The credential that makes it readable cannot go stale unnoticed | Open — Factory#566 |
+   | 1 | Every image a rule matches is readable by Kyverno | **Met**, 2026-08-07 — Factory#563 |
+   | 1b | The credential that makes it readable cannot go stale unnoticed | **Moot** — there is no credential; Factory#566 |
    | 2 | Runner coverage is actually evidenced | Open — Factory#562 |
    | 3 | The DNS repair behind Factory#430 is declarative | Open — olafkfreund/nixos_config#1232 |
 
    **1. Two runner packages are private (Factory#563). Closed.**
-   `tfactory-runner-nix` and `tfactory-runner-portal-ui` are private GHCR
-   packages. Kyverno held no registry credential and read ghcr.io anonymously,
-   so it got `UNAUTHORIZED: authentication required` — the exact case D deny
-   quoted above. Under Enforce that would have denied **every build and verify
-   Job in the fleet**, because those two images are `AIFACTORY_SANDBOX_IMAGE`,
-   `TFACTORY_NIX_RUNNER_IMAGE`, `TFACTORY_VAL3_K8S_JOB_IMAGE` and
-   `PORTAL_UI_IMAGE`. Both images are correctly signed; it was purely a read
-   permission.
+   `tfactory-runner-nix` and `tfactory-runner-portal-ui` were private GHCR
+   packages. Kyverno holds no registry credential and reads ghcr.io
+   anonymously, so it got `UNAUTHORIZED: authentication required` — the exact
+   case D deny quoted above. Under Enforce that would have denied **every build
+   and verify Job in the fleet**, because those two images are
+   `AIFACTORY_SANDBOX_IMAGE`, `TFACTORY_NIX_RUNNER_IMAGE`,
+   `TFACTORY_VAL3_K8S_JOB_IMAGE` and `PORTAL_UI_IMAGE`. Both images are
+   correctly signed; it was purely a read permission.
 
-   Closed by giving Kyverno a `read:packages` ghcr.io credential rather than by
-   making the packages public — the visibility toggle is UI-only and would not
-   commit. See [How the credential is wired](#how-the-credential-is-wired).
+   **Closed 2026-08-07 by making both packages public.** Both now verify
+   anonymously against the rule's anchored identity, and a server dry-run of a
+   Pod carrying both returns zero warnings with
+   `kyverno.io/verify-images` reporting `pass` for each. No rule changed —
+   the runner glob already named them. See
+   [Blockers after this change](#blockers-after-this-change).
 
-   **1b. The credential is now a new single point of failure (Factory#566).**
-   This is the finding that mutation-checking #563 produced, and it is a
-   genuine new Enforce blocker rather than a caveat.
-
-   A wrong, revoked or **expired** credential in `kyverno/kyverno-ghcr-pull`
-   does not degrade to the anonymous path. It breaks verification for **every
-   image in the fleet**, including the fourteen that are public and verify fine
-   with no credential at all. Measured, same probe, both controllers restarted
-   so the cache is cold:
+   **1b. The credential single point of failure (Factory#566). Moot, by
+   removal.** Mutation-checking the credential path found that a wrong, revoked
+   or **expired** credential in `kyverno/kyverno-ghcr-pull` does not degrade to
+   the anonymous path — it breaks verification for **every image in the fleet**,
+   including the fourteen that verify fine with no credential at all:
 
    ```
    credential absent  ->  2 warnings   (the two private runners only)
@@ -1205,27 +1145,20 @@ Do NOT skip a phase. Each is a separate, small PR.
 
    `go-containerregistry`'s keychain resolves ghcr.io to the pull-secret
    credential and returns it. There is no fallback: an authenticated request
-   that fails auth is a failed request, not a cue to retry anonymously. Once
-   the secret exists it governs every ghcr.io read Kyverno makes.
+   that fails auth is a failed request, not a cue to retry anonymously.
+   `failurePolicy: Ignore` does not cover it either — Ignore covers Kyverno
+   being unreachable, and here Kyverno is healthy and returning a considered
+   fail. Classic PATs default to 30-day expiry, and nothing watched it.
 
-   Consequences that matter for the flip:
-
-   - **Classic PATs expire**, and GitHub's default for a new one is 30 days. At
-     Enforce, on expiry day, every Pod in the fleet is denied — builds, verify
-     Jobs, and the control plane itself on its next rollout.
-   - **`failurePolicy: Ignore` does not save this.** Ignore covers Kyverno being
-     unreachable. Here Kyverno is healthy and returns a considered fail. Same
-     distinction as case D below.
-   - **The failure is silent until it is total.** Nothing watches the
-     credential today.
-
-   Before flipping: give the PAT no expiry (a no-expiry `read:packages`-only
-   token is a smaller risk than an unmonitored 30-day one that denies the fleet
-   on day 31), and add a probe that does an authenticated
-   `GET /v2/olafkfreund/tfactory-runner-nix/manifests/latest` and alerts on
-   401/403. Kyverno offers no per-rule credential for `verifyImages` that would
-   contain the blast radius — `imageRegistryCredentials` exists only under
-   `rules[].context[].imageRegistry`, checked against the live v1.18.2 CRD.
+   **There is no credential today.** The `--imagePullSecrets=kyverno-ghcr-pull`
+   flag was removed along with the private packages it existed for, so this
+   blocker does not stand in front of the flip. It comes back the moment a
+   factory package goes private again, and the mitigation is recorded with the
+   recipe: no expiry on the PAT, plus an authenticated registry probe alerting
+   on 401/403. Kyverno offers no per-rule credential for `verifyImages` that
+   would contain the blast radius — `imageRegistryCredentials` exists only
+   under `rules[].context[].imageRegistry`, checked against the live v1.18.2
+   CRD.
 
    **2. A green board is not evidence of runner coverage (Factory#562).**
    This one directly undermines the rollout criterion this document has used
