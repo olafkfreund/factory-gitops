@@ -1,0 +1,189 @@
+################################################################################
+# trace-silence-check (Factory#516)
+#
+# WHY THIS EXISTS
+#
+# Factory#465 read "PFactory, TFactory and CFactory show 0 occurrences over the
+# same window" as evidence that the problem was AIFactory-specific. The three
+# quiet services were not healthy, they were unwired, and the thing that made
+# that misreading possible is that NOTHING IN THE FLEET EVER ASKED whether a
+# service was still emitting. Silence was the same shape as health.
+#
+# It happened a second time, and worse. After the OTLP config landed on all
+# four services, PFactory and TFactory logged
+#
+#     OTel tracing enabled ... (startup export accepted)
+#     OTel instrumentation installed: FastAPI
+#
+# on every boot, and exported exactly ZERO spans for weeks. Both claims were
+# individually true and neither one measured delivery: the export probe proves
+# the credential with an EMPTY payload, and the instrumentation line proves a
+# call did not raise. The app that got instrumented was not the app that
+# served (see each service's observability/tracing.py).
+#
+# So the check that was missing is the only one that cannot be satisfied by a
+# component reporting on itself: ask the COLLECTOR whether spans arrived, by
+# service name, and fail when the answer is none. It is indifferent to WHY a
+# service went dark -- bad credential, unwired env, uninstrumented app, crashed
+# exporter, a rebuild that dropped a Secret. Any cause, same alarm.
+#
+# WHY A CRONJOB
+#
+# job-watchdog sweeps EVERY CronJob in this namespace rather than a hardcoded
+# list, so a repeated failure here inherits human routing (a GitHub issue) for
+# free -- the same reasoning that put observe-otlp-auth-sync in a CronJob.
+#
+# WHY THE WINDOW IS SAFE
+#
+# Every service in EXPECTED_SERVICES is a long-lived FastAPI pod with a kubelet
+# readinessProbe hitting it every 10s. Once the ASGI app is instrumented those
+# probes alone are a continuous span source, so "zero spans in an hour" cannot
+# mean "idle" for these four -- it means broken. A service that is genuinely
+# request-driven and can be legitimately quiet must NOT be added to this list
+# without widening its window first.
+#
+# The credential is observe-root, the same primary secret observe-otlp-auth-sync
+# derives the ingest header from, read here via secretKeyRef -- this job only
+# READS it, so it needs no ServiceAccount and no RBAC at all.
+################################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trace-silence-check-script
+  namespace: factory
+  labels: { app: observe }
+data:
+  check.py: |
+    """Fail when a service that should be tracing has stopped (Factory#516).
+
+    stdlib only, same as job-watchdog and observe-otlp-auth-sync.
+    """
+    import base64
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    ENDPOINT = os.environ["OBSERVE_ENDPOINT"].rstrip("/")
+    ORG = os.environ.get("OBSERVE_ORG", "default")
+    STREAM = os.environ.get("OBSERVE_TRACES_STREAM", "default")
+    EXPECTED = [s.strip() for s in os.environ["EXPECTED_SERVICES"].split(",") if s.strip()]
+    LOOKBACK_MIN = int(os.environ.get("LOOKBACK_MINUTES", "60"))
+
+    email = os.environ["OBSERVE_EMAIL"]
+    password = os.environ["OBSERVE_PASSWORD"]
+    auth = base64.b64encode(f"{email}:{password}".encode()).decode()
+
+    now = int(time.time())
+    body = json.dumps({
+        "query": {
+            "sql": f"SELECT service_name, count(*) AS n FROM {STREAM} GROUP BY service_name",
+            "start_time": (now - LOOKBACK_MIN * 60) * 1_000_000,
+            "end_time": now * 1_000_000,
+            "from": 0,
+            "size": 100,
+        }
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{ENDPOINT}/api/{ORG}/_search?type=traces",
+        data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Basic {auth}"},
+    )
+
+    try:
+        raw = urllib.request.urlopen(req, timeout=60).read().decode()
+    except urllib.error.HTTPError as e:
+        # A collector that cannot be QUERIED is itself a reason to shout: it is
+        # the state in which every service looks silent and none of them is.
+        # Never print the response body unfiltered -- it can echo the request.
+        print(f"FAIL: collector query returned HTTP {e.code}; "
+              f"cannot tell whether any service is tracing", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001 - any transport failure is a real failure
+        print(f"FAIL: collector unreachable ({type(e).__name__}); "
+              f"cannot tell whether any service is tracing", file=sys.stderr)
+        sys.exit(1)
+
+    counts = {h["service_name"]: h.get("n", 0) for h in json.loads(raw).get("hits", [])}
+
+    silent = [s for s in EXPECTED if counts.get(s, 0) <= 0]
+    for s in EXPECTED:
+        print(f"  {s:<16} {counts.get(s, 0):>10} spans in the last {LOOKBACK_MIN}m")
+
+    if silent:
+        print(
+            f"\nFAIL: {len(silent)} of {len(EXPECTED)} services emitted NO spans in "
+            f"the last {LOOKBACK_MIN} minutes: {', '.join(silent)}\n"
+            f"\nThese pods each answer a readinessProbe every 10s, so zero spans is "
+            f"not idleness. Check, in this order:\n"
+            f"  1. does the Deployment still have OTEL_EXPORTER_OTLP_ENDPOINT?\n"
+            f"  2. does the pod log say 'REJECTED the startup export'?  -> credential\n"
+            f"  3. does it say 'OTel tracing enabled' and still nothing lands?\n"
+            f"     -> the app that got instrumented is not the app that serves;\n"
+            f"        that is Factory#516, see the service's observability/tracing.py\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"\nOK: all {len(EXPECTED)} services emitted spans in the last {LOOKBACK_MIN}m")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trace-silence-check
+  namespace: factory
+  labels: { app: observe }
+spec:
+  # Hourly, matching the LOOKBACK_MINUTES window below. Tracing going dark is
+  # a degradation, not an outage, so this trades detection latency for a job
+  # that cannot itself become noise.
+  schedule: "43 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      # No retry. A retry would only re-ask the same question about the same
+      # window and turn one honest failure into two.
+      backoffLimit: 0
+      template:
+        metadata: { labels: { app: trace-silence-check } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: check
+              # Stock python; the script is stdlib-only, same as job-watchdog.
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+              command: ["python3", "/script/check.py"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              env:
+                - { name: OBSERVE_ENDPOINT, value: "http://observe.factory.svc.cluster.local:5080" }
+                # The four PARR services. Each is a long-lived FastAPI pod with
+                # a readinessProbe, so each is a continuous span source once its
+                # SERVING app is instrumented. Keep in step with each service's
+                # DEFAULT_SERVICE_NAME.
+                - { name: EXPECTED_SERVICES, value: "pfactory-web,tfactory-web,aifactory-web,cfactory-api" }
+                - { name: LOOKBACK_MINUTES, value: "60" }
+                - { name: OBSERVE_EMAIL,    valueFrom: { secretKeyRef: { name: observe-root, key: email } } }
+                - { name: OBSERVE_PASSWORD, valueFrom: { secretKeyRef: { name: observe-root, key: password } } }
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - { name: script, mountPath: /script, readOnly: true }
+          volumes:
+            - name: script
+              configMap: { name: trace-silence-check-script }
