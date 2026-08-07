@@ -1,0 +1,42 @@
+# job-watchdog's watchdog.py lives as a block scalar inside a ConfigMap, so
+# nothing imported it and nothing ran its ~500 lines of embedded assertions
+# (factory-gitops#152). manifest-validate.yml proves the ConfigMap is
+# well-formed YAML and says nothing about the Python inside it, which meant the
+# selftest could be broken — or silently pass while asserting nothing — and CI
+# would stay green. Every mutation check on this app had to be run by hand.
+#
+# The watchdog is the fleet's only route from a failing workload to a human, so
+# "its tests are run by a person who remembers to" is not good enough.
+#
+# No paths filter: this takes seconds, and a required check that does not run on
+# a PR leaves that PR blocked forever.
+#
+# argocd-drift has the same gap and is NOT covered here — see factory-gitops#152.
+name: job-watchdog selftest
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: watchdog.py selftest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Extract watchdog.py from the ConfigMap
+        run: |
+          python3 .github/scripts/extract_embedded_script.py \
+            apps/job-watchdog/manifests/manifests.yaml \
+            watchdog.py \
+            /tmp/watchdog_extracted.py
+      - name: Selftest
+        run: python3 /tmp/watchdog_extracted.py selftest
