@@ -1,0 +1,33 @@
+# cred-sync lives as an inline `args:` block scalar in three Deployments, so
+# nothing imported it and nothing ever ran it. Factory#628: it treated an
+# unreadable destination as epoch 0 and copied a two-month-expired seed over a
+# working credential, logging it as `adopted fresher credential (+494672.6h)`.
+# That cost a full TFactory verification run.
+#
+# The script is vendored byte-identically into three manifests, so this also
+# fails on drift -- one engine, no drift.
+#
+# No paths filter: this takes seconds, and a required check that does not run on
+# a PR leaves that PR blocked forever.
+name: cred-sync guards
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cred-sync refuses bad adoptions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Every guard, and all three copies identical
+        run: python3 .github/scripts/test_cred_sync.py
