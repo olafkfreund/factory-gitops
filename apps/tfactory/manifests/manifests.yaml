@@ -433,7 +433,7 @@ spec:
             # 12-Jobs-per-module path let a transient dispatch error flip stability
             # to ERROR, downgrading accept->flag). Keep in lockstep with newTag on
             # every CD bump.
-            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-7b14c8e" }
+            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-647b698" }
             # PORTAL_UI_IMAGE pins the runner image the portal-ui browser Job
             # runs (portal_testing/dispatch.py). TFactory#886: nothing built that
             # image for the first five weeks of its life, so `:latest` -- the
