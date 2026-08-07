@@ -1,0 +1,123 @@
+# Factory#570 — constrain tfactory-deploy-dryrun to dry-run creates only.
+#
+# WHY THIS EXISTS. RBAC grants verbs on resource TYPES, not on request intent:
+# the API server authorizes a `dryRun=All` create identically to a real,
+# persisted create. The deploy VAL-2 lane runs `kubectl create --dry-run=server`,
+# which REQUIRES the `create` verb, so `Role/tfactory-deploy-dryrun` in `factory`
+# must keep `create` and cannot be narrowed further (see
+# apps/tfactory/manifests/manifests.yaml, and Factory#569 for why every read verb
+# was already removed).
+#
+# That leftover `create` is a privilege-escalation primitive. A REAL pod naming
+# `serviceAccountName: cred-broker` (which holds get/patch on the Claude
+# credential `factory-cli-creds`) or `tfactory-sandbox` (which creates the
+# Nix-lane Jobs) hands the caller that SA's token; `create` on serviceaccounts +
+# rolebindings mints a fresh identity. Kubernetes escalation-prevention bounds
+# `create roles/rolebindings` ("you cannot grant what you do not hold") but does
+# NOT bound pod-spec ServiceAccount selection. Demonstrated on the live cluster:
+# a create-only identity built from an exact replica of that Role stood up a
+# RUNNING pod bound to a stronger SA and enumerated a secret it could not read.
+#
+# The only other guard, `deploy_runner.assert_dry_run`, is CLIENT-side and runs
+# in the same Job as the model-generated descriptors it polices. So the real
+# boundary has to be admission, which is the one layer that can see
+# `request.dryRun`. This rule denies any NON-dryRun create by that one
+# ServiceAccount; `create --dry-run=server` carries dryRun=All and passes.
+#
+# ENFORCE, DELIBERATELY. Unlike the signature policies here, which are Audit
+# (Factory#522), this rule sets `validate.failureAction: Enforce`. An Audit rule
+# reports and constrains nothing, which would leave the escalation wide open
+# while looking fixed. The exception is narrow: the preconditions gate on ONE
+# exact username, so no other identity can ever be denied by it, and
+# `failurePolicy: Ignore` (fleet convention) plus `namespaces: ["factory"]` bound
+# the blast radius if Kyverno is down or a rule misfires.
+#
+# THE `kinds:` LIST MUST MIRROR THE ROLE. It covers all 17 resources
+# Role/tfactory-deploy-dryrun grants `create` on (verified 1:1 at time of
+# writing). A kind granted by the Role but missing here is an open escalation
+# path that is INVISIBLE — the policy still loads, still reports Ready, and
+# still denies everything it does list. If that Role ever gains a resource, add
+# it here in the same change.
+#
+# TESTING THIS BY HAND: strip the `app.kubernetes.io/instance` label and rename
+# the object first. That label is what makes ArgoCD adopt it, and this
+# Application runs prune+selfHeal, so a hand-applied copy carrying the label can
+# be pruned within about a second. The failure reads backwards — the policy is
+# gone, the create succeeds, and it looks like the policy does not work. Use a
+# before/after pair (real create must be ALLOWED with no policy, DENIED with it,
+# ALLOWED again after removing it), or a lone DENY may just be plain RBAC.
+# Note the Kyverno CLI cannot cover this rule: `--userinfo` can set
+# request.userInfo.username but nothing can set request.dryRun, so a CLI suite
+# can only ever exercise the deny branch — never the allow branch, which is the
+# one whose regression breaks the VAL-2 lane. Live verification is the only real
+# evidence here.
+#
+# Applying this emits: "Warning: system:serviceaccount:kyverno:
+# kyverno-reports-controller requires permissions get,list,watch for resource
+# Role". That is EXPECTED and benign — `background: false` means no background
+# scan runs, so the reports controller never needs to read Roles. Do not "fix"
+# it by widening the reports-controller's RBAC.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deploy-dryrun-sa-dryrun-only
+  labels:
+    app.kubernetes.io/instance: kyverno-policies
+  annotations:
+    policies.kyverno.io/title: Deploy dry-run SA may only dry-run (Factory#570)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: ServiceAccount
+    policies.kyverno.io/description: >-
+      Denies any non-dry-run create by system:serviceaccount:factory:tfactory-deploy-dryrun.
+      Server dry-run (kubectl create --dry-run=server), the only operation the
+      VAL-2 deploy lane performs, carries dryRun=All and is allowed. Factory#570.
+spec:
+  admission: true
+  background: false
+  emitWarning: false
+  failurePolicy: Ignore
+  rules:
+  - name: deny-non-dryrun-create
+    match:
+      any:
+      - resources:
+          namespaces: ["factory"]
+          # Mirrors the 17 resources Role/tfactory-deploy-dryrun grants create on.
+          kinds:
+          - Pod
+          - Deployment
+          - ReplicaSet
+          - StatefulSet
+          - DaemonSet
+          - Job
+          - CronJob
+          - ServiceAccount
+          - Role
+          - RoleBinding
+          - Secret
+          - Service
+          - ConfigMap
+          - PersistentVolumeClaim
+          - Ingress
+          - NetworkPolicy
+          - HorizontalPodAutoscaler
+    preconditions:
+      all:
+      - key: "{{ request.userInfo.username }}"
+        operator: Equals
+        value: system:serviceaccount:factory:tfactory-deploy-dryrun
+      - key: "{{ request.operation }}"
+        operator: Equals
+        value: CREATE
+      # dryRun is absent on a normal create, so default it rather than compare null.
+      - key: "{{ request.dryRun || `false` }}"
+        operator: Equals
+        value: false
+    validate:
+      failureAction: Enforce
+      message: >-
+        tfactory-deploy-dryrun is authorized for server dry-run only
+        (kubectl create --dry-run=server). A real, persisted create by this
+        ServiceAccount is a privilege-escalation primitive and is denied.
+        See Factory#570.
+      deny: {}
