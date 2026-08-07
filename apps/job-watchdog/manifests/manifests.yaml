@@ -286,13 +286,31 @@
 # PODS LEFT `Unknown` BY A NODE THAT CAME BACK (Factory#613)
 # ---------------------------------------------------------------------------
 #
-# `Unknown` means the kubelet stopped reporting for a pod the API server still
-# has. When a node is stranded and then returns, the kubelet does not re-adopt
-# what it lost: on 2026-08-06 `k3d-agent-0-0` was stranded by the nightly
+# When a node is stranded and then returns, the kubelet does not re-adopt what
+# it lost: on 2026-08-06 `k3d-agent-0-0` was stranded by the nightly
 # nixos-upgrade, came back Ready at 14:44:07Z, and `fleet-match-29767120-98nzc`
 # sat `Unknown` for over 30 hours afterwards. NO CONTROLLER OWNS THIS. Taint-
 # based eviction only fires while the node is NotReady; once it is Ready again
 # nothing revisits the pod.
+#
+# `Unknown` IS NOT THE POD PHASE, and the obvious rule would have matched
+# nothing. `kubectl get pods` printed `Unknown` in the STATUS column for 30
+# hours; that string is the CONTAINER's `state.terminated.reason`, which the
+# column prefers over the phase. Read on the live object, the pod's
+# `status.phase` is `Failed`. A check written as `phase == "Unknown"` — which is
+# what both the issue and the first draft of this change said — would have
+# reported a clean run while the row it was written for sat there untouched.
+# That is this app's own defect rebuilt inside its fix, and it was caught only
+# by running the rule against the live object instead of the description of it.
+#
+# The real discriminator is the attribution Factory#598 already built:
+# `reason: Unknown` means the kubelet had NO exit status to report, because the
+# runtime restarted underneath a running container. Nobody chose that 255. A pod
+# that exited 3 of its own accord is EVIDENCE of a failure and belongs to
+# whatever GC owns its history — five such `Error` pods are live in this
+# namespace right now and none of them may ever be touched. So the reap predicate
+# is `runtime_lost` attribution, not a phase string, and it reuses the rule that
+# is already deployed and already tested rather than inventing a second one.
 #
 # REAPING IS THE FIX, NOT EXCLUDING IT FROM HEALTH CHECKS. Both were on the
 # table and the choice matters:
@@ -307,9 +325,9 @@
 # that asks the ordinary question gets the ordinary answer. The condition
 # closes because the condition is GONE, which is the only close worth having.
 #
-# A POD `Unknown` BECAUSE ITS NODE IS GONE IS A DIFFERENT THING, and is NOT
-# reaped. While the node is NotReady the pod's status is merely unknown rather
-# than wrong — the container may well still be running — and deleting it would
+# A POD LOST BECAUSE ITS NODE IS GONE IS A DIFFERENT THING, and is NOT reaped.
+# While the node is NotReady the pod's status is merely unknown rather than
+# wrong — the container may well still be running — and deleting it would
 # produce a Terminating ghost that outlives the delete. So the rule requires the
 # node to be Ready AND to have been Ready for ORPHAN_REAP_AFTER_SECONDS: the
 # kubelet has been back long enough to have re-adopted this pod and did not.
@@ -327,8 +345,10 @@
 # THE ONE WRITE VERB. This is the first thing this app is allowed to change, and
 # the grant is `pods: delete` — nothing else, no `pods/eviction`, no `nodes`
 # write, no `deletecollection`. It is deliberately narrow, and the predicate
-# above is narrower still: phase `Unknown` only, on a node that has been Ready
-# for a quarter of an hour. A Running pod can never match it.
+# above is narrower still: a terminal pod whose EVERY termination attributes to
+# `runtime_lost`, on a node that has been Ready for a quarter of an hour. A
+# Running pod can never match it, and neither can a pod that reported its own
+# exit status.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -386,9 +406,11 @@ rules:
   #
   # Scoped as tightly as RBAC allows (`delete` on pods, not `deletecollection`,
   # not `pods/eviction`) and far more tightly than that in the code: the
-  # predicate is phase `Unknown` on a node that has been Ready for at least
-  # ORPHAN_REAP_AFTER_SECONDS. A Running pod cannot match it, and a pod on a
-  # node that is still down is deliberately left alone.
+  # predicate is a TERMINAL pod whose every container termination attributes to
+  # `runtime_lost` -- the kubelet had no exit status, so nobody chose it -- on a
+  # node that has been Ready for at least ORPHAN_REAP_AFTER_SECONDS. A Running
+  # pod cannot match it, a pod that reported its own exit code cannot match it,
+  # and a pod on a node that is still down is deliberately left alone.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["delete"]
@@ -1377,21 +1399,68 @@ data:
         return out
 
 
+    def abandoned_by_node(pod: dict) -> bool:
+        """Is this a row the node abandoned, rather than a pod that failed?
+
+        THE DISTINCTION IS THE ENTIRE SAFETY ARGUMENT for the delete verb, and
+        it is NOT the one the symptom suggests. `kubectl get pods` printed
+        `Unknown` for `fleet-match-29767120-98nzc` for 30 hours, and that string
+        is the CONTAINER's `state.terminated.reason`, which the STATUS column
+        prefers over the phase. The pod's `status.phase` is `Failed` -- verified
+        on the live object. A rule keyed on `phase == "Unknown"` would have
+        matched nothing at all and reported a clean run while the row it was
+        written for sat there, which is this app's own defect rebuilt inside its
+        fix.
+
+        What actually separates the case is the attribution already used for
+        Factory#598: `reason: Unknown` means the kubelet had NO exit status,
+        because the runtime or the kubelet restarted underneath a running
+        container. Nobody chose that 255. A pod that exited 3 of its own accord
+        is EVIDENCE of a failure and belongs to whatever GC owns its history --
+        the five `Error` pods live in this namespace right now are exactly that,
+        and none of them may ever be touched.
+
+        `all`, not `any`: if one container was lost but another reported a real
+        exit status, the pod carries evidence and is left alone. Conservative in
+        the only direction that matters for something that deletes.
+        """
+        st = pod.get("status") or {}
+        phase = st.get("phase")
+        if phase == "Unknown":
+            return True  # the classic NodeLost shape: no container status at all
+        if phase != "Failed":
+            return False
+        terms = [
+            (cs.get("state") or {}).get("terminated")
+            or (cs.get("lastState") or {}).get("terminated")
+            for cs in ((st.get("containerStatuses") or [])
+                       + (st.get("initContainerStatuses") or []))
+        ]
+        terms = [t for t in terms if t]
+        if not terms:
+            return False  # nothing to attribute; a guess here deletes something
+        return all(attribute_termination(t, st.get("reason"))[0] == "runtime_lost"
+                   for t in terms)
+
+
     def assess_orphan_pods(pods: list[dict], nodes: list[dict], now: datetime,
                            reaper, reap_after: int = ORPHAN_REAP_AFTER_SECONDS
                            ) -> list[dict]:
-        """Reap pods left `Unknown` by a node that came back, and say so (#613).
+        """Reap the rows a returning node abandoned, and say so (#613).
 
         `reaper(namespace, name) -> None | error string` does the delete; it is a
         parameter so the whole rule is testable without a cluster.
 
-        THE PREDICATE IS THE WHOLE ARGUMENT. Phase `Unknown` alone is not enough:
-        while a node is NotReady the pod's status is merely unknown rather than
-        wrong, and the container may well still be running. Requiring the node to
-        be Ready AND to have been Ready for `reap_after` is what separates a
-        STALE row from an unknown one -- the kubelet has been back long enough to
-        re-adopt this pod and has not. Nothing else in Kubernetes revisits it:
-        taint-based eviction only runs while the node is NotReady.
+        TWO CONDITIONS, AND BOTH ARE LOAD-BEARING. `abandoned_by_node` above
+        decides that the kubelet lost this container rather than the container
+        failing. This function decides that the loss is STALE rather than
+        unknown: the node must be Ready AND have been Ready for `reap_after`.
+        While a node is NotReady the pod's status is merely unknown -- the
+        container may well still be running -- and deleting it would produce a
+        Terminating ghost. Once the node is back, the kubelet re-adopts what it
+        can within seconds; a quarter of an hour later it is not going to, and
+        nothing else in Kubernetes revisits the row because taint-based eviction
+        only runs while the node is NotReady.
 
         A SUCCESSFUL REAP DOES NOT NOTIFY. The record carries no codes, so it
         lands in the stream as evidence and raises nothing -- same treatment
@@ -1414,7 +1483,7 @@ data:
 
         found: dict = {}
         for p in pods:
-            if (p.get("status") or {}).get("phase") != "Unknown":
+            if not abandoned_by_node(p):
                 continue
             meta = p.get("metadata") or {}
             node = (p.get("spec") or {}).get("nodeName") or ""
@@ -1443,13 +1512,15 @@ data:
         for node, victims in sorted(found.items()):
             failed = [v for v in victims if not v["reaped"]]
             problems = [
-                f"{len(victims)} pod(s) were still `Unknown` on node `{node}`, "
-                f"which has been Ready for {_dur(victims[0]['ready_for_seconds'])}. "
-                "`Unknown` means the kubelet stopped reporting for a pod the API "
-                "server still has; nothing re-adopts it once the node recovers, "
-                "so the row is stale rather than unknown and every "
-                "\"no pods outside Running/Succeeded\" check stays permanently "
-                "red for a reason unrelated to the current state of the fleet",
+                f"{len(victims)} pod(s) on node `{node}` carry a termination the "
+                "kubelet had NO exit status for -- the runtime was restarted "
+                "underneath a running container, so nobody chose that exit code. "
+                f"The node has been Ready for {_dur(victims[0]['ready_for_seconds'])} "
+                "and never re-adopted them. Nothing else reconciles this: "
+                "taint-based eviction only runs while the node is NotReady, so "
+                "once it recovers the row is permanent and every \"no pods "
+                "outside Running/Succeeded\" check stays red for a reason "
+                "unrelated to the current state of the fleet",
                 f"REAPED {len(victims) - len(failed)} of {len(victims)}: "
                 + ", ".join(f"`{v['namespace']}/{v['pod']}`" for v in victims),
             ]
@@ -1702,8 +1773,12 @@ data:
                 "Where to look first:",
                 "",
                 "```",
-                "kubectl --context factory get pods -A "
-                "--field-selector status.phase=Unknown -o wide",
+                "# NB `Unknown` in the STATUS column is the CONTAINER's "
+                "terminated reason, not status.phase (which is Failed):",
+                "kubectl --context factory get pods -A -o json | jq -r "
+                "'.items[] | select(any(.status.containerStatuses[]?; "
+                "(.state.terminated // .lastState.terminated // {}).reason == "
+                "\"Unknown\")) | \"\\(.metadata.namespace)/\\(.metadata.name)\"'",
                 "kubectl --context factory get nodes",
                 "```",
                 "",
@@ -2973,12 +3048,22 @@ data:
         # `fleet-match-29767120-98nzc` sat `Unknown` for 30h+ afterwards.
         # Nothing owns this: taint-based eviction only runs while the node is
         # NotReady, so once it recovers the stale row is permanent.
-        def unknown_pod(name, node, *, ns="factory", deleting=None, phase="Unknown"):
+        # THE FIXTURE IS THE LIVE OBJECT, field for field, because the obvious
+        # rule was wrong and only the live object said so. `kubectl get pods`
+        # printed `Unknown` in the STATUS column for 30 hours; that is the
+        # CONTAINER's state.terminated.reason. status.phase is `Failed`. A check
+        # written as `phase == "Unknown"` matches this pod NOT AT ALL.
+        def lost_pod(name, node, *, ns="factory", deleting=None, phase="Failed",
+                     reason="Unknown", code=255, statuses=None):
+            cs = ([] if statuses == [] else statuses or
+                  [{"name": "match", "restartCount": 0, "state": {"terminated": {
+                      "reason": reason, "exitCode": code,
+                      "finishedAt": "2026-08-06T14:41:58Z"}}}])
             return {
                 "metadata": {"name": name, "namespace": ns,
                              **({"deletionTimestamp": deleting} if deleting else {})},
                 "spec": {"nodeName": node},
-                "status": {"phase": phase},
+                "status": {"phase": phase, "containerStatuses": cs},
             }
 
         def notready(name, since):
@@ -2999,7 +3084,13 @@ data:
 
         stranded = datetime(2026, 8, 7, 21, 0, tzinfo=timezone.utc)
         back = term_node("k3d-agent-0-0", "2026-08-06T14:44:07Z")
-        orphan_pods = [unknown_pod("fleet-match-29767120-98nzc", "k3d-agent-0-0")]
+        orphan_pods = [lost_pod("fleet-match-29767120-98nzc", "k3d-agent-0-0")]
+
+        # 0. THE REGRESSION THAT ALMOST SHIPPED. The live pod's phase is
+        #    `Failed`, so the rule the issue describes matches nothing.
+        assert orphan_pods[0]["status"]["phase"] == "Failed", "the live shape"
+        assert abandoned_by_node(orphan_pods[0]), \
+            "the discriminator is the runtime_lost attribution, NOT the phase"
 
         # 1. THE REAP. The node has been Ready for 30h and the kubelet never
         #    re-adopted this pod, so the row is STALE, not unknown.
@@ -3039,14 +3130,45 @@ data:
             orphan_pods, [term_node("k3d-agent-0-0", "2026-08-07T11:44:59Z")],
             edge_now, ok_reaper)) == 1                                   # 901s
 
-        # 5. ONLY `Unknown`. This is the guard that keeps a delete verb safe: a
-        #    predicate that drifted phase-agnostic would reap the fleet.
+        # 5. THE GUARD THAT KEEPS A DELETE VERB SAFE, and the one assertion in
+        #    this file with a blast radius behind it. A pod that reported its own
+        #    exit status was NOT abandoned -- it failed, it is evidence, and
+        #    whatever GC owns its history owns it. Five such `Error` pods are
+        #    live in `factory` right now (cred-broker, trace-silence-check) and
+        #    the fixtures below are their exact shape.
         reaped.clear()
-        for phase in ("Running", "Pending", "Succeeded", "Failed"):
+        for reason, code in (("Error", 3), ("Error", 1), ("OOMKilled", 137),
+                             ("DeadlineExceeded", 1), ("Completed", 0)):
             assert assess_orphan_pods(
-                [unknown_pod("live", "k3d-agent-0-0", phase=phase)],
+                [lost_pod("real-failure", "k3d-agent-0-0", reason=reason,
+                          code=code)],
+                [back], stranded, ok_reaper) == [], (reason, code)
+        # Nor a pod that is not terminal at all.
+        for phase in ("Running", "Pending", "Succeeded"):
+            assert assess_orphan_pods(
+                [lost_pod("live", "k3d-agent-0-0", phase=phase)],
                 [back], stranded, ok_reaper) == [], phase
-        assert reaped == [], "only phase Unknown may ever be deleted"
+        # Nor one whose containers cannot be read: a guess here deletes something.
+        assert assess_orphan_pods(
+            [lost_pod("opaque", "k3d-agent-0-0", statuses=[])],
+            [back], stranded, ok_reaper) == []
+        # A pod where ONE container was lost and another reported a real exit
+        # code still carries evidence. `all`, not `any`.
+        assert assess_orphan_pods(
+            [lost_pod("mixed", "k3d-agent-0-0", statuses=[
+                {"name": "a", "state": {"terminated": {
+                    "reason": "Unknown", "exitCode": 255,
+                    "finishedAt": "2026-08-06T14:41:58Z"}}},
+                {"name": "b", "state": {"terminated": {
+                    "reason": "Error", "exitCode": 7,
+                    "finishedAt": "2026-08-06T14:41:58Z"}}}])],
+            [back], stranded, ok_reaper) == []
+        assert reaped == [], "nothing but an abandoned row may ever be deleted"
+        # The classic NodeLost shape -- phase Unknown, no container status at
+        # all -- is still covered; it is simply not the shape #613 turned out
+        # to be.
+        assert abandoned_by_node(
+            {"status": {"phase": "Unknown"}}), "NodeLost must still be reaped"
 
         # 6. A REAP THAT DID NOT WORK IS A FINDING, and a warning rather than a
         #    critical: stale rows are not a workload being down.
@@ -3060,7 +3182,7 @@ data:
         # again: reissuing a delete that did nothing is a silent no-op loop.
         reaped.clear()
         again = assess_orphan_pods(
-            [unknown_pod("fleet-match-29767120-98nzc", "k3d-agent-0-0",
+            [lost_pod("fleet-match-29767120-98nzc", "k3d-agent-0-0",
                          deleting="2026-08-07T20:00:00Z")],
             [back], stranded, ok_reaper)[0]
         assert reaped == [], "a pod already Terminating must not be re-deleted"
@@ -3071,7 +3193,7 @@ data:
         #    issue per victim is CFactory#306 by volume.
         reaped.clear()
         many_recs = assess_orphan_pods(
-            [unknown_pod(f"p-{i}", "k3d-agent-0-0", ns=f"ns-{i}") for i in range(4)],
+            [lost_pod(f"p-{i}", "k3d-agent-0-0", ns=f"ns-{i}") for i in range(4)],
             [back], stranded, ok_reaper)
         assert len(many_recs) == 1 and len(many_recs[0]["victims"]) == 4
         assert len(reaped) == 4
