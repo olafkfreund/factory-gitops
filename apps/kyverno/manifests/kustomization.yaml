@@ -192,7 +192,7 @@ patches:
   #     kyverno-ghcr-pull` -> NotFound), so the flag was doing nothing; and
   #   - Factory#566 measured what it does when it IS satisfied by a wrong or
   #     EXPIRED credential: the keychain does not fall back to the anonymous
-  #     path, so ALL SIXTEEN covered images go unverified at once, not just the
+  #     path, so EVERY covered image goes unverified at once, not just the
   #     private ones. Classic PATs default to 30-day expiry. Leaving a dormant
   #     flag pointing at a Secret nobody maintains puts that whole-fleet failure
   #     in front of Factory#522's Enforce flip in exchange for nothing.

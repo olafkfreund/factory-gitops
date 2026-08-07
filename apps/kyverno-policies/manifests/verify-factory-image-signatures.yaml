@@ -409,8 +409,8 @@ spec:
     # IT WAS NOT FIXED WITH A CREDENTIAL. That path was built (a
     # `--imagePullSecrets=kyverno-ghcr-pull` flag on both verifying
     # controllers) and is now removed: the Secret was never created, and
-    # Factory#566 measured that a wrong or EXPIRED one unverifies ALL SIXTEEN
-    # covered images rather than degrading to the anonymous path. See
+    # Factory#566 measured that a wrong or EXPIRED one unverifies EVERY
+    # covered image rather than degrading to the anonymous path. See
     # apps/kyverno/manifests/kustomization.yaml.
     #
     # It was also NOT fixed by excluding these two images from the rule. An
