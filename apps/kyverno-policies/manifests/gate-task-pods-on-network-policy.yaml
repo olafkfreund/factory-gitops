@@ -1,0 +1,318 @@
+# Hold every task pod at the gate until its NetworkPolicy is actually enforced.
+#
+# THE DEFECT THIS FIXES (Factory#517, Factory#42)
+# -----------------------------------------------
+# `factory-sandbox-jobs-egress` is enforced -- that is measured and not in
+# doubt. But it is not enforced YET at the moment a task pod starts running, and
+# a task pod runs untrusted, model-generated code. Startup is the one instant an
+# attacker fully controls: whatever a malicious build step puts first, runs
+# first. The control was fail-closed in steady state and fail-open at exactly
+# the moment that matters.
+#
+# MEASURED ON THIS CLUSTER, from the probe pod's own entrypoint so no exec
+# latency is in the loop. Every destination below is denied in steady state:
+#
+#   t+0ms    ext-http=CONNECT dns-exfil=CONNECT kubelet=CONNECT
+#   ...      ~100 further rounds, all CONNECT
+#   t+110ms  ext-http=blocked dns-exfil=blocked kubelet=blocked
+#
+# Three independent runs put the window at 110ms, 690ms and 820ms. It is a race,
+# so the number is a sample, not a bound -- a loaded node makes it longer.
+#
+# IT IS NOT ONLY EGRESS. In the window a task pod could also
+#   - resolve through ANY resolver (8.8.8.8:53 connected), a DNS covert channel
+#     that never touches the cluster resolver,
+#   - reach the node's own kubelet on :10250,
+#   - reach in-namespace pods the policy exists to keep it away from, and
+#   - ACCEPT INBOUND. Demonstrated with a pair: the victim task pod leaked its
+#     own IP out through the window and an unprivileged pod connected straight
+#     back into it on a random port. `ingress at reveal-time: OPEN`, and
+#     `ingress at +8s: blocked`. Ingress is default-deny here with no rules at
+#     all, so that connection is purely the window.
+#
+# WHY NO NETWORKPOLICY CHANGE CAN FIX THIS -- DO NOT TRY
+# ------------------------------------------------------
+# k3s's embedded kube-router enforces policy as PER-POD-IP iptables jump rules:
+#
+#   -A KUBE-ROUTER-INPUT  -s 10.42.0.x/32 ... -j KUBE-POD-FW-<hash>
+#   -A KUBE-ROUTER-OUTPUT -d 10.42.0.x/32 ... -j KUBE-POD-FW-<hash>
+#
+# Those rules are written by a pod-informer callback, so they cannot exist until
+# the pod has an IP -- and the container is unpaused at that same moment. The
+# gap is between "pod has an IP and is running" and "kube-router got the watch
+# event and finished its iptables write". Nothing expressible in the
+# NetworkPolicy API moves that write earlier.
+#
+# In particular, "just add a namespace-wide default-deny so there is no
+# permissive default" DOES NOT WORK, and this was tested rather than assumed. In
+# a throwaway namespace, with a `podSelector: {}` default-deny created minutes
+# BEFORE any pod existed, a fresh pod still connected to a denied destination
+# for its first 820ms. The policy object's age is irrelevant; what lags is the
+# per-pod-IP rule, and every policy is compiled down to those.
+#
+# The only other real closure is a CNI that programs the datapath inside CNI ADD
+# (Calico, Cilium). That is a cluster rebuild and disproportionate on its own.
+# So the fix is not to make the network faster -- it is to stop the workload
+# from running until the network is ready, which is what this policy does.
+#
+# WHY AN ADMISSION MUTATION RATHER THAN EDITING THE JOB BUILDERS
+# --------------------------------------------------------------
+# Task pods are built in code, in four dispatch lanes across two repos
+# (AIFactory `core/job_dispatch.py` and `core/kube_sandbox.py`, and TFactory's
+# equivalents). Factory#502 is the standing lesson from that shape: a control
+# that enumerates lanes covered two of four for months. This selects the same
+# `factory.io/kind=task` label the NetworkPolicy selects, so a fifth lane is
+# gated the day it is written, by the same axis, with no code change.
+#
+# KNOWN GAP, STATED PLAINLY. `failurePolicy: Ignore` means that if the Kyverno
+# admission controller is down when a task pod is created, the pod is admitted
+# WITHOUT the gate and the window is back. That is deliberate and it is the
+# smaller risk -- see BLAST RADIUS below -- but it is a real hole and it is not
+# closed by this file. It differs from the hole it replaces in one way that
+# matters: an attacker inside a task pod controls what runs first, but cannot
+# cause a Kyverno outage. Factory#620 tracks scoping a `Fail` webhook narrowly
+# enough to close it.
+#
+# ---------------------------------------------------------------------------
+# BLAST RADIUS -- read before editing.
+#
+# 1. failurePolicy: Ignore  <- DO NOT CHANGE TO Fail IN THIS FILE.
+#    Kyverno does not register one webhook per policy. Today the cluster has a
+#    single `mutate.kyverno.svc-ignore` entry whose rules already cover
+#    pods, jobs, deployments, daemonsets, statefulsets and replicasets, cluster
+#    wide, with `objectSelector: {}`. Setting `Fail` here adds a
+#    `mutate.kyverno.svc-fail` sibling with THE SAME BROAD RULES -- so a Kyverno
+#    admission outage would stop every pod, Job and Deployment write in the
+#    cluster, ArgoCD and the control plane included. Kyverno v1.18.2 does
+#    support `spec.webhookConfiguration.matchConditions` to scope that down to
+#    the task label, and that is the right way to earn `Fail` later, but it must
+#    be verified by reading back the generated webhook FIRST. Flipping this
+#    field on its own is a cluster outage waiting for the next Kyverno restart,
+#    and the Kyverno controllers on this cluster have restarted hundreds of
+#    times.
+#
+# 2. The gate can only ever delay a task pod, never a control-plane one. It is
+#    matched on `factory.io/kind=task` in the `factory` namespace, which is the
+#    same selector the NetworkPolicy uses, and nothing in cluster bootstrap
+#    carries that label.
+#
+# 3. If the gate never passes, the pod FAILS after 60s rather than running
+#    unconfined. A failed build is the correct outcome; it is loud, and it is
+#    recoverable. See the two-sided check in the script for why the gate cannot
+#    be tricked into passing by a pod that simply has no network.
+#
+# VALIDATE ANY EDIT AGAINST THE LIVE WEBHOOK BEFORE MERGING:
+#   kubectl --context factory apply --dry-run=server -f <this file>
+#   kyverno test apps/kyverno-policies/tests/kyverno-test-gate-task-pods-on-network-policy.yaml
+# A policy Kyverno rejects is a file ArgoCD cannot apply, and ArgoCD then keeps
+# serving the previous version while reporting Healthy (Factory#430). And a
+# mutate rule that fires while injecting nothing is schema-valid, applies
+# cleanly and reports Ready -- so the test asserts `patchedResources`, the
+# produced object, not merely that the rule ran.
+# ---------------------------------------------------------------------------
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: gate-task-pods-on-network-policy
+  annotations:
+    policies.kyverno.io/title: Gate task pods on their NetworkPolicy being enforced
+    policies.kyverno.io/category: Sandbox Isolation
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      k3s's embedded kube-router programs a pod's NetworkPolicy as per-pod-IP
+      iptables rules written after the pod is already running, leaving a task
+      pod with unrestricted ingress and egress for its first few hundred
+      milliseconds. This injects a netpol-gate init container that blocks until
+      a denied destination is actually refused while an allowed one still
+      connects, so untrusted task code never runs inside that window.
+spec:
+  admission: true
+  # Nothing to re-evaluate in a background scan: this mutates at admission and
+  # has no `targets`.
+  background: false
+  # See BLAST RADIUS note 1. This is spec-level in kyverno.io/v1; a rule-level
+  # failurePolicy is rejected by the API server with a strict-decoding error.
+  failurePolicy: Ignore
+  rules:
+    # Rule 1 exists only so rule 2 can insert at index 0 unconditionally.
+    # JSON Patch `add` to /spec/initContainers/0 requires the array to exist,
+    # and both shapes occur in the wild today: `kube_sandbox.py` sets an
+    # initContainer (`seed-nix-store`), `job_dispatch.py` sets none.
+    #
+    # This must NOT be folded into rule 2 as a leading `add /spec/initContainers
+    # value: []`. JSON Patch `add` on an EXISTING member REPLACES it, so that
+    # would silently delete seed-nix-store and every task pod using a warm nix
+    # store would break. The precondition is what keeps the two cases apart.
+    #
+    # Kyverno applies mutate rules in order and feeds each rule the previous
+    # rule's output, so rule 2 sees the array this creates. That is asserted by
+    # the `no-init-containers` case in the test suite, which checks the produced
+    # pod, not that the rules fired.
+    - name: ensure-init-containers-array
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - factory
+              operations:
+                - CREATE
+              selector:
+                matchLabels:
+                  factory.io/kind: task
+      preconditions:
+        all:
+          - key: '{{ length(request.object.spec.initContainers || `[]`) }}'
+            operator: Equals
+            value: 0
+      mutate:
+        patchesJson6902: |-
+          - path: /spec/initContainers
+            op: add
+            value: []
+
+    # Rule 2 puts the gate FIRST, ahead of any existing init container.
+    #
+    # First, not last, on purpose. Last would still keep untrusted task code out
+    # of the window -- that lives in the main container -- but it would let
+    # every init container run unconfined. `seed-nix-store` happens to make no
+    # network calls today, and resting a security boundary on that staying true
+    # is how the next init container quietly gets a free 700ms.
+    - name: inject-netpol-gate
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - factory
+              operations:
+                - CREATE
+              selector:
+                matchLabels:
+                  factory.io/kind: task
+      # LOAD-BEARING IDEMPOTENCY GUARD. Without it EVERY task pod is REJECTED:
+      #   The Pod "..." is invalid: spec.initContainers[1].name:
+      #   Duplicate value: "netpol-gate"
+      #
+      # Kyverno's resource mutating webhook is registered with
+      # `reinvocationPolicy: IfNeeded`, so the API server calls it AGAIN
+      # whenever another webhook alters the object in the same admission. A
+      # JSON Patch `add` at an index is not idempotent -- the second invocation
+      # cheerfully inserts a second gate -- and the pod then fails API
+      # validation on the duplicate container name. This is the difference
+      # between a mutation that is merely correct once and one that is correct
+      # under reinvocation.
+      #
+      # Rule 1 needs no such guard: its own `length == 0` precondition is
+      # already false on the second pass.
+      #
+      # Caught only on the live cluster. The offline `kyverno test` engine
+      # applies each rule once and reports a clean pass, so the suite now
+      # carries an explicit `task-already-gated` case standing in for the
+      # reinvocation pass. Do not delete it as redundant -- it is the only
+      # thing between this rule and rejecting every task pod in the fleet.
+      preconditions:
+        all:
+          - key: "{{ length(request.object.spec.initContainers[?name == 'netpol-gate'] || `[]`) }}"
+            operator: Equals
+            value: 0
+      mutate:
+        patchesJson6902: |-
+          - path: /spec/initContainers/0
+            op: add
+            value:
+              name: netpol-gate
+              # busybox is already this repo's convention for tiny utility
+              # containers and is cached on both nodes, so the gate adds no pull.
+              # All it needs is `nc`.
+              image: busybox:1.36
+              env:
+                # The gate's deny leg is this pod's OWN node's kubelet, so the
+                # address has to come from the downward API rather than be
+                # baked in -- pods land on either node.
+                - name: HOST_IP
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: status.hostIP
+              command:
+                - sh
+                - -c
+                - |
+                  # Block until this pod's NetworkPolicy is actually in force.
+                  #
+                  # THE CHECK IS TWO-SIDED ON PURPOSE. "A denied destination
+                  # refused me" is on its own worthless: it is equally true of a
+                  # pod with no working network at all, so a one-sided gate
+                  # would wave through exactly the pods that are least healthy,
+                  # fail-open wearing a fail-closed mask. It cannot tell
+                  # "policy programmed" from "nothing was ever reachable".
+                  # Both legs must hold at the same time:
+                  #
+                  #   ALLOW  10.43.0.1:443   kubernetes API ClusterIP, permitted
+                  #                          by egress rule 4. Must CONNECT ->
+                  #                          the datapath is up.
+                  #   DENY   $HOST_IP:10250  kubelet on this pod's own node.
+                  #                          Must REFUSE -> the policy is live.
+                  #
+                  # The deny leg is chosen so it cannot go stale or flap:
+                  # kubelet is always listening (it is the process that started
+                  # this pod), and no egress rule reaches it -- 172.16/12 is
+                  # excluded from the public-443 rule and :10250 appears
+                  # nowhere else. Verified against an unlabelled control pod,
+                  # which CONNECTS to the same address; without that control,
+                  # "blocked" could just mean "nothing is listening there".
+                  # Neither leg depends on a Factory workload being up, so no
+                  # service outage can wedge a build behind this gate.
+                  #
+                  # NO DOLLAR-PAREN ANYWHERE BELOW, DELIBERATELY -- not in the
+                  # code and not in these comments either. Kyverno reads
+                  # dollar-paren as its OWN variable syntax and rejects the
+                  # whole policy at admission with "got nil resolved variable".
+                  # That applies to the entire patch string, comments included,
+                  # so writing the forbidden form even to warn about it is
+                  # itself rejected. Hence backticks and `expr` in place of
+                  # command substitution and shell arithmetic. This is not a
+                  # style choice and it will not survive being "modernised".
+                  set -u
+                  allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; }
+                  denied()  { ! nc -z -w1 "$HOST_IP" 10250 >/dev/null 2>&1; }
+
+                  i=0
+                  while [ "$i" -lt 60 ]; do
+                    # Sampled twice: one dropped SYN must not read as an
+                    # enforced policy. `allowed` is re-checked between the two
+                    # so a datapath that dies mid-check cannot pass either.
+                    if allowed && denied && allowed && denied; then
+                      echo "netpol-gate: enforced at poll $i"
+                      exit 0
+                    fi
+                    i=`expr $i + 1`
+                    # Poll spacing only. The loop exits on evidence, never on
+                    # elapsed time; replacing the whole gate with a sleep is
+                    # the thing this is here to avoid.
+                    sleep 1
+                  done
+                  # Fail closed. A build that never starts beats a build that
+                  # starts unconfined.
+                  echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
+                  exit 1
+              securityContext:
+                # Task pods pin runAsNonRoot at pod level, and busybox's default
+                # user is root, so the uid has to be explicit or the kubelet
+                # refuses to start the container.
+                runAsUser: 65534
+                runAsGroup: 65534
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  memory: 32Mi

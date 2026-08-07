@@ -1,0 +1,168 @@
+# Expected output of gate-task-pods-on-network-policy for the two task
+# pod shapes in resources-gate-task-pods-on-network-policy.yaml.
+#
+# The netpol-gate container here is a copy of the `value:` block in the
+# policy's inject-netpol-gate rule. IF YOU EDIT THE GATE SCRIPT, EDIT IT
+# HERE TOO -- the suite compares the produced pod byte for byte and will
+# fail until the two agree. That is deliberate: it means the script
+# cannot be changed without someone looking at what task pods actually
+# end up running.
+#
+# The assertions that matter are structural: netpol-gate is
+# initContainers[0] in BOTH pods, and in task-with-init the original
+# seed-nix-store is still there, still second, still holding its own
+# image and command. `task-already-gated` deliberately has NO patched
+# form -- the idempotency precondition skips it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: task-no-init
+  namespace: factory
+  labels:
+    app: aifactory-task
+    factory.io/kind: task
+spec:
+  restartPolicy: Never
+  containers:
+  - name: coder
+    image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
+  initContainers:
+  - name: netpol-gate
+    image: busybox:1.36
+    env:
+    - name: HOST_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    command:
+    - sh
+    - -c
+    - "# Block until this pod's NetworkPolicy is actually in force.\n#\n# THE CHECK\
+      \ IS TWO-SIDED ON PURPOSE. \"A denied destination\n# refused me\" is on its\
+      \ own worthless: it is equally true of a\n# pod with no working network at all,\
+      \ so a one-sided gate\n# would wave through exactly the pods that are least\
+      \ healthy,\n# fail-open wearing a fail-closed mask. It cannot tell\n# \"policy\
+      \ programmed\" from \"nothing was ever reachable\".\n# Both legs must hold at\
+      \ the same time:\n#\n#   ALLOW  10.43.0.1:443   kubernetes API ClusterIP, permitted\n\
+      #                          by egress rule 4. Must CONNECT ->\n#            \
+      \              the datapath is up.\n#   DENY   $HOST_IP:10250  kubelet on this\
+      \ pod's own node.\n#                          Must REFUSE -> the policy is live.\n\
+      #\n# The deny leg is chosen so it cannot go stale or flap:\n# kubelet is always\
+      \ listening (it is the process that started\n# this pod), and no egress rule\
+      \ reaches it -- 172.16/12 is\n# excluded from the public-443 rule and :10250\
+      \ appears\n# nowhere else. Verified against an unlabelled control pod,\n# which\
+      \ CONNECTS to the same address; without that control,\n# \"blocked\" could just\
+      \ mean \"nothing is listening there\".\n# Neither leg depends on a Factory workload\
+      \ being up, so no\n# service outage can wedge a build behind this gate.\n#\n\
+      # NO DOLLAR-PAREN ANYWHERE BELOW, DELIBERATELY -- not in the\n# code and not\
+      \ in these comments either. Kyverno reads\n# dollar-paren as its OWN variable\
+      \ syntax and rejects the\n# whole policy at admission with \"got nil resolved\
+      \ variable\".\n# That applies to the entire patch string, comments included,\n\
+      # so writing the forbidden form even to warn about it is\n# itself rejected.\
+      \ Hence backticks and `expr` in place of\n# command substitution and shell arithmetic.\
+      \ This is not a\n# style choice and it will not survive being \"modernised\"\
+      .\nset -u\nallowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; }\ndenied()\
+      \  { ! nc -z -w1 \"$HOST_IP\" 10250 >/dev/null 2>&1; }\n\ni=0\nwhile [ \"$i\"\
+      \ -lt 60 ]; do\n  # Sampled twice: one dropped SYN must not read as an\n  #\
+      \ enforced policy. `allowed` is re-checked between the two\n  # so a datapath\
+      \ that dies mid-check cannot pass either.\n  if allowed && denied && allowed\
+      \ && denied; then\n    echo \"netpol-gate: enforced at poll $i\"\n    exit 0\n\
+      \  fi\n  i=`expr $i + 1`\n  # Poll spacing only. The loop exits on evidence,\
+      \ never on\n  # elapsed time; replacing the whole gate with a sleep is\n  #\
+      \ the thing this is here to avoid.\n  sleep 1\ndone\n# Fail closed. A build\
+      \ that never starts beats a build that\n# starts unconfined.\necho \"netpol-gate:\
+      \ NOT enforced after 60 polls -- refusing to start the task\" >&2\nexit 1\n"
+    securityContext:
+      runAsUser: 65534
+      runAsGroup: 65534
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        memory: 32Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: task-with-init
+  namespace: factory
+  labels:
+    app: aifactory-sandbox
+    factory.io/kind: task
+spec:
+  restartPolicy: Never
+  initContainers:
+  - name: netpol-gate
+    image: busybox:1.36
+    env:
+    - name: HOST_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    command:
+    - sh
+    - -c
+    - "# Block until this pod's NetworkPolicy is actually in force.\n#\n# THE CHECK\
+      \ IS TWO-SIDED ON PURPOSE. \"A denied destination\n# refused me\" is on its\
+      \ own worthless: it is equally true of a\n# pod with no working network at all,\
+      \ so a one-sided gate\n# would wave through exactly the pods that are least\
+      \ healthy,\n# fail-open wearing a fail-closed mask. It cannot tell\n# \"policy\
+      \ programmed\" from \"nothing was ever reachable\".\n# Both legs must hold at\
+      \ the same time:\n#\n#   ALLOW  10.43.0.1:443   kubernetes API ClusterIP, permitted\n\
+      #                          by egress rule 4. Must CONNECT ->\n#            \
+      \              the datapath is up.\n#   DENY   $HOST_IP:10250  kubelet on this\
+      \ pod's own node.\n#                          Must REFUSE -> the policy is live.\n\
+      #\n# The deny leg is chosen so it cannot go stale or flap:\n# kubelet is always\
+      \ listening (it is the process that started\n# this pod), and no egress rule\
+      \ reaches it -- 172.16/12 is\n# excluded from the public-443 rule and :10250\
+      \ appears\n# nowhere else. Verified against an unlabelled control pod,\n# which\
+      \ CONNECTS to the same address; without that control,\n# \"blocked\" could just\
+      \ mean \"nothing is listening there\".\n# Neither leg depends on a Factory workload\
+      \ being up, so no\n# service outage can wedge a build behind this gate.\n#\n\
+      # NO DOLLAR-PAREN ANYWHERE BELOW, DELIBERATELY -- not in the\n# code and not\
+      \ in these comments either. Kyverno reads\n# dollar-paren as its OWN variable\
+      \ syntax and rejects the\n# whole policy at admission with \"got nil resolved\
+      \ variable\".\n# That applies to the entire patch string, comments included,\n\
+      # so writing the forbidden form even to warn about it is\n# itself rejected.\
+      \ Hence backticks and `expr` in place of\n# command substitution and shell arithmetic.\
+      \ This is not a\n# style choice and it will not survive being \"modernised\"\
+      .\nset -u\nallowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; }\ndenied()\
+      \  { ! nc -z -w1 \"$HOST_IP\" 10250 >/dev/null 2>&1; }\n\ni=0\nwhile [ \"$i\"\
+      \ -lt 60 ]; do\n  # Sampled twice: one dropped SYN must not read as an\n  #\
+      \ enforced policy. `allowed` is re-checked between the two\n  # so a datapath\
+      \ that dies mid-check cannot pass either.\n  if allowed && denied && allowed\
+      \ && denied; then\n    echo \"netpol-gate: enforced at poll $i\"\n    exit 0\n\
+      \  fi\n  i=`expr $i + 1`\n  # Poll spacing only. The loop exits on evidence,\
+      \ never on\n  # elapsed time; replacing the whole gate with a sleep is\n  #\
+      \ the thing this is here to avoid.\n  sleep 1\ndone\n# Fail closed. A build\
+      \ that never starts beats a build that\n# starts unconfined.\necho \"netpol-gate:\
+      \ NOT enforced after 60 polls -- refusing to start the task\" >&2\nexit 1\n"
+    securityContext:
+      runAsUser: 65534
+      runAsGroup: 65534
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        memory: 32Mi
+  - name: seed-nix-store
+    image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
+    command:
+    - sh
+    - -c
+    - echo seed
+  containers:
+  - name: gate
+    image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
