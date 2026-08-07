@@ -89,6 +89,7 @@ spec:
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           ports:
             - { containerPort: 5080, name: http }
             - { containerPort: 5081, name: grpc }
