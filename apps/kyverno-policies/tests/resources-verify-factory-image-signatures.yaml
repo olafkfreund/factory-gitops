@@ -1,0 +1,137 @@
+# Test fixtures for verify-factory-image-signatures (factory-gitops#145).
+#
+# EVERY Pod in this file must be matched by NO rule in that policy. Each one is
+# either a near-miss of a real glob, or a shape the fleet has already been
+# bitten by. None of them is filler, and none of them may ever start producing
+# a result -- see the header of kyverno-test-verify-factory-image-signatures.yaml
+# for why that is the only direction this suite can assert.
+---
+# `ghcr.io/olafkfreund/aifactory:*` needs the literal `:`. A repository whose
+# name merely STARTS with `aifactory` is a different package with a different
+# publishing workflow, and widening the glob to `aifactory*` would quietly put
+# this policy's AIFactory signer identity in front of it.
+apiVersion: v1
+kind: Pod
+metadata: {name: near-aifactory-worker, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory-worker:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: near-pfactory-planner, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/pfactory-planner:v1"}]
+---
+# Two globs at once. `tfactory:*` does not match it (no literal `:` after
+# `tfactory`), and `tfactory-runner-*` does not match it either -- that glob
+# requires the TRAILING DASH, so the bare repository name is outside it. The
+# eleven real runners are `tfactory-runner-<lane>`.
+apiVersion: v1
+kind: Pod
+metadata: {name: near-tfactory-runner-bare, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/tfactory-runner:v1"}]
+---
+# The exact shape that forces `cfactory-frontend:*` to be listed separately in
+# the policy. If `cfactory:*` is ever "simplified" to `cfactory*`, this starts
+# matching and this case turns red.
+apiVersion: v1
+kind: Pod
+metadata: {name: near-cfactory-backend, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/cfactory-backend:v1"}]
+---
+# Same test in the other direction: a name that extends `cfactory-frontend`.
+apiVersion: v1
+kind: Pod
+metadata: {name: near-cfactory-frontend-preview, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/cfactory-frontend-preview:v1"}]
+---
+# THE Factory#564 TRAP. `skillai:*` not matching `skillai-migrator:*` is why the
+# policy lists both, and `skillai-worker` is the next name in that family that
+# nobody has created yet. A glob widened to `skillai*` would swallow it AND
+# apply SkillAi's non-main ref anchor (refs/heads/core-mvp-foundation) to a
+# package that may not publish from that branch at all.
+apiVersion: v1
+kind: Pod
+metadata: {name: near-skillai-worker, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/skillai-worker:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: near-skillai-migrator-tools, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/skillai-migrator-tools:v1"}]
+---
+# A near-miss hiding in an initContainer. Kyverno extracts images from
+# initContainers and ephemeralContainers as well as containers, so a widened
+# glob reaches here too -- and this is where the first draft of the JMESPath in
+# require-first-party-signature-coverage went wrong.
+apiVersion: v1
+kind: Pod
+metadata: {name: near-miss-in-initcontainer, namespace: factory}
+spec:
+  initContainers: [{name: i, image: "ghcr.io/olafkfreund/aifactory-worker:v1"}]
+  containers: [{name: c, image: "busybox:1.36"}]
+---
+# DELIBERATELY UNCOVERED, Factory#572. `odin` is first-party and signed, but its
+# GHCR package is private and `kyverno-ghcr-pull` does not cover it, so a rule
+# here would report the Factory#430 registry-auth ambiguity as a permanent red.
+# Its absence is intentional and is reported honestly by
+# require-first-party-signature-coverage instead. If this case ever turns red,
+# a rule was added -- check the credential exists before celebrating.
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-odin, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/odin:sha-2749b26"}]
+---
+# A DIGEST-PINNED first-party image is matched by none of these globs: they all
+# end in a literal `:`, and a digest reference has `@` there instead. This is
+# the same finding as `uncovered-digest-pinned` in resources.yaml, asserted
+# here against the policy that would have to do the verifying. It is a real
+# hole, not a test artefact: pin a factory Deployment to a digest today and its
+# signature stops being checked. Tracked by the coverage policy, which reports
+# exactly this Pod as uncovered.
+apiVersion: v1
+kind: Pod
+metadata: {name: digest-pinned-first-party, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
+---
+# Another account's package with our repository name, on the same registry.
+# Verifying it against OUR signer identity would be wrong in both directions.
+apiVersion: v1
+kind: Pod
+metadata: {name: other-owner-same-name, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/someoneelse/aifactory:v1"}]
+---
+# Our name, a different registry. The globs are anchored on `ghcr.io/`.
+apiVersion: v1
+kind: Pod
+metadata: {name: other-registry-same-name, namespace: factory}
+spec:
+  containers: [{name: c, image: "docker.io/olafkfreund/aifactory:v1"}]
+---
+# Third-party images are out of scope BY DESIGN. This policy makes no claim
+# about them; require-first-party-signature-coverage makes none either.
+apiVersion: v1
+kind: Pod
+metadata: {name: thirdparty-out-of-scope, namespace: factory}
+spec:
+  containers:
+    - {name: a, image: "postgres:16.4"}
+    - {name: b, image: "quay.io/keycloak/keycloak:26.1"}
+---
+# NAMESPACE SCOPE. Every rule matches `namespaces: [factory]` only. A covered
+# image outside that namespace must produce nothing. If this turns red the
+# policy has grown a scope nobody agreed to -- and at Enforce (Factory#522)
+# that would put a Rekor round trip in front of Pods in other namespaces.
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-image-wrong-namespace, namespace: default}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:sha-6b116ee"}]
