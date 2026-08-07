@@ -41,7 +41,6 @@ spec:
       # Factory#504's chart-vs-gitops gate now compares this value against
       # charts/pfactory/values.yaml, so the two engines cannot drift apart again.
       # Related: Factory#42 (sandbox), Factory#570 (deploy identity blast radius).
-      automountServiceAccountToken: false
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       # Factory#503. Every CronJob in this namespace has carried this set since
