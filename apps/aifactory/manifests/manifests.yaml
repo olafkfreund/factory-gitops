@@ -48,6 +48,20 @@ spec:
     metadata: { labels: { app: aifactory } }
     spec:
       serviceAccountName: aifactory-sandbox
+      # Factory#550. This pod DOES need its SA token, and says so rather than
+      # inheriting the default. Four call sites load in-cluster credentials —
+      # core/kube_sandbox.py, web-server/services/{build_backend,build_log_stream,
+      # k8s_client}.py — plus core/mcp_credentials.py and services/vault_client.py
+      # read /var/run/secrets/kubernetes.io/serviceaccount/token directly. The
+      # aifactory-sandbox Role below is what those calls are scoped to.
+      #
+      # Setting this false would break Job-per-task (RFC-0016), which is why
+      # Factory#550 verified per workload instead of flipping the fleet. The
+      # value is stated so Factory#504's gate can hold chart and cluster to the
+      # SAME answer: charts/aifactory/values.yaml previously declared `false` on
+      # the ServiceAccount and renders no pod-level override, i.e. the published
+      # chart would have shipped a broken install.
+      automountServiceAccountToken: true
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       # Factory#503. Every CronJob in this namespace has carried this set since
