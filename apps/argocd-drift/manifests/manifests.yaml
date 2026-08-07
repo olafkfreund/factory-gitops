@@ -106,6 +106,48 @@ roleRef:
   name: argocd-drift
   apiGroup: rbac.authorization.k8s.io
 ---
+# Factory#639. Signal 5 compares each workload's LIVE security fields against
+# the manifest ArgoCD last applied to it, so it must read the workloads
+# themselves -- which the Application-only Role above cannot see.
+#
+# WHY THIS ONE IS A ClusterRole, following apps/job-watchdog (Factory#571).
+# A namespaced Role would scope this to `factory` and leave every other
+# namespace unwatched, and an unwatched namespace reports "no drift" for the
+# part of the cluster nobody is looking at -- the same false green this app
+# exists to abolish. It is also self-defeating here specifically: a namespace
+# added later would silently never be examined, which is the Factory#642 defect
+# (a check that examined nothing and reported nothing) built in by design.
+#
+# Least privilege is preserved where it counts: get/list only, no write verb,
+# no secrets, no pods/log, no pods/exec. The scope widens; the power does not.
+# Note these four kinds are read for their pod TEMPLATE, not their pods.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-drift
+  labels: { app: argocd-drift }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-drift
+  labels: { app: argocd-drift }
+subjects:
+  - kind: ServiceAccount
+    name: argocd-drift
+    namespace: factory
+roleRef:
+  kind: ClusterRole
+  name: argocd-drift
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -455,6 +497,202 @@ data:
         }
 
 
+    # ---- SIGNAL 5: ADDITIVE SECURITY DRIFT (Factory#639) -------------------
+    #
+    # Signals 1-4 all read ArgoCD's own opinion. This one does not, because for
+    # this class of drift ArgoCD's opinion is structurally blind.
+    #
+    # MEASURED ON THIS CLUSTER 2026-08-07, one object, one reconcile loop, with
+    # syncPolicy.automated.selfHeal TRUE the whole time:
+    #   23:27:32  kubectl patch cronjob/endpoint-guard adding BOTH
+    #               automountServiceAccountToken: true   (git does NOT declare it)
+    #               securityContext.runAsUser: 65533     (git DOES declare 65532)
+    #   t=3s      sync=OutOfSync, both fields live
+    #   t=6s      runAsUser reverted to 65532, sync=Synced
+    #   t=6..120s automountServiceAccountToken STILL true, sync=Synced/Healthy
+    #   23:29:58  forced hard refresh; reconciledAt advanced to 23:29:58,
+    #             field still live, still Synced/Healthy.
+    #
+    # The DECLARED field was reverted in under six seconds. The UNDECLARED one
+    # survived every reconcile, including a forced one, and the Application
+    # reported Synced throughout. A field present only in LIVE is not a
+    # difference to a three-way diff, so there is nothing for self-heal to undo
+    # and nothing for the UI to show.
+    #
+    # WHY THIS INVERTS THE SAFETY ADVICE: "a hand-applied patch does not stick,
+    # self-heal reverts it" was used twice on Factory#621 to justify not running
+    # an experiment. It is true for a patch that MODIFIES a declared value and
+    # false for one that ADDS an undeclared field -- and the additive case is
+    # the dangerous one, because it persists indefinitely while looking exactly
+    # like it worked. With the image-signature gate at Enforce (Factory#522), a
+    # hand-added securityContext, imagePullSecrets or automountServiceAccountToken
+    # on a live workload is invisible to git AND to ArgoCD.
+    #
+    # WHERE "DECLARED" COMES FROM: the last-applied-configuration annotation on
+    # the live object -- the manifest ArgoCD itself last applied. No ArgoCD API
+    # token, no kustomize build, no git clone, no new credential. MEASURED: a
+    # `kubectl patch` does NOT update that annotation, which is precisely why
+    # the added field is visible here (declared automount=None, live=True) and
+    # invisible to ArgoCD.
+    #
+    # THE HONEST CEILING, stated rather than discovered later: a change made
+    # with `kubectl apply` DOES rewrite last-applied, so this check would not
+    # see it. That case is ArgoCD's, and it catches it -- last-applied is exactly
+    # the input its three-way diff uses to compute a prune. The two are
+    # complementary: ArgoCD covers what last-applied knows about, this covers
+    # what it does not. Reasoned from the mechanism, not measured.
+    #
+    # ponytail: additive only. A MODIFIED declared field is already ArgoCD's job
+    # and was measured reverting in under six seconds above; reporting it here
+    # would duplicate a working control and add noise.
+
+    LAST_APPLIED = "kubectl.kubernetes.io/last-applied-configuration"
+
+    # THE FIELD SET, AND WHY IT IS THIS SHORT. Comparing everything live against
+    # everything declared is unusable, and that is measured rather than assumed:
+    # across 42 workloads on this cluster `dnsPolicy` is defaulted by Kubernetes
+    # into 42 of 42 live objects and appears in none of the declared ones. A
+    # check that fires on all 42 every five minutes gets muted, which is the
+    # cry-wolf failure this fleet has already hit.
+    #
+    # So the set is exactly the fields whose ADDITION changes the security
+    # posture of a workload:
+    #   securityContext          the Factory#521/#621 hardening ratchet itself
+    #   hostNetwork/PID/IPC      namespace escapes to the node
+    #   automountServiceAccountToken   API-token exposure (the field measured above)
+    #   imagePullSecrets         supply chain: which registry credential is trusted
+    # Added capabilities need no entry of their own -- capabilities.add lives
+    # under a container securityContext and is reached by the leaf walk below.
+    #
+    # DELIBERATELY EXCLUDED: env vars. Measured at 0 additive noise here, so
+    # noise is not the reason -- the reason is that this job writes what it finds
+    # into an OpenObserve stream, and env values carry literal secrets. A drift
+    # check that exfiltrates the thing it is guarding is a worse bug than the one
+    # it closes. Add it only behind value-redaction.
+    SECURITY_POD_KEYS = (
+        "securityContext",
+        "hostNetwork",
+        "hostPID",
+        "hostIPC",
+        "automountServiceAccountToken",
+        "imagePullSecrets",
+    )
+
+    # (apiGroup, plural) for every kind that carries a pod template.
+    WORKLOAD_KINDS = (
+        ("apps", "deployments", "Deployment"),
+        ("apps", "statefulsets", "StatefulSet"),
+        ("apps", "daemonsets", "DaemonSet"),
+        ("batch", "cronjobs", "CronJob"),
+    )
+
+
+    def pod_template(obj: dict) -> dict:
+        """Pod spec for any of the four kinds, including CronJob's extra nesting."""
+        spec = obj.get("spec") or {}
+        if "jobTemplate" in spec:
+            spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+        return ((spec.get("template") or {}).get("spec") or {})
+
+
+    def _leaves(value, prefix: str):
+        """Flatten to (dotted-path, scalar) pairs. An empty dict or list yields
+        NOTHING, and that is the whole reason this walks to leaves instead of
+        comparing top-level keys.
+
+        MEASURED: Kubernetes defaults `securityContext: {}` into 10 of 42 live
+        workloads here. Comparing key PRESENCE reports all 10 forever; comparing
+        leaves reports none of them, because {} has no leaves -- while still
+        catching a single added runAsUser inside a securityContext that is
+        otherwise declared. Fleet-wide noise measured at 0 findings.
+        """
+        if isinstance(value, dict):
+            for k in sorted(value):
+                yield from _leaves(value[k], f"{prefix}.{k}")
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                yield from _leaves(v, f"{prefix}[{i}]")
+        else:
+            yield prefix, value
+
+
+    def security_leaves(pod: dict) -> dict:
+        """{leaf path: value} for every security-relevant field in a pod spec."""
+        out: dict = {}
+        for key in SECURITY_POD_KEYS:
+            if key in pod:
+                out.update(_leaves(pod[key], key))
+        # initContainers included: a hand-added privileged init container is the
+        # classic way to touch the host and exit before anyone looks at it.
+        for field in ("initContainers", "containers"):
+            for c in (pod.get(field) or []):
+                sc = c.get("securityContext")
+                if sc is not None:
+                    out.update(
+                        _leaves(sc, f"{field}[{c.get('name')}].securityContext")
+                    )
+        return out
+
+
+    def assess_workload(kind: str, obj: dict, now: datetime) -> dict | None:
+        """One workload -> a security-drift record, or None if it has no baseline.
+
+        None means "no last-applied annotation", i.e. nothing ever declared this
+        object through kubectl apply. MEASURED: 10 of 52 workloads here are in
+        that state and every one is Helm- or k3s-owned (keda, kyverno,
+        kube-system). They are COUNTED in the summary record rather than
+        reported, because ten permanent findings is how a check gets muted --
+        but the count is emitted so it cannot grow in silence.
+        """
+        meta = obj.get("metadata") or {}
+        ref = f"{kind}/{meta.get('namespace', '?')}/{meta.get('name', '?')}"
+        raw = (meta.get("annotations") or {}).get(LAST_APPLIED)
+        if not raw:
+            return None
+
+        base = {
+            "_timestamp": int(now.timestamp() * 1_000_000),
+            "source": "argocd-drift",
+            "check": "security_drift",
+            "workload": ref,
+            "kind": kind,
+            "namespace": meta.get("namespace", ""),
+            "name": meta.get("name", ""),
+        }
+
+        try:
+            declared = security_leaves(pod_template(json.loads(raw)))
+        except Exception as e:  # noqa: BLE001 -- unreadable is a finding, not a skip
+            return {
+                **base,
+                "status": "declared_unreadable",
+                "added_fields": [],
+                "problems": [
+                    f"last-applied-configuration will not parse ({e!r}), so this "
+                    "workload's security fields cannot be checked against anything"
+                ],
+            }
+
+        live = security_leaves(pod_template(obj))
+        added = {p: v for p, v in live.items() if p not in declared}
+        if not added:
+            return {**base, "status": "ok", "added_fields": [], "problems": []}
+
+        return {
+            **base,
+            "status": "security_field_added",
+            "added_fields": [f"{p}={json.dumps(v)}" for p, v in sorted(added.items())],
+            "problems": [
+                "LIVE-ONLY SECURITY FIELD(S) that the applied manifest does not "
+                "declare: "
+                + ", ".join(f"{p}={json.dumps(v)}" for p, v in sorted(added.items()))
+                + " -- ArgoCD reports this workload's Application as Synced "
+                "because a field present only in live is not a difference to a "
+                "three-way diff, so self-heal will never remove it"
+            ],
+        }
+
+
     def k8s_get(path: str):
         with open(f"{SA}/token") as f:
             token = f.read().strip()
@@ -534,6 +772,30 @@ data:
         return records, sum(1 for t in tips.values() if t)
 
 
+    def build_security_records(workloads: list, now: datetime) -> tuple:
+        """[(kind, obj)] -> (finding_records, examined, without_baseline).
+
+        Only FINDINGS are returned as records. A per-workload `ok` record every
+        five minutes would be ~12k rows a day saying nothing; the examined count
+        travels in the summary record instead, which is what makes a run that
+        looked at nothing distinguishable from a run that found nothing
+        (Factory#642).
+        """
+        findings, examined, no_baseline = [], 0, []
+        for kind, obj in workloads:
+            rec = assess_workload(kind, obj, now)
+            if rec is None:
+                meta = obj.get("metadata") or {}
+                no_baseline.append(
+                    f"{kind}/{meta.get('namespace', '?')}/{meta.get('name', '?')}"
+                )
+                continue
+            examined += 1
+            if rec["status"] != "ok":
+                findings.append(rec)
+        return findings, examined, sorted(no_baseline)
+
+
     def main() -> int:
         drift_tol = int(os.environ.get("DRIFT_TOLERANCE_SECONDS", DEFAULT_DRIFT_TOLERANCE))
         reconcile_tol = int(
@@ -545,6 +807,7 @@ data:
         ).rstrip("/")
         org = os.environ.get("OO_ORG", "default")
         stream = os.environ.get("OO_STREAM", "argocd_drift")
+        sec_stream = os.environ.get("OO_SECURITY_STREAM", "security_drift")
         user, pw = os.environ.get("OO_USER", ""), os.environ.get("OO_PASS", "")
         if not user or not pw:
             eprint("FATAL: OO_USER/OO_PASS not set (observe-root secret missing)")
@@ -587,6 +850,61 @@ data:
             f"reported {len(records)} Application(s) to '{stream}': "
             f"{len(records) - len(bad)} ok, {len(bad)} drifted"
             + (f" ({', '.join(bad)})" if bad else "")
+        )
+
+        # ---- SIGNAL 5: additive security drift (Factory#639) ----------------
+        workloads = []
+        try:
+            for group, plural, kind in WORKLOAD_KINDS:
+                for obj in k8s_get(f"/apis/{group}/v1/{plural}")["items"]:
+                    workloads.append((kind, obj))
+        except Exception as e:  # noqa: BLE001 -- cannot see == cannot report
+            eprint(f"FATAL: cannot list workloads: {e!r}")
+            return 3
+
+        sec_findings, examined, no_baseline = build_security_records(workloads, now)
+
+        # Factory#642: a check that examined nothing and reported nothing is
+        # indistinguishable from a healthy fleet, and is the exact defect this
+        # file exists to catch. Zero examined while workloads exist means the
+        # annotation was stripped fleet-wide or RBAC was lost -- that is THIS
+        # job being broken, so it exits non-zero rather than reporting all-clear.
+        if workloads and examined == 0:
+            eprint(
+                f"FATAL: {len(workloads)} workload(s) visible but NONE had a "
+                "last-applied baseline -- nothing could be compared"
+            )
+            return 6
+
+        for r in sec_findings:
+            eprint(f"SECDRIFT {r['workload']} [{r['status']}]")
+            for p in r["problems"]:
+                eprint(f"         - {p}")
+
+        summary = {
+            "_timestamp": int(now.timestamp() * 1_000_000),
+            "source": "argocd-drift",
+            "check": "security_drift_summary",
+            "workloads_examined": examined,
+            "workloads_without_baseline": len(no_baseline),
+            "without_baseline": no_baseline,
+            "findings": len(sec_findings),
+            "drifted_workloads": [r["workload"] for r in sec_findings],
+            "status": "ok" if not sec_findings else "security_field_added",
+        }
+
+        try:
+            emit(oo, org, sec_stream, basic, sec_findings + [summary])
+        except Exception as e:  # noqa: BLE001 -- a dropped record is a blind spot
+            eprint(f"FATAL: cannot emit to OpenObserve stream '{sec_stream}': {e!r}")
+            return 4
+
+        eprint(
+            f"examined {examined} workload(s) for additive security drift "
+            f"({len(no_baseline)} without a declared baseline, not checked): "
+            f"{len(sec_findings)} drifted"
+            + (f" ({', '.join(r['workload'] for r in sec_findings)})"
+               if sec_findings else "")
         )
         # Exit 0 on findings BY DESIGN, as apps/job-watchdog: a red job must mean
         # the watchdog is broken, not that a watched Application is.
@@ -795,6 +1113,156 @@ data:
         assert age_calls == [], age_calls
         assert recs2[0]["status"] == "out_of_sync", recs2
 
+        # ---- Factory#639: ADDITIVE SECURITY DRIFT ---------------------------
+        #
+        # Every pair below is a mutation check. A check degenerated to "report
+        # everything" passes the findings and fails the quiet cases; a check
+        # degenerated to "always ok" passes the quiet cases and fails the
+        # findings. Neither degeneration passes both halves of any pair.
+
+        def wl(kind, live_pod, declared_pod, name="endpoint-guard", ns="factory"):
+            def wrap(pod):
+                if kind == "CronJob":
+                    return {"spec": {"jobTemplate": {"spec": {"template": {"spec": pod}}}}}
+                return {"spec": {"template": {"spec": pod}}}
+            obj = wrap(live_pod)
+            obj["metadata"] = {
+                "name": name,
+                "namespace": ns,
+                "annotations": {LAST_APPLIED: json.dumps(wrap(declared_pod))},
+            }
+            return obj
+
+        HARD = {"runAsNonRoot": True, "runAsUser": 65532,
+                "seccompProfile": {"type": "RuntimeDefault"}}
+
+        # THE MEASURED INCIDENT, exactly as it happened on this cluster at
+        # 23:27:32 on 2026-08-07: automountServiceAccountToken added by hand to
+        # the live CronJob, absent from the applied manifest, ArgoCD Synced.
+        # Note this asserts CronJob's extra jobTemplate nesting works too.
+        hit = assess_workload(
+            "CronJob",
+            wl("CronJob", {"securityContext": dict(HARD),
+                           "automountServiceAccountToken": True}, {"securityContext": dict(HARD)}),
+            now)
+        assert hit["status"] == "security_field_added", hit
+        assert hit["added_fields"] == ["automountServiceAccountToken=true"], hit
+        assert "Synced" in hit["problems"][0], hit
+        assert hit["workload"] == "CronJob/factory/endpoint-guard", hit
+
+        # THE OTHER DIRECTION: live == declared must be silent, or the fix has
+        # just painted the fleet red and taught everyone to ignore it.
+        assert assess_workload(
+            "CronJob", wl("CronJob", {"securityContext": dict(HARD)},
+                          {"securityContext": dict(HARD)}), now)["status"] == "ok"
+
+        # THE NOISE CASE THAT DECIDED THE DESIGN. Kubernetes defaults
+        # `securityContext: {}` into 10 of 42 live workloads here while the
+        # applied manifest has no securityContext at all. Comparing top-level
+        # KEY presence reports all ten every five minutes forever; comparing
+        # LEAVES reports none, because {} has no leaves. This assert is the
+        # whole reason _leaves() exists.
+        assert assess_workload(
+            "Deployment", wl("Deployment", {"securityContext": {}}, {}), now
+        )["status"] == "ok"
+
+        # ...and the leaf walk must still catch ONE added key inside a
+        # securityContext that is otherwise declared and identical. The pair
+        # above and this line together forbid "ignore securityContext entirely".
+        one = assess_workload(
+            "Deployment",
+            wl("Deployment", {"securityContext": {**HARD, "fsGroup": 1000}},
+               {"securityContext": dict(HARD)}), now)
+        assert one["status"] == "security_field_added", one
+        assert one["added_fields"] == ["securityContext.fsGroup=1000"], one
+
+        # Fields OUTSIDE the set stay quiet however loudly they differ.
+        # `dnsPolicy` is defaulted into 42 of 42 live workloads here -- the
+        # measurement that ruled out comparing everything.
+        assert assess_workload(
+            "Deployment",
+            wl("Deployment", {"dnsPolicy": "ClusterFirst", "restartPolicy": "Always"}, {}),
+            now)["status"] == "ok"
+
+        # MODIFIED, NOT ADDED: both sides declare runAsUser and they disagree.
+        # That is ArgoCD's job and it was measured reverting it in under six
+        # seconds, so this check must stay quiet or it duplicates a control that
+        # works. This is the line that keeps "additive only" honest.
+        assert assess_workload(
+            "CronJob",
+            wl("CronJob", {"securityContext": {**HARD, "runAsUser": 65533}},
+               {"securityContext": dict(HARD)}), now)["status"] == "ok"
+
+        # Container-level, including capabilities.add reached by the leaf walk --
+        # it needs no rule of its own, which is why there is no entry for it.
+        caps = assess_workload(
+            "Deployment",
+            wl("Deployment",
+               {"containers": [{"name": "app", "securityContext": {
+                   "allowPrivilegeEscalation": False,
+                   "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN"]}}}]},
+               {"containers": [{"name": "app", "securityContext": {
+                   "allowPrivilegeEscalation": False,
+                   "capabilities": {"drop": ["ALL"]}}}]}),
+            now)
+        assert caps["status"] == "security_field_added", caps
+        assert caps["added_fields"] == [
+            'containers[app].securityContext.capabilities.add[0]="NET_ADMIN"'], caps
+
+        # A hand-added privileged INIT container -- touches the host and exits
+        # before anyone looks at it.
+        init = assess_workload(
+            "Deployment",
+            wl("Deployment",
+               {"initContainers": [{"name": "setup",
+                                    "securityContext": {"privileged": True}}]},
+               {"initContainers": [{"name": "setup"}]}),
+            now)
+        assert init["added_fields"] == [
+            "initContainers[setup].securityContext.privileged=true"], init
+
+        # The remaining set members, each the whole reason it is in the set.
+        for key, val, want in (
+            ("hostNetwork", True, "hostNetwork=true"),
+            ("hostPID", True, "hostPID=true"),
+            ("hostIPC", True, "hostIPC=true"),
+        ):
+            r = assess_workload("Deployment", wl("Deployment", {key: val}, {}), now)
+            assert r["added_fields"] == [want], r
+        pull = assess_workload(
+            "Deployment",
+            wl("Deployment", {"imagePullSecrets": [{"name": "rogue-registry"}]}, {}), now)
+        assert pull["added_fields"] == ['imagePullSecrets[0].name="rogue-registry"'], pull
+
+        # NO BASELINE is None, not a finding: the 10 Helm/k3s-owned workloads
+        # here would otherwise be ten permanent alarms, which is how a check
+        # gets muted. They are counted instead, below.
+        assert assess_workload(
+            "Deployment", {"metadata": {"name": "kyverno", "namespace": "kyverno"},
+                           "spec": {"template": {"spec": {"hostPID": True}}}}, now) is None
+
+        # ...but a baseline that will not PARSE is a finding, never a silent
+        # skip -- unreadable is not the same as clean.
+        bad_ann = {"metadata": {"name": "x", "namespace": "factory",
+                                "annotations": {LAST_APPLIED: "{not json"}},
+                   "spec": {"template": {"spec": {}}}}
+        assert assess_workload("Deployment", bad_ann, now)["status"] == "declared_unreadable"
+
+        # build_security_records: examined counts ONLY comparable workloads, and
+        # no-baseline ones are counted separately rather than vanishing. An
+        # examined count that silently included the unverifiable would be the
+        # Factory#642 defect wearing a number.
+        f, examined, nb = build_security_records([
+            ("CronJob", wl("CronJob", {"securityContext": dict(HARD),
+                                       "automountServiceAccountToken": True},
+                           {"securityContext": dict(HARD)})),
+            ("Deployment", wl("Deployment", {"securityContext": {}}, {}, name="observe")),
+            ("Deployment", {"metadata": {"name": "keda", "namespace": "keda"},
+                            "spec": {"template": {"spec": {}}}}),
+        ], now)
+        assert (len(f), examined, nb) == (1, 2, ["Deployment/keda/keda"]), (f, examined, nb)
+        assert f[0]["workload"] == "CronJob/factory/endpoint-guard", f
+
         print("selftest OK")
         return 0
 
@@ -849,6 +1317,12 @@ spec:
               command: ["python3", "/script/drift.py"]
               env:
                 - { name: OO_STREAM, value: "argocd_drift" }
+                # Factory#639. A separate stream because the records have a
+                # different shape (a workload, not an Application) and because
+                # a quiet run writes exactly ONE row here -- the summary
+                # carrying workloads_examined. Findings, when they exist, land
+                # alongside it.
+                - { name: OO_SECURITY_STREAM, value: "security_drift" }
                 - { name: OO_ORG, value: "default" }
                 # 180s. The webhook went live 2026-07-31 (Factory#506, hook
                 # 659390464), which removed the ~360s of legitimate blindness
