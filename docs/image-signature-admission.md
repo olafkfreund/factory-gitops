@@ -232,8 +232,11 @@ lost if the cluster is ever recreated.
 
    All eleven runner packages and all five service packages now answer an
    anonymous `ghcr.io/token` request with a token that reads their manifests.
-   `odin` still does not — it 403s — which is why it still has no rule
-   (Factory#572).
+
+   `odin` was still 403ing when this was written and went public later the same
+   day, so **no first-party package is private any more**. That unblocks the
+   rule it was denied — Factory#572, which owns both the rule and the section
+   below.
 
 #### The credential path, built and then removed
 
@@ -464,9 +467,15 @@ cosign verify \
   ghcr.io/olafkfreund/odin:sha-2749b26
 ```
 
-It still has **no** rule in `verify-factory-image-signatures`, deliberately. The
-`odin` GHCR package is **private** — the only first-party package that still is
-after Factory#563 — and Kyverno holds no ghcr.io credential at all, by design:
+> **Superseded 2026-08-07.** The `odin` GHCR package went **public** later the
+> same day, which removes the only reason it was denied a rule. Factory#572 adds
+> `verify-odin-signature` and rewrites this section; what follows is the state
+> while the package was private, kept because the *reasoning* — never put a rule
+> in front of an image Kyverno cannot read — outlives the instance.
+
+It had **no** rule in `verify-factory-image-signatures`, deliberately. The
+`odin` GHCR package was **private**, the last first-party package that was, and
+Kyverno holds no ghcr.io credential at all, by design:
 
 ```bash
 $ curl -s "https://ghcr.io/token?scope=repository%3Aolafkfreund%2Fodin%3Apull&service=ghcr.io"
