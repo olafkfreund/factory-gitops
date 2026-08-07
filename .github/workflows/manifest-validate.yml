@@ -332,7 +332,22 @@ jobs:
                   continue
                 fi
               else
-                rendered=$(cat "$path"/*.yaml "$path"/*.yml 2>/dev/null)
+                # `find -exec cat` rather than `cat "$path"/*.yaml "$path"/*.yml`:
+                # an unmatched glob is passed through literally, cat exits
+                # non-zero on it, and GitHub runs this step under `bash -e`, so
+                # the whole step died at the first such directory. infra/cloudflared
+                # holds no .yml file and is the first one reached alphabetically.
+                rendered=$(find "$path" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -exec cat {} +)
+              fi
+
+              # An empty render is not a passing render -- same reasoning as the
+              # zero-output guard on `kustomize build` in the step above. Without
+              # this, a directory that renders to nothing contributes no images
+              # and no complaint, which reads exactly like a clean app.
+              if [ -z "$(printf '%s' "$rendered" | tr -d '[:space:]')" ]; then
+                echo "::error file=$a::\`$path\` rendered no manifests -- this gate checked nothing for \`$name\`"
+                fail=1
+                continue
               fi
 
               mapfile -t REFS < <(
