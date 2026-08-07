@@ -114,10 +114,13 @@
 # packages return manifest=200 AND sig=200 anonymously. That is the measurement
 # to repeat before trusting this paragraph again -- not `tags/list`, not a pull.
 #
-# Counting note, since the number moves: nineteen images are covered by the
-# globs below -- 5 services + 11 runners + 2 SkillAi + odin. Earlier revisions
-# said "sixteen", which predated the SkillAi pair and odin. Prefer deriving it
-# from the globs to quoting a number from a comment.
+# COUNTING NOTE, because this number has been wrong twice and TWO DIFFERENT
+# NUMBERS ARE BOTH CORRECT. The globs below name nineteen REPOSITORIES -- 5
+# services + 11 runners + 2 SkillAi + odin. That is not the same as the count of
+# images actually running, which is what a live-board measurement returns (17 at
+# the time of Factory#566's credential experiment) and which changes whenever a
+# workload starts or stops. Say which one you mean, and prefer deriving either
+# from the globs or from the cluster over quoting a number out of a comment.
 #
 # The reason NOT to re-add a credential later "just in case" is measured and
 # specific: a WRONG or EXPIRED credential unverifies EVERY covered image, not

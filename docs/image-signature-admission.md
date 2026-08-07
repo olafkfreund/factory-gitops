@@ -499,6 +499,15 @@ DOCKER_CONFIG=/tmp/nocreds cosign verify \
   ghcr.io/olafkfreund/odin:sha-39ecd91
 ```
 
+**Use `cosign`, not a hand-rolled `curl`, and if you must hand-roll it get the
+`Accept` header right.** The `.sig` tag is an OCI **image manifest**; reusing the
+index/list `Accept` header from a digest lookup returns **404 on every package,
+public ones included**. That was hit for real while cross-checking this
+(factory-gitops#180), and it is worse than an ordinary bug: a 404 there looks
+exactly like the registry-auth failure a triager is already hunting, so the tool
+being used to diagnose the Factory#430 ambiguity reintroduces it. `cosign`
+negotiates this correctly and is the reason the recipe above is safe.
+
 ##### And read the identity off the signature, do not copy a neighbour
 
 The other half of writing an honest rule. A `subjectRegExp` that is well-formed
