@@ -1203,7 +1203,7 @@ Do NOT skip a phase. Each is a separate, small PR.
    | 1b | The credential that makes it readable cannot go stale unnoticed | **Moot** by deletion, 2026-08-07 — there is no credential; Factory#566 |
    | 2 | Runner coverage is actually evidenced | **Met** — `apps/kyverno-runner-probe`, Factory#562 closed |
    | 3 | The DNS repair behind Factory#430 is declarative | **Open** — olafkfreund/nixos_config#1232 |
-   | 4 | No image a rule matches is unsigned | **Open** — two retained `skillai` ReplicaSets, see below |
+   | 4 | No image a rule matches is unsigned | **Open** — Factory#640, two retained `skillai` ReplicaSets, see below |
    | 5 | Report freshness is checked population-wide, not read as a green board | **Met** — `check-report-freshness.sh`, see below |
 
    Row 1b is moot rather than fixed, which is the stronger outcome. All seven
@@ -1569,8 +1569,17 @@ controller first.
 **Flip to Enforce once row 4 is cleared, and not before.** Concretely:
 
 1. Roll `skillai-app` onto a signed image and let the two unsigned ReplicaSets
-   age out. This is the only precondition standing between here and the flip
-   that is inside this repo's control.
+   age out (Factory#640). This is the only precondition standing between here
+   and the flip that is inside this repo's control.
+
+   Do **not** clear it by excluding zero-replica ReplicaSets from the rule's
+   `match`. That converts a true statement into silence, and it hides exactly
+   the case that bites: these are not inert. ReplicaSets are excluded from
+   admission by the `[ReplicaSet,*,*]` entry in the `kyverno` ConfigMap's
+   `resourceFilters`, but the Deployment path is not filtered and denies, and a
+   `kubectl rollout undo` scales one of them up and is denied at the Pod level.
+   It is a latent denial armed for the moment someone reaches for a rollback
+   during an incident.
 2. Keep `failurePolicy: Ignore`, with the restart-window bypass named above
    accepted explicitly rather than overlooked.
 3. Flip, and run `check-report-freshness.sh` twice across a scan interval
