@@ -9,14 +9,57 @@ version is running without a registry round-trip.
 One exception, stated so it is a known boundary rather than an oversight:
 `pgvector/pgvector:pg17` also runs in `factory`, but `apps/skillai/application.yaml`
 points ArgoCD at the `olafkfreund/SkillAi` repo, so its manifest is not here and
-cannot be pinned from here. It is unpinned and has already drifted. Tracked in
-Factory#588.
+cannot be pinned from here. It is pinned **in that repo** instead
+(olafkfreund/SkillAi#304, Factory#588), to the digest that was already running
+rather than to registry HEAD -- `pg17` is a floating major-line tag and the
+image is a live database, so adopting HEAD is an upgrade that should be its own
+change.
+
+Nothing in this repo can verify that pin, and the CI gate below says so out
+loud rather than passing over it in silence. If it regresses, it regresses in
+`olafkfreund/SkillAi` and this repo will not notice.
 
 Companion to [image signature admission](image-signature-admission.md), which
 covers the first-party half and is scoped to `ghcr.io/olafkfreund/*`. These
 images cannot be signed and publish no identity we could pin an attestor to, so
 digest pinning is the control that actually applies to them. Tracked in
 Factory#573, split out of Factory#564.
+
+## What asserts this, and what asserted it before
+
+`manifest validation (blocking)` has a step, **Assert third-party images in
+`factory` are pinned to a digest**, that fails the PR if any of them is not.
+
+Before that step existed, **nothing did**. The pins were made once by hand and
+then went unobserved: no workflow read them, and none of the three Kyverno
+policies covers them -- `verify-factory-image-signatures` and
+`require-first-party-signature-coverage` are both scoped to
+`ghcr.io/olafkfreund/*`, and the latter's own closing comment records that
+third-party digest pinning "is a separate policy against a separate set of
+manifests". So the eleven pinned images were not passing a check; there was no
+check, and a revert or a stray `images:` transformer would have unpinned any of
+them with nothing to say so.
+
+The step is worth reading for what it deliberately does not do:
+
+- **Scope is derived, never listed.** It reads every ArgoCD Application whose
+  `spec.destination.namespace` is `factory` -- the same boundary Factory#573
+  draws -- so a new app is covered the day it lands and `apps/kyverno`,
+  `apps/keda`, `apps/fides` and `bootstrap` are out because of what they
+  declare, not because someone remembered to exempt them. There is no list of
+  images anywhere in it.
+- **It reads rendered output, not source files**, because of the observe
+  transformer described below.
+- **An Application it cannot read fails.** Multi-source and Helm sources are
+  not parsed, and rather than skip them the step errors.
+- **An in-scope Application from another repo must be declared** in
+  `is_external_declared()` with its tracking issue. `skillai` is the only one.
+  An undeclared one fails, which is the guard that would have caught
+  Factory#588 at the time instead of eleven images later.
+
+It does not check that a pinned digest is the *right* image (these upstreams
+publish no signature we could pin an attestor to -- see Factory#573), it does
+not look at the cluster, and it does nothing about staleness.
 
 ## What a mutable tag costs, measured rather than argued
 
