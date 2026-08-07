@@ -1,0 +1,92 @@
+# Kyverno CLI test for gate-task-pods-on-network-policy (Factory#517).
+#
+# Run it with the SAME Kyverno version the cluster runs (v1.18.2 today):
+#
+#   kyverno test apps/kyverno-policies/tests/kyverno-test-gate-task-pods-on-network-policy.yaml
+#
+# THIS SUITE ASSERTS `patchedResources`, NOT THAT THE RULES FIRED. A mutate rule
+# that matches and injects nothing is schema-valid, applies cleanly and reports
+# Ready -- that is exactly how the first version of
+# strip-last-applied-configuration-from-secrets shipped a no-op, and it is the
+# same failure mode here. "The rule ran" is not evidence; the produced pod is.
+#
+# What the patched output pins down, and why each one matters:
+#   - the gate is at initContainers[0]. If it drifts to the end, every other
+#     init container gets to run inside the unconfined window this exists to
+#     close, and nothing else in CI would notice.
+#   - `seed-nix-store` SURVIVES, still holding its own image and command. The
+#     insert is a JSON Patch `add` at index 0, one character away from an `add`
+#     onto /spec/initContainers that would replace the array and silently
+#     delete it -- breaking every task pod that uses a warm nix store.
+#   - the gate keeps its non-root uid. Task pods pin runAsNonRoot at pod level,
+#     so an unset uid means the kubelet refuses to start the container and every
+#     task pod CrashLoops -- a gate that fails the pipeline instead of the pod.
+#
+# `kyverno test` v1.18.2 evaluates every resource as a CREATE, which is the only
+# operation this policy matches, so the simulated operation is the real one.
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: gate-task-pods-on-network-policy
+policies:
+  - ../manifests/gate-task-pods-on-network-policy.yaml
+resources:
+  - resources-gate-task-pods-on-network-policy.yaml
+results:
+  # --- MUST GATE: the no-init-container lane. This case also proves rule 1
+  #     feeds rule 2 -- the array it creates is what index 0 is inserted into.
+  - policy: gate-task-pods-on-network-policy
+    rule: ensure-init-containers-array
+    kind: Pod
+    result: pass
+    resources:
+      - task-no-init
+    patchedResources: patched-gate-task-pods-on-network-policy.yaml
+  - policy: gate-task-pods-on-network-policy
+    rule: inject-netpol-gate
+    kind: Pod
+    result: pass
+    resources:
+      - task-no-init
+      - task-with-init
+    patchedResources: patched-gate-task-pods-on-network-policy.yaml
+
+  # --- MUST NOT create the array when one already exists: rule 1's precondition
+  #     is the only thing standing between `add` and a replaced array.
+  - policy: gate-task-pods-on-network-policy
+    rule: ensure-init-containers-array
+    kind: Pod
+    result: skip
+    resources:
+      - task-with-init
+
+  # --- MUST NOT GATE TWICE. The webhook is `reinvocationPolicy: IfNeeded`, so
+  #     a pod that already carries the gate WILL be presented to this policy
+  #     again in the same admission. Injecting a second one makes the API server
+  #     reject the pod on the duplicate container name -- every task pod in the
+  #     fleet dead. Live-cluster finding; the offline engine applies each rule
+  #     once and reports a clean pass without this case.
+  - policy: gate-task-pods-on-network-policy
+    rule: inject-netpol-gate
+    kind: Pod
+    result: skip
+    resources:
+      - task-already-gated
+
+  # --- MUST NOT GATE: a control-plane pod, and a task-labelled pod outside the
+  #     namespace the NetworkPolicy exists in.
+  - policy: gate-task-pods-on-network-policy
+    rule: inject-netpol-gate
+    kind: Pod
+    result: skip
+    resources:
+      - control-plane-pod
+      - task-other-namespace
+  - policy: gate-task-pods-on-network-policy
+    rule: ensure-init-containers-array
+    kind: Pod
+    result: skip
+    resources:
+      - control-plane-pod
+      - task-other-namespace
+      - task-already-gated

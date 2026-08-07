@@ -46,16 +46,35 @@
 #   # then from each: nc -z -w6 1.1.1.1 443 ; nc -z -w6 1.1.1.1 80
 # Label the control so it cannot join a Service (Factory#476) and delete both.
 #
-# THE ONE REAL GAP: a few seconds at pod start.
-# kube-router programs the per-pod egress chain shortly AFTER the pod goes
-# Running, so there is a brief unconfined window. Measured by probing every 3s
-# from a pod's own entrypoint:
-#   t+3s  1.1.1.1:80 CONNECTED   <-- leaked
-#   t+6s  onward     blocked     (stable thereafter, verified to t+33s)
-# So a task pod can egress freely for roughly its first 3-5 seconds. That is
-# not enough for a build, but it IS enough for a deliberate exfiltration call
-# placed at the top of a malicious step. Tracked separately; it is a property of
-# the CNI, not something this manifest can express.
+# THE GAP AT POD START -- NOW CLOSED ELSEWHERE, NOT HERE (Factory#517).
+# kube-router programs this policy as PER-POD-IP iptables jump rules:
+#   -A KUBE-ROUTER-INPUT  -s 10.42.0.x/32 ... -j KUBE-POD-FW-<hash>
+#   -A KUBE-ROUTER-OUTPUT -d 10.42.0.x/32 ... -j KUBE-POD-FW-<hash>
+# written by a pod-informer callback, so they cannot exist until the pod already
+# has an IP -- and the container is unpaused at that same moment. Re-measured at
+# 10ms resolution from the pod's own entrypoint, the window is 110ms / 690ms /
+# 820ms across three runs, with ~100 successful connections to a DENIED
+# destination inside it. It is a race, so those are samples, not a bound.
+#
+# It was never only egress, and the earlier "3-5 seconds of extra egress"
+# reading understated it. In the window a task pod also resolved through
+# 8.8.8.8:53 (a DNS covert channel that never touches the cluster resolver),
+# reached its node's kubelet on :10250, reached in-namespace pods this policy
+# exists to keep it away from, and ACCEPTED INBOUND -- an unprivileged pod
+# connected straight into a task pod on a random port at reveal-time and was
+# blocked 8s later. The ingress default-deny below has no rules at all, so that
+# connection was purely the window.
+#
+# EDITING THIS FILE CANNOT FIX IT, AND A DEFAULT-DENY DOES NOT EITHER. Tested,
+# not assumed: in a throwaway namespace, a `podSelector: {}` default-deny
+# created minutes BEFORE any pod existed still let a fresh pod reach a denied
+# destination for its first 820ms. The policy object's age is irrelevant --
+# every policy compiles down to the same per-pod-IP rules, and those are what
+# lag. The fix is to stop the workload until the network is ready, which is
+# `gate-task-pods-on-network-policy` in apps/kyverno-policies/manifests/: it
+# injects an init container that blocks until a denied destination is actually
+# refused WHILE an allowed one still connects. Verified 10 gated runs, 0 leaks,
+# against 5 ungated runs that leaked 31-99 connections each.
 #
 # WHY THE EARLIER "NOT ENFORCED" READING IS NOT REPRODUCIBLE HERE: no node or
 # k3s-agent restart happened between the two measurements (both nodes Ready
