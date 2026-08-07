@@ -512,13 +512,6 @@ jobs:
                   "Same root cause as its capabilities carve-out above: ganesha "
                   "binds privileged ports and setuids down itself, so it has to "
                   "start as uid 0. Factory#521.",
-              ("odin-dashboard", "odin", "runAsNonRoot"):
-                  "TEMPORARY, tracked by Factory#622. odin-dashboard needs uid 0 "
-                  "only because its deploy key Secret is mounted at /root/.ssh, "
-                  "which is drwx------ root root. The fix is a mount-path move "
-                  "plus an IdentityFile flag in the Odin repo, so it needs a new "
-                  "odin image before the manifest can flip. DELETE THIS LINE in "
-                  "the same change that sets runAsNonRoot on odin-dashboard.",
           }
 
           KINDS = {"Deployment", "StatefulSet", "DaemonSet"}

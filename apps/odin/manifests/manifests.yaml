@@ -26,6 +26,11 @@ spec:
       serviceAccountName: odin-dashboard-sa
       imagePullSecrets:
         - name: ghcr-pull
+      # fsGroup makes the odin-ssh-key Secret land group-owned 65532, which is
+      # what lets defaultMode 0440 (below) be readable by the non-root uid.
+      # Without it the files are root:root and 0440 buys nothing. Factory#622.
+      securityContext:
+        fsGroup: 65532
       containers:
       - name: odin
         image: ghcr.io/olafkfreund/odin:0.1.0
@@ -43,6 +48,12 @@ spec:
         # configuration that was actually measured, so it is the one shipped.
         - name: PYTHONDONTWRITEBYTECODE
           value: "1"
+        # Factory#622. Points ssh_base_args() at the key's new home. Unset, the
+        # backend passes no -o IdentityFile and falls back to the connecting
+        # user's ~/.ssh -- which is exactly why this env var and the mountPath
+        # below have to move in the SAME change.
+        - name: ODIN_SSH_KEY
+          value: /etc/odin/ssh/id_ed25519
         resources:
           limits:
             cpu: "500m"
@@ -90,22 +101,53 @@ spec:
           # /root/.ssh already fails today — that path is a readOnly secret
           # mount — and it is non-fatal, so a read-only / changes nothing there.
           #
-          # runAsNonRoot: false — this half of the exception STANDS, unchanged,
-          # and for the reason recorded above: the odin-ssh-key Secret is mounted
-          # at /root/.ssh and /root is drwx------ root root (re-measured today on
-          # the live pod), so a non-root uid could not traverse to its own key.
-          # Moving the mount off /root is an Odin image change, not a manifest
-          # one. Note this is a mount PATH decision, so it is fixable in a repo
-          # we own rather than a genuine third-party constraint: Factory#622.
+          # runAsNonRoot — THIS HALF OF THE EXCEPTION IS NOW CLOSED TOO.
+          #
+          # It read: the odin-ssh-key Secret is mounted at /root/.ssh and /root
+          # is drwx------ root root, so a non-root uid could not traverse to its
+          # own key. True, and a mount PATH decision rather than a third-party
+          # constraint, which is why it was fixable at all (Factory#622).
+          #
+          # Two things had to be true to move it, and BOTH were measured
+          # in-cluster against the real Secret and a real host:
+          #
+          #   arm 1 (CONTROL) mount moved + runAsUser only, Secret left at
+          #                   0400 with no fsGroup
+          #                   -> key unreadable (Permission denied) AND
+          #                      ssh refused: "No user exists for uid 65532"
+          #   arm 2           0440 + fsGroup 65532, uid with a passwd entry
+          #                   -> key -r--r----- root:65532, readable;
+          #                      ssh authenticated, remote `id -un` = olafkfreund
+          #
+          # The control is what makes this readable: the naive version of this
+          # fix (move the mount, set runAsUser) fails, and fails for TWO
+          # independent reasons, so neither the mode change nor the image user
+          # is cargo cult.
+          #
+          #   1. OpenSSH refuses a private key with group/other mode bits, so
+          #      0440 looks wrong -- but sshkey_perm_ok() only applies that test
+          #      when the file is owned by the CALLING uid. Root owns it, we are
+          #      not root, so the check is skipped.
+          #   2. ssh resolves the home dir via getpwuid(), not $HOME, and exits
+          #      before authenticating if the uid has no /etc/passwd entry. A
+          #      bare runAsUser here is NOT enough; the image now creates an
+          #      `odin` user (uid/gid 65532, home /tmp).
+          #
+          # Requirement 2 is why this manifest MUST NOT land before the Odin
+          # image carrying it. With the old image ODIN_SSH_KEY is ignored, ssh
+          # looks under the home directory, finds nothing, and fleet polling
+          # goes dark while GET / keeps answering 200.
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
-          runAsNonRoot: false
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
           seccompProfile: { type: RuntimeDefault }
           capabilities:
             drop: ["ALL"]
         volumeMounts:
         - name: ssh-key
-          mountPath: /root/.ssh
+          mountPath: /etc/odin/ssh
           readOnly: true
         # Required by readOnlyRootFilesystem above: ODIN_SSH_MUX_DIR defaults to
         # /tmp/odin-ssh-mux and backend/main.py os.makedirs() it at import time.
@@ -116,7 +158,11 @@ spec:
       - name: ssh-key
         secret:
           secretName: odin-ssh-key
-          defaultMode: 256
+          # 288 == 0440. Was 256 (0400), which is unreadable by anyone but the
+          # owner -- and the owner of a Secret volume file is root, not the
+          # runAsUser. Paired with the pod fsGroup above, 0440 makes it readable
+          # via the group and nothing wider. Factory#622.
+          defaultMode: 288
       - name: tmp
         emptyDir: {}
 ---
