@@ -27,6 +27,21 @@ spec:
   template:
     metadata: { labels: { app: pfactory } }
     spec:
+      # Factory#550. No SA token in this pod. PFactory has no in-cluster API
+      # caller: neither `kubernetes` nor `kubernetes_asyncio` is installed in
+      # ghcr.io/olafkfreund/pfactory and there is no kubectl on PATH, so the one
+      # `load_incluster_config()` call in the codebase
+      # (plan/enrich/adapters/kubernetes.py) cannot execute in this image. It
+      # also runs under the `default` SA, which has no RoleBinding in this
+      # namespace, so the token authorised nothing it could use.
+      #
+      # Stated EXPLICITLY rather than left to the default, because the default is
+      # `true` and an unset field records no decision: the next reader cannot
+      # tell "we checked and this pod needs no token" from "nobody looked".
+      # Factory#504's chart-vs-gitops gate now compares this value against
+      # charts/pfactory/values.yaml, so the two engines cannot drift apart again.
+      # Related: Factory#42 (sandbox), Factory#570 (deploy identity blast radius).
+      automountServiceAccountToken: false
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
       # Factory#503. Every CronJob in this namespace has carried this set since
