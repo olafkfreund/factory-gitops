@@ -436,12 +436,14 @@ jobs:
           done
 
           # What this still does NOT catch:
-          #   - Any policy no suite covers. Today that is
+          #   - Any policy no suite covers, which is #145. Today that is
           #     verify-factory-image-signatures and
           #     strip-last-applied-configuration-from-secrets: they load, they
           #     are never evaluated here, and a dead expression in either would
           #     still ship green. Coverage of policies by suites is not itself
-          #     measured -- adding a policy does not fail this step.
+          #     measured -- adding a policy does not fail this step. Making it
+          #     fail is #145 step 2, and must land AFTER those two suites
+          #     exist or it wedges the required check.
           #   - Signature verification. No case here reaches a registry or
           #     rekor, by design; the suite is offline rule logic only.
           #   - Anything the webhook checks at admission time that the CLI does
