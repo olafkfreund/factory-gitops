@@ -64,32 +64,57 @@
 # `factory.io/kind=task` label the NetworkPolicy selects, so a fifth lane is
 # gated the day it is written, by the same axis, with no code change.
 #
-# KNOWN GAP, STATED PLAINLY. `failurePolicy: Ignore` means that if the Kyverno
-# admission controller is down when a task pod is created, the pod is admitted
-# WITHOUT the gate and the window is back. That is deliberate and it is the
-# smaller risk -- see BLAST RADIUS below -- but it is a real hole and it is not
-# closed by this file. It differs from the hole it replaces in one way that
-# matters: an attacker inside a task pod controls what runs first, but cannot
-# cause a Kyverno outage. Factory#620 tracks scoping a `Fail` webhook narrowly
-# enough to close it.
+# THE GAP THIS FILE ONCE HAD, AND HOW IT WAS CLOSED (Factory#620)
+# ---------------------------------------------------------------
+# This shipped `failurePolicy: Ignore`: if the Kyverno admission controller was
+# down at the moment a task pod was created, the pod was admitted WITHOUT the
+# gate and the window was back, silently. That was the smaller risk at the time
+# -- an attacker inside a task pod controls what runs first but cannot cause a
+# Kyverno outage -- but it was a real hole.
+#
+# It is now `Fail`, scoped by `webhookConfiguration.matchConditions` so the Fail
+# webhook is only ever consulted for factory task pods. Everything else in the
+# cluster -- every other pod, every Deployment, every ArgoCD sync -- is not
+# matched by the Fail webhook at all and is unaffected by a Kyverno outage.
 #
 # ---------------------------------------------------------------------------
 # BLAST RADIUS -- read before editing.
 #
-# 1. failurePolicy: Ignore  <- DO NOT CHANGE TO Fail IN THIS FILE.
-#    Kyverno does not register one webhook per policy. Today the cluster has a
-#    single `mutate.kyverno.svc-ignore` entry whose rules already cover
-#    pods, jobs, deployments, daemonsets, statefulsets and replicasets, cluster
-#    wide, with `objectSelector: {}`. Setting `Fail` here adds a
-#    `mutate.kyverno.svc-fail` sibling with THE SAME BROAD RULES -- so a Kyverno
-#    admission outage would stop every pod, Job and Deployment write in the
-#    cluster, ArgoCD and the control plane included. Kyverno v1.18.2 does
-#    support `spec.webhookConfiguration.matchConditions` to scope that down to
-#    the task label, and that is the right way to earn `Fail` later, but it must
-#    be verified by reading back the generated webhook FIRST. Flipping this
-#    field on its own is a cluster outage waiting for the next Kyverno restart,
-#    and the Kyverno controllers on this cluster have restarted hundreds of
-#    times.
+# 1. failurePolicy: Fail IS ONLY SAFE BECAUSE OF THE matchConditions BELOW.
+#    Kyverno does not register one webhook per policy. It groups policies by
+#    failure policy into `mutate.kyverno.svc-ignore` and `mutate.kyverno.svc-
+#    fail`, and the generated rules for a group are the UNION over that group's
+#    policies, cluster wide, with `objectSelector: {}`. Setting `Fail` here with
+#    no matchConditions would therefore register a Fail webhook over pods, Jobs
+#    and Deployments cluster wide, and a Kyverno admission outage would stop
+#    every workload write in the cluster, ArgoCD and the control plane included.
+#    The Kyverno controllers on this cluster have restarted hundreds of times
+#    and the cluster had a seven-hour outage on 2026-08-06.
+#
+#    So `failurePolicy` and `matchConditions` are ONE change, never two. Do not
+#    remove, weaken or "temporarily comment out" the matchConditions while
+#    leaving Fail. If you need to drop the matchConditions, drop Fail with them,
+#    in the same commit.
+#
+# 1a. THIS POLICY MUST STAY THE ONLY `Fail` POLICY IN THIS DIRECTORY, unless the
+#    next one carries matchConditions selecting the SAME objects. Kubernetes ANDs
+#    a webhook's matchConditions, and Kyverno unions the matchConditions of every
+#    policy in a failure-policy group into that group's single webhook. A second
+#    Fail policy with no matchConditions widens this webhook to everything its
+#    own rules cover; a second Fail policy WITH different matchConditions ANDs
+#    them with these and both policies then silently stop firing. Neither is
+#    detectable from this file alone, so it is asserted in CI --
+#    .github/workflows/manifest-validate.yml, "one Fail-policy" guard.
+#
+# 1b. THE CEL MUST NOT BE ABLE TO ERROR. Under `Fail`, a matchCondition that
+#    raises at evaluation time is treated as a failure and the request is
+#    REJECTED -- so a careless expression is the cluster-wide outage arriving by
+#    a different door. Every field access below is guarded before it is read
+#    (`object != null`, then `has(...)`, then `in`, only then the subscript).
+#    CEL's `&&` absorbs errors on the other side of a `false`, so the guards
+#    hold whichever order the evaluator picks. Bare
+#    `object.metadata.labels['factory.io/kind'] == 'task'` is NOT equivalent: on
+#    a pod with no labels it raises "no such key" and rejects that pod.
 #
 # 2. The gate can only ever delay a task pod, never a control-plane one. It is
 #    matched on `factory.io/kind=task` in the `factory` namespace, which is the
@@ -101,9 +126,43 @@
 #    recoverable. See the two-sided check in the script for why the gate cannot
 #    be tricked into passing by a pod that simply has no network.
 #
+# 4. `Fail` DOES NOT COVER A GRACEFUL KYVERNO SHUTDOWN, and it cannot. Measured
+#    on this cluster: Kyverno DELETES kyverno-resource-mutating-webhook-cfg
+#    entirely on clean termination and recreates it on startup --
+#
+#      $ kubectl scale deploy -n kyverno kyverno-admission-controller --replicas=0
+#      $ kubectl get mutatingwebhookconfiguration kyverno-resource-mutating-webhook-cfg
+#      Error from server (NotFound): ... not found
+#
+#    -- which is Kyverno deliberately refusing to wedge the cluster it is
+#    leaving. A webhook that is not registered has no failurePolicy, so during a
+#    Helm upgrade, a node drain or any other orderly restart, task pods are
+#    admitted UNGATED exactly as they were before Factory#620, and the ~700ms
+#    window is open for the length of the restart. What `Fail` closes is the
+#    UNGRACEFUL outage -- crash, OOM kill, node loss, network partition -- where
+#    the webhook config outlives the endpoint behind it. That is the larger and
+#    less announced half, but it is not the whole of it. Do not read `Fail` as
+#    "the gate can no longer be skipped".
+#
+#    It also means the obvious test is a false negative: `scale --replicas=0`
+#    deregisters the webhook before any probe reaches it and reports a clean
+#    pass having exercised nothing. Reproduce an outage by making the endpoint
+#    unreachable while the config stays registered instead.
+#
 # VALIDATE ANY EDIT AGAINST THE LIVE WEBHOOK BEFORE MERGING:
 #   kubectl --context factory apply --dry-run=server -f <this file>
 #   kyverno test apps/kyverno-policies/tests/kyverno-test-gate-task-pods-on-network-policy.yaml
+# AND READ BACK WHAT KYVERNO ACTUALLY GENERATED -- this file is a request, not
+# the webhook. Kyverno v1.18.2 renders it as its own per-policy "finegrained"
+# entry, which is why the scope holds; a future version that folded it back
+# into the shared `-fail` group would inherit that group's union of rules:
+#   kubectl --context factory get mutatingwebhookconfiguration \
+#     kyverno-resource-mutating-webhook-cfg -o json | jq '.webhooks[]
+#     | {name, failurePolicy, matchConditions, rules}'
+# Expected: exactly one Fail entry, named
+# mutate.kyverno.svc-fail-finegrained-gate-task-pods-on-network-policy, rules
+# limited to core/pods on CREATE, carrying only-factory-task-pods; and the
+# `-ignore` entry with matchConditions still null.
 # A policy Kyverno rejects is a file ArgoCD cannot apply, and ArgoCD then keeps
 # serving the previous version while reporting Healthy (Factory#430). And a
 # mutate rule that fires while injecting nothing is schema-valid, applies
@@ -131,9 +190,46 @@ spec:
   # Nothing to re-evaluate in a background scan: this mutates at admission and
   # has no `targets`.
   background: false
-  # See BLAST RADIUS note 1. This is spec-level in kyverno.io/v1; a rule-level
-  # failurePolicy is rejected by the API server with a strict-decoding error.
-  failurePolicy: Ignore
+  # See BLAST RADIUS notes 1, 1a and 1b.
+  #
+  # NOTE THE SPELLING. This used to be a bare `spec.failurePolicy: Ignore`. That
+  # field is deprecated and, the moment `webhookConfiguration` appears, Kyverno's
+  # own policy webhook REJECTS the pair outright:
+  #
+  #   admission webhook "validate-policy.kyverno.svc" denied the request:
+  #   spec.failurePolicy: Forbidden: remove the deprecated field and use
+  #   spec.webhookConfiguration.failurePolicy instead
+  #
+  # So there is exactly one failurePolicy in this file and it lives beside the
+  # matchConditions that make it safe -- which is the right place for it, since
+  # the two are one change (note 1). A rule-level failurePolicy is a different
+  # thing again and is rejected by the API server with a strict-decoding error.
+  webhookConfiguration:
+    failurePolicy: Fail
+    # WHAT MAKES `Fail` SAFE. Kubernetes evaluates these on the API server
+    # BEFORE it dials Kyverno, so a request that does not match is never sent
+    # to the webhook and a Kyverno outage cannot touch it. This is the whole
+    # difference between a scoped Fail webhook and a cluster outage.
+    #
+    # Read the GENERATED webhook back after any edit here -- what Kyverno emits
+    # is not necessarily what this file says, and a Fail webhook that renders
+    # without its matchConditions is the exact configuration this is designed to
+    # avoid:
+    #
+    #   kubectl --context factory get mutatingwebhookconfiguration \
+    #     kyverno-resource-mutating-webhook-cfg \
+    #     -o jsonpath='{.webhooks[?(@.failurePolicy=="Fail")].matchConditions}'
+    #
+    # Each clause guards the next; see BLAST RADIUS note 1b for why a bare
+    # subscript is not equivalent.
+    matchConditions:
+      - name: only-factory-task-pods
+        expression: >-
+          object != null &&
+          request.namespace == 'factory' &&
+          has(object.metadata.labels) &&
+          'factory.io/kind' in object.metadata.labels &&
+          object.metadata.labels['factory.io/kind'] == 'task'
   rules:
     # Rule 1 exists only so rule 2 can insert at index 0 unconditionally.
     # JSON Patch `add` to /spec/initContainers/0 requires the array to exist,

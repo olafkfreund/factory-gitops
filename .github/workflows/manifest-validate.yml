@@ -993,7 +993,80 @@ jobs:
           #     rekor, by design; the suite is offline rule logic only.
           #   - Anything the webhook checks at admission time that the CLI does
           #     not, which is why the `kyverno apply` step above stays.
+          #   - A `Fail` policy widening beyond its matchConditions. That is not
+          #     a property of a rule, it is a property of the generated webhook,
+          #     and `kyverno test` never generates one. See the next step.
           exit "$fail"
+
+      # Factory#620. A Kyverno `Fail` webhook can stop every write it covers, so
+      # the blast radius of a Fail policy is decided entirely by its
+      # matchConditions -- and by how many Fail policies share the webhook.
+      #
+      # WHY THIS IS NOT COVERED ABOVE. Everything else in this job reasons about
+      # a policy in isolation. This hazard only exists BETWEEN policies:
+      # Kubernetes ANDs a webhook's matchConditions and Kyverno unions the
+      # matchConditions of every policy in a failure-policy group into that
+      # group's webhook. So adding a second Fail policy is enough to break the
+      # first one's scope without editing the first one's file -- either
+      # widening the webhook (second policy has no matchConditions) or silently
+      # switching both policies off (second policy has different ones). Neither
+      # is visible from either file alone, neither changes any rule's behaviour
+      # in `kyverno test`, and the failure mode of getting it wrong is the whole
+      # cluster.
+      #
+      # Kyverno v1.18.2 happens to render a policy that sets
+      # `webhookConfiguration` into its OWN "finegrained" webhook, which dodges
+      # the union -- verified by reading the generated config back off the
+      # cluster. This gate does not depend on that holding: it keeps the repo in
+      # the state that is safe either way.
+      - name: A Fail policy must be scoped, and must be the only one
+        run: |
+          set -uo pipefail
+
+          mapfile -t POLICIES < <(
+            git ls-files -z 'apps/**/*.yaml' | tr '\0' '\n' | sort | while read -r f; do
+              grep -qE '^apiVersion:[[:space:]]*"?kyverno\.io/' "$f" && printf '%s\n' "$f"
+            done
+          )
+          # Rule 4.7: a gate that cannot run must fail, not pass. The same
+          # discovery regex as the steps above, so if that regex ever stops
+          # matching, every Kyverno step in this job goes red together rather
+          # than this one quietly finding nothing to check.
+          if [ "${#POLICIES[@]}" -eq 0 ]; then
+            echo "::error::discovered 0 Kyverno policies -- this gate checked nothing"
+            exit 1
+          fi
+          echo "scanning ${#POLICIES[@]} Kyverno policy file(s) for Fail webhooks"
+
+          rc=0
+          failing=()
+          for f in "${POLICIES[@]}"; do
+            # Both spellings. `spec.failurePolicy` is deprecated and Kyverno
+            # rejects it outright alongside `webhookConfiguration`, but a policy
+            # carrying only the old one is still a Fail webhook.
+            fp=$(yq -r '[.spec.failurePolicy, .spec.webhookConfiguration.failurePolicy] | map(select(. != null)) | .[0] // "Ignore"' "$f")
+            [ "$fp" = "Fail" ] || continue
+
+            failing+=("$f")
+            n=$(yq -r '.spec.webhookConfiguration.matchConditions | length // 0' "$f")
+            if [ "$n" -lt 1 ]; then
+              echo "::error file=$f::failurePolicy Fail with no spec.webhookConfiguration.matchConditions -- this registers a Fail webhook over everything the policy's rules cover, cluster wide (Factory#620)"
+              rc=1
+            else
+              echo "ok  fail-scope  $f  ($n matchCondition(s))"
+            fi
+          done
+
+          if [ "${#failing[@]}" -gt 1 ]; then
+            echo "::error::${#failing[@]} policies set failurePolicy Fail: ${failing[*]}"
+            echo "::error::Kyverno ANDs matchConditions across a failure-policy group, so a second Fail policy either widens the first one's webhook or switches both off. Read the generated webhook back off the cluster before allowing this (Factory#620)."
+            rc=1
+          fi
+
+          if [ "${#failing[@]}" -eq 0 ]; then
+            echo "no Fail policies -- nothing to scope"
+          fi
+          exit "$rc"
 
   # Second gate, deliberately NOT the required status check (branch protection
   # requires only "kustomize build + schema"). It currently FAILS, on purpose:
