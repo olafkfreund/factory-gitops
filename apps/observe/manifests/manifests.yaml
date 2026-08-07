@@ -44,12 +44,52 @@ spec:
     spec:
       enableServiceLinks: false
       # OpenObserve image runs as root by default; fsGroup lets it own the PVC dir.
-      securityContext: { fsGroup: 65532 }
+      #
+      # Factory#521 — this pod had fsGroup and NOTHING else: no seccomp profile,
+      # no capability drop, no no-new-privileges. It was the last Deployment in
+      # this namespace still on the container-runtime defaults, i.e. it kept all
+      # 14 default capabilities and the unconfined seccomp profile.
+      #
+      # Everything below was measured against this exact image before it was
+      # applied, because a wrong guess here is a CrashLoop on the cluster's only
+      # observability backend. Probed with `docker run` on the pinned digest,
+      # proved by REQUEST rather than by container status (#521 warns a container
+      # can stay Running and useless):
+      #
+      #   baseline (runtime defaults)                 /healthz 200, /web/ 200
+      #   --cap-drop ALL --security-opt               /healthz 200, /web/ 200
+      #     no-new-privileges                          <- what is applied here
+      #   ... + --user 65532:65532                    /healthz 200, /web/ 200
+      #   ... + --read-only --tmpfs /tmp              PANIC, exit 101:
+      #       "create cache dir success: Os { code: 30, kind: ReadOnlyFilesystem }"
+      #       at src/config/src/config.rs:3114
+      #
+      # So `readOnlyRootFilesystem: true` is NOT available on this image: it
+      # builds a cache directory outside /tmp at startup and panics when it
+      # cannot. That is a real finding, not a guess — Factory#322 tracks the
+      # rootfs epic and this workload is a documented non-starter for it.
+      #
+      # `runAsNonRoot`/`runAsUser: 65532` DOES work on a fresh volume (third
+      # probe above) but is deliberately NOT set here, and this is the reason:
+      # this pod has been running as root against `observe-data` since it was
+      # created, so every Parquet file and the SQLite metadata store under /data
+      # is owned by uid 0. fsGroup 65532 fixes group ownership, not the mode
+      # bits, so a uid-65532 process would find its own existing data
+      # group-readable and not group-writable. Flipping the uid needs a chown of
+      # the existing volume in the same change, which is a maintenance window
+      # with a backup, not a drive-by edit inside a hardening sweep. Tracked
+      # separately rather than silently skipped: Factory#607.
+      securityContext:
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: openobserve
           # Pinned, NOT latest. public.ecr.aws/zinclabs is the official ECR mirror.
           image: public.ecr.aws/zinclabs/openobserve:v0.90.3@sha256:f77856199bff2097e0355d66e59d5792064ff8ff831ea5f580b3650fa5457136
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
           ports:
             - { containerPort: 5080, name: http }
             - { containerPort: 5081, name: grpc }
