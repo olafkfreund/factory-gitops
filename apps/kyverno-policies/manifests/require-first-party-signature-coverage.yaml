@@ -70,12 +70,18 @@
 # filed about, reintroduced by the fix for it.
 #
 # A second reason, independent of the first: with no attestor the message is
-# clean, but any attestor at all means Kyverno must READ the image. `odin` is a
-# private GHCR package, so that read fails `UNAUTHORIZED: authentication
-# required` -- and Factory#430 is the record of how expensive it is when a
-# transport failure is reported in the same words as a signature verdict. The
-# validate form never touches the registry, so it cannot produce that
-# ambiguity.
+# clean, but any attestor at all means Kyverno must READ the image. When this
+# policy was written `odin` was a private GHCR package and that read failed
+# `UNAUTHORIZED: authentication required` -- and Factory#430 is the record of
+# how expensive it is when a transport failure is reported in the same words as
+# a signature verdict. Every first-party package is public today (Factory#572,
+# #566), so that is no longer a live example, but the property is the reason
+# this shape was chosen and it does not depend on today's visibility: the
+# validate form never touches the registry, so it CANNOT produce that ambiguity
+# for any image, including one made private tomorrow. That is precisely the
+# property a coverage control needs -- it must keep answering "is this image
+# covered" when the registry is unreachable, because an unreachable registry is
+# when an unnoticed gap does the most damage.
 #
 # ---------------------------------------------------------------------------
 # WHAT `skip` MEANS HERE, AND WHY THERE ARE A LOT OF THEM
@@ -128,11 +134,16 @@
 # request regardless of how many images are uncovered, and names the image only
 # when some other image on the same Pod verified. It cannot attribute.
 #
-# THE TWO CHANNELS CROSS-CHECK EACH OTHER. Both must name `odin` today
-# (Factory#572). If this rule's mirror list below drifts from the globs in
-# verify-factory-image-signatures, the probe -- which reads those globs'
-# effects and not this list -- will disagree, and it carries a canary that
-# makes the disagreement loud rather than silent.
+# THE TWO CHANNELS CROSS-CHECK EACH OTHER. If this rule's mirror list below
+# drifts from the globs in verify-factory-image-signatures, the probe -- which
+# reads those globs' effects and not this list -- will disagree, and it carries
+# a canary that makes the disagreement loud rather than silent.
+#
+# Both channels named `odin` until 2026-08-07, when Factory#572 gave it
+# `verify-odin-signature` and added `odin:` to the mirror below in the same
+# commit. Both must now be SILENT about it, and the two going silent together
+# is the cross-check working. If one still names it, the mirror and the globs
+# have drifted and one of the two is lying.
 #
 # ---------------------------------------------------------------------------
 # THE COVERED LIST BELOW MIRRORS THE GLOBS IN verify-factory-image-signatures.
@@ -185,8 +196,15 @@ metadata:
 spec:
   # AUDIT/WARN ONLY. Do NOT flip this to Enforce. Factory#522 tracks the flip
   # for the signature policy with its own blockers, and this control shares the
-  # decisive one: nothing has yet been observed denying on a real workload. At
-  # Enforce today this would deny `odin`, which is a running dashboard.
+  # decisive one: nothing has yet been observed denying on a real workload.
+  #
+  # What HAS now been observed, and is the closest thing to that evidence this
+  # control has produced (Factory#572): it reported a standing `fail` against a
+  # real running Pod -- odin-dashboard, on ghcr.io/olafkfreund/odin:sha-2749b26
+  # -- for as long as the gap was real, and stopped when the gap was closed.
+  # That is a control objecting to a genuine workload and then falling silent
+  # for a reason, rather than one that has only ever been quiet. It is still not
+  # a denial, which is what #522 needs.
   validationFailureAction: Audit
   # If Kyverno is down, admit. This is a reporting control, not a gate.
   failurePolicy: Ignore
@@ -225,7 +243,7 @@ spec:
             jmesPath: >-
               request.object.spec.[containers, initContainers, ephemeralContainers][].image
               | [?regex_match('^ghcr\.io/olafkfreund/', @)]
-              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|skillai:|skillai-migrator:|tfactory-runner-)', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|odin:|skillai:|skillai-migrator:|tfactory-runner-)', @)]
             # A Pod with no containers matching cannot produce a null here.
             default: []
       preconditions:

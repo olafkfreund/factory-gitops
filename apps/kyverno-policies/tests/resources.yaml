@@ -4,12 +4,26 @@
 # point while the rule was being built, or is a trap the fleet has already paid
 # for once. None of them is filler.
 ---
-# The image that was running in `factory` matched by no rule at all.
+# THE `:` TRAP FOR THE NEWEST MIRROR ENTRY, AND THE CASE THAT MAKES THIS SUITE
+# ASSERT SOMETHING ABOUT `odin` AT ALL.
+#
+# Factory#572 added `odin:` to the mirror list. `covered-odin` below asserts
+# that entry works, but its expected result is `skip` -- and `skip` is the one
+# verdict the #148 gate cannot tell apart from a rule that evaluated nothing.
+# Drop the `odin:` entry entirely and `covered-odin` turns from skip to fail,
+# which IS caught; but write it as `odin` without the colon and `covered-odin`
+# stays skip and stays green while the entry has silently grown to cover every
+# `odin*` package that will ever exist.
+#
+# THIS case is the one that catches that. `odin-exporter` is the next name in
+# the family, it has no rule and no signer identity of its own, and it must
+# report `fail` -- a real, genuinely-evaluated verdict, not a skip. It goes
+# green-to-red on exactly the mutation `covered-odin` sleeps through.
 apiVersion: v1
 kind: Pod
-metadata: {name: uncovered-odin, namespace: factory}
+metadata: {name: uncovered-odin-exporter, namespace: factory}
 spec:
-  containers: [{name: c, image: "ghcr.io/olafkfreund/odin:sha-2749b26"}]
+  containers: [{name: c, image: "ghcr.io/olafkfreund/odin-exporter:v1"}]
 ---
 # THE POINT OF THE WHOLE POLICY: an image nobody has thought of yet. If this
 # case ever stops failing, the class has reopened and #564 is back.
@@ -96,6 +110,17 @@ spec:
     - {name: a, image: "ghcr.io/olafkfreund/tfactory-runner-pytest:latest"}
     - {name: b, image: "ghcr.io/olafkfreund/tfactory-runner-nix:latest"}
     - {name: c, image: "ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-bbd4400"}
+---
+# Factory#572. The exact image reference that was the single standing `fail` on
+# this policy's live board until 2026-08-07 -- odin-dashboard's container, read
+# off the running Pod. It is covered now, so it must read `skip`. If this ever
+# turns back to `fail`, the `odin:` mirror entry has been dropped while
+# `verify-odin-signature` still exists, and the two channels have drifted.
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-odin, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/odin:sha-2749b26"}]
 ---
 # skillai and skillai-migrator are separate globs for the same `:` reason.
 apiVersion: v1

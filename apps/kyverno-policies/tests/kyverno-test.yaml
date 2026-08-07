@@ -34,7 +34,7 @@ results:
     kind: Pod
     result: fail
     resources:
-      - uncovered-odin
+      - uncovered-odin-exporter
       - uncovered-future-service
       - uncovered-digest-pinned
       - uncovered-in-initcontainer
@@ -52,6 +52,7 @@ results:
       - covered-cfactory
       - covered-cfactory-frontend
       - covered-runners
+      - covered-odin
       - covered-skillai-both
       - thirdparty-out-of-scope
       - lookalikes-not-ours

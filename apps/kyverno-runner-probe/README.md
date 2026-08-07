@@ -104,11 +104,14 @@ signature canary correctly voids the run.
 
 - `tfactory-runner-nix`, `tfactory-runner-portal-ui` — `registry_auth`. Private
   GHCR packages, Kyverno reads ghcr.io anonymously (Factory#563).
-- `odin` — `not_covered`. Signed, but its GHCR package is private and
-  `kyverno-ghcr-pull` does not exist, so a rule would report `UNAUTHORIZED` in
-  the same words a signature failure uses. Deliberately ruleless; Factory#572.
-  It is carried here so this record states the true first-party position rather
-  than a runner-only slice of it. Do not remove it to get a green.
+- `odin` — was `not_covered`; **closed by Factory#572** on 2026-08-07. The GHCR
+  package was made public, `verify-odin-signature` landed in
+  `verify-factory-image-signatures`, and odin now reports `pass` here on its
+  own. It stays in the probe's image list — removing it would drop a real
+  signature verification for no gain. One caveat that did not apply while it was
+  uncovered: its pinned tag is now actually fetched and verified, so a stale pin
+  still passes while describing a HISTORICAL image. The standing PolicyReport,
+  not this row, is the channel that follows the running Pod.
 
 **Factory#522 must not read the at-rest board as evidence while these stand**:
 at Enforce this denies every build and verify Job in the fleet.
