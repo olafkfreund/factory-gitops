@@ -294,7 +294,9 @@ spec:
       #   Duplicate value: "netpol-gate"
       #
       # Kyverno's resource mutating webhook is registered with
-      # `reinvocationPolicy: IfNeeded`, so the API server calls it AGAIN
+      # `reinvocationPolicy: IfNeeded` -- including the per-policy `-fail`
+      # entry Factory#620 added, which was read back off the cluster and carries
+      # `IfNeeded` like every other Kyverno mutating webhook. So the API server calls it AGAIN
       # whenever another webhook alters the object in the same admission. A
       # JSON Patch `add` at an index is not idempotent -- the second invocation
       # cheerfully inserts a second gate -- and the pod then fails API
