@@ -197,7 +197,33 @@ spec:
               # secret key in a process argument where any `ps` in this container
               # could read it. Same credential, same Secret, off argv.
               echo "waiting for minio..."
-              until mc ls fac/ >/dev/null 2>&1; do
+              # BOUNDED (Factory#508). This was `until mc ls fac/ >/dev/null 2>&1;
+              # do sleep 3; done` — unbounded, and with both the error text and the
+              # exit code thrown away. A MinIO that never came back therefore left
+              # this Job Running FOREVER: it never succeeded, and it never failed,
+              # so `backoffLimit` was never reached, `restartPolicy: Never` never
+              # produced a terminal pod, and nothing downstream ever fired.
+              # apps/job-watchdog does not cover this: it iterates
+              # /apis/batch/v1/cronjobs, and this is a bare Job, and its own
+              # job_state() treats an active Job as "neither succeeded nor failed".
+              # So the outcome was a silent no-op — versioning, encryption and
+              # every ILM assertion below simply never execute — which is the same
+              # unobservable-by-construction hole as the `2>/dev/null || true`
+              # retention this Job was already fixed for. A hang is not a failure
+              # until something makes it one.
+              #
+              # NOT `activeDeadlineSeconds` on the Job, which would be the obvious
+              # reach: exceeding it makes the Job controller DELETE the active pod,
+              # so the timeout would destroy the very logs explaining the timeout —
+              # re-introducing this issue's top half by another route. Failing from
+              # inside the container leaves a terminal pod that can be read.
+              i=0
+              while ! err="$(mc ls fac/ 2>&1)"; do
+                i=$((i + 1))
+                if [ "$i" -ge 100 ]; then
+                  echo "FATAL: minio.factory.svc.cluster.local:9000 unreachable after $((i * 3))s: $err" >&2
+                  exit 1
+                fi
                 sleep 3
               done
               mc mb --ignore-existing fac/factory-artifacts
