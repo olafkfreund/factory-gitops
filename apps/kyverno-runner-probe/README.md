@@ -100,21 +100,42 @@ signature canary correctly voids the run.
 
 ## Current verdict
 
-9 pass, 3 fail, both canaries holding.
+**Expected: 12 pass, 0 fail, both canaries holding.** All twelve images in the
+list above, no exceptions.
 
-- `tfactory-runner-nix`, `tfactory-runner-portal-ui` — `registry_auth`. Private
-  GHCR packages, Kyverno reads ghcr.io anonymously (Factory#563).
-- `odin` — was `not_covered`; **closed by Factory#572** on 2026-08-07. The GHCR
+This number is DERIVED, not yet read off a probe run — the last three fails were
+each closed by a change, and the next scheduled run is the confirmation. Treat a
+red on the next run as real and triage it; do not assume this line.
+
+The three that were failing, and what closed each:
+
+- `tfactory-runner-nix`, `tfactory-runner-portal-ui` — were `registry_auth`,
+  because both were private GHCR packages and Kyverno reads ghcr.io anonymously.
+  **Closed by Factory#563** on 2026-08-07: both packages were made public, the
+  `--imagePullSecrets=kyverno-ghcr-pull` flag was removed as a dangling
+  reference to a Secret that was never created, and the live webhook was
+  measured returning `pass` for all three kinds of runner with no credential.
+- `odin` — was `not_covered`. **Closed by Factory#572** on 2026-08-07. The GHCR
   package was made public, `verify-odin-signature` landed in
-  `verify-factory-image-signatures`, and odin now reports `pass` here on its
-  own. It stays in the probe's image list — removing it would drop a real
-  signature verification for no gain. One caveat that did not apply while it was
+  `verify-factory-image-signatures`, and odin reports `pass` here on its own. It
+  stays in the probe's image list — removing it would drop a real signature
+  verification for no gain. One caveat that did not apply while it was
   uncovered: its pinned tag is now actually fetched and verified, so a stale pin
-  still passes while describing a HISTORICAL image. The standing PolicyReport,
-  not this row, is the channel that follows the running Pod.
+  still passes while describing a HISTORICAL image. odin redeployed from
+  `sha-2749b26` to `sha-39ecd91` within hours of the rule landing, and both
+  verify under the same identity. The standing PolicyReport, not this row, is
+  the channel that follows the running Pod.
 
-**Factory#522 must not read the at-rest board as evidence while these stand**:
-at Enforce this denies every build and verify Job in the fleet.
+Two failure modes this board cannot see, both worth knowing before quoting it as
+evidence:
+
+- A **narrowed glob** in `verify-factory-image-signatures` makes a rule stop
+  speaking rather than fail — measured `pass: 0, fail: 0, skip: 0` on two
+  independent rules. This probe is the compensating control for that, but its
+  own image list is hand-maintained too, so narrowing a glob and dropping the
+  matching entry here in one commit restores the silence. Tracked in
+  factory-gitops#181.
+- A **stale pin**, as above: `pass` on a tag nobody runs any more.
 
 ### The #522 gate has a third term now
 
