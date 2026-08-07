@@ -508,10 +508,22 @@ jobs:
                   "privileged ports. drop:[ALL] crashloops the NFS server and takes "
                   "the `nfs` storageClass -- and tfactory-data-rwx -- with it. "
                   "Measured: Factory#521, evidence in apps/nfs-provisioner/manifests.",
+              ("nfs-provisioner", "nfs-provisioner", "runAsNonRoot"):
+                  "Same root cause as its capabilities carve-out above: ganesha "
+                  "binds privileged ports and setuids down itself, so it has to "
+                  "start as uid 0. Factory#521.",
+              ("odin-dashboard", "odin", "runAsNonRoot"):
+                  "TEMPORARY, tracked by Factory#622. odin-dashboard needs uid 0 "
+                  "only because its deploy key Secret is mounted at /root/.ssh, "
+                  "which is drwx------ root root. The fix is a mount-path move "
+                  "plus an IdentityFile flag in the Odin repo, so it needs a new "
+                  "odin image before the manifest can flip. DELETE THIS LINE in "
+                  "the same change that sets runAsNonRoot on odin-dashboard.",
           }
 
           KINDS = {"Deployment", "StatefulSet", "DaemonSet"}
-          CONTROLS = ("seccompProfile", "allowPrivilegeEscalation", "capabilities.drop[ALL]")
+          CONTROLS = ("seccompProfile", "allowPrivilegeEscalation", "capabilities.drop[ALL]",
+                      "runAsNonRoot")
 
 
           def missing(pod_sc, sc):
@@ -526,6 +538,10 @@ jobs:
               drop = [str(d).upper() for d in ((sc.get("capabilities") or {}).get("drop") or [])]
               if "ALL" not in drop:
                   out.append("capabilities.drop[ALL]")
+              # runAsNonRoot is inheritable like seccomp: the pod-level form
+              # covers every container, so either level satisfies it.
+              if sc.get("runAsNonRoot") is not True and pod_sc.get("runAsNonRoot") is not True:
+                  out.append("runAsNonRoot")
               return out
 
 
@@ -579,8 +595,15 @@ jobs:
                     "(informational, does not fail):")
               for u in sorted(unhardened):
                   print("  -  " + u)
-          print("ratchet: " + str(len(seen)) + "/" + str(len(HARDENED))
-                + " banked workload(s) still carry " + ", ".join(CONTROLS))
+          # Printed AFTER the verdict is known: this line used to say
+          # "18/18 ... still carry" even on a red run, because it counts
+          # workloads seen, not workloads passed. A summary that reads green on
+          # a failing build is the exact shape this repo keeps getting bitten by.
+          if bad:
+              print("ratchet: REGRESSION -- see the ::error:: annotations above")
+          else:
+              print("ratchet: " + str(len(seen)) + "/" + str(len(HARDENED))
+                    + " banked workload(s) still carry " + ", ".join(CONTROLS))
           sys.exit(bad)
           PYEOF
 
