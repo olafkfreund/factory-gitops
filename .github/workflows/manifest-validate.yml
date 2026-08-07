@@ -209,6 +209,204 @@ jobs:
 
           exit "$fail"
 
+      - name: Assert the pod-hardening ratchet has not slipped
+        run: |
+          set -uo pipefail
+
+          # Factory#521. Factory#503 hardened the five Factory-owned control-plane
+          # Deployments; #521 did the third-party ones. NOTHING kept either set
+          # hardened. Deleting a securityContext block from any of them was, until
+          # this step, a change that passed every gate in this repo: kustomize
+          # builds it, kubeconform calls it schema-valid, and Kyverno ADMITS it.
+          #
+          # That last one is the part worth being blunt about. The fleet's Kyverno
+          # policy is `Audit` for everything except the single scoped Enforce rule
+          # landed in Factory#570. An Audit policy writes a PolicyReport and lets
+          # the pod through -- it CONSTRAINS NOTHING. Factory#522 is the issue that
+          # would change that. Until it does, this step is the only enforcement
+          # that exists for pod hardening in this repo, and it is CI-side, so it
+          # binds what this repo declares, not what is running in the cluster.
+          #
+          # It is a RATCHET, not a blanket policy, and deliberately so: a blanket
+          # "every workload must be hardened" check is red today (fides-db,
+          # fides-server, postgres) and a permanently-red REQUIRED check wedges
+          # every merge. This repo already faced that trade for the literal-secrets
+          # scan (#116) and answered it by making that job non-required. A ratchet
+          # is the shape that can live inside the required job: green now, red the
+          # moment something that IS hardened stops being.
+          #
+          # Mutation-tested before it landed, all three guards, both directions:
+          #   strip drop:[ALL] from observe        -> RED  (exit 1), restore -> GREEN
+          #   strip seccompProfile from odin       -> RED  (exit 1), restore -> GREEN
+          #   rename a banked container            -> RED  (exit 1), restore -> GREEN
+
+          mapfile -t DIRS < <(find . -name kustomization.yaml -not -path './.git/*' -printf '%h\n' | sort)
+          mapfile -t ALL < <(git ls-files -z '*.yaml' '*.yml' | tr '\0' '\n' | sort)
+          if [ "${#DIRS[@]}" -eq 0 ] || [ "${#ALL[@]}" -eq 0 ]; then
+            echo "::error::discovery found nothing -- this gate checked nothing"
+            exit 1
+          fi
+
+          is_kustomized() {
+            local f="$1" d
+            for d in "${DIRS[@]}"; do
+              case "$f" in "${d#./}"/*) return 0 ;; esac
+            done
+            return 1
+          }
+
+          # Same three buckets as the schema step, for the same reason (#117):
+          # anything not covered by a kustomization is still read, so a new
+          # manifest directory is checked the day it lands.
+          : > /tmp/hardening-all.yaml
+          for d in "${DIRS[@]}"; do
+            kustomize build "$d" >> /tmp/hardening-all.yaml 2>/dev/null
+            echo "---" >> /tmp/hardening-all.yaml
+          done
+          for f in "${ALL[@]}"; do
+            is_kustomized "$f" && continue
+            case "$f" in .github/workflows/*|mkdocs.yml) continue ;; esac
+            cat "$f" >> /tmp/hardening-all.yaml
+            echo "---" >> /tmp/hardening-all.yaml
+          done
+
+          # yq for the parse (these manifests use flow style and anchors, so a
+          # grep is not a parser -- the same reasoning as #148), python for the
+          # assertion.
+          yq -o=json -I0 '[.]' /tmp/hardening-all.yaml 2>/dev/null \
+            | python3 -c "
+          import json,sys
+          docs=[]
+          for line in sys.stdin:
+              line=line.strip()
+              if not line: continue
+              try: docs.extend(json.loads(line))
+              except Exception: pass
+          json.dump(docs, open('/tmp/hardening.json','w'))
+          "
+
+          cat > /tmp/assert-hardened.py <<'PYEOF'
+          import json, sys
+
+          # Workloads whose hardening has been paid for and MEASURED. Losing a
+          # control here is a regression and fails the build. Adding a workload
+          # here is how the win gets banked.
+          #   Factory#503: the five Factory-owned control-plane Deployments
+          #   Factory#521: the third-party ones
+          HARDENED = {
+              ("aifactory", "aifactory"), ("aifactory", "cred-sync"),
+              ("pfactory", "pfactory"),   ("pfactory", "cred-sync"),
+              ("tfactory", "tfactory"),   ("tfactory", "cred-sync"),
+              ("cfactory", "cfactory"),
+              ("cfactory-frontend", "frontend"),
+              ("cloudflared", "cloudflared"),
+              ("keycloak", "keycloak"),
+              ("minio", "minio"),
+              ("redis", "redis"),
+              ("oauth2-proxy-cfactory", "oauth2-proxy"),
+              ("oauth2-proxy-observe", "oauth2-proxy"),
+              ("oauth2-proxy-odin", "oauth2-proxy"),
+              ("observe", "openobserve"),
+              ("odin-dashboard", "odin"),
+              ("nfs-provisioner", "nfs-provisioner"),
+          }
+
+          # Per-control carve-outs. Each one is a line in a diff a reviewer sees.
+          EXCEPTIONS = {
+              ("nfs-provisioner", "nfs-provisioner", "capabilities.drop[ALL]"):
+                  "ganesha forks rpcbind and rpc.statd, which setuid down and bind "
+                  "privileged ports. drop:[ALL] crashloops the NFS server and takes "
+                  "the `nfs` storageClass -- and tfactory-data-rwx -- with it. "
+                  "Measured: Factory#521, evidence in apps/nfs-provisioner/manifests.",
+          }
+
+          KINDS = {"Deployment", "StatefulSet", "DaemonSet"}
+          CONTROLS = ("seccompProfile", "allowPrivilegeEscalation", "capabilities.drop[ALL]")
+
+
+          def missing(pod_sc, sc):
+              out = []
+              # seccomp is inherited from the pod, so either level satisfies it.
+              seccomp = (sc.get("seccompProfile") or pod_sc.get("seccompProfile") or {}).get("type")
+              if seccomp not in ("RuntimeDefault", "Localhost"):
+                  out.append("seccompProfile")
+              # allowPrivilegeEscalation is container-only; no pod-level form exists.
+              if sc.get("allowPrivilegeEscalation") is not False:
+                  out.append("allowPrivilegeEscalation")
+              drop = [str(d).upper() for d in ((sc.get("capabilities") or {}).get("drop") or [])]
+              if "ALL" not in drop:
+                  out.append("capabilities.drop[ALL]")
+              return out
+
+
+          docs = [d for d in json.load(open("/tmp/hardening.json")) if isinstance(d, dict)]
+          workloads = [d for d in docs if d.get("kind") in KINDS]
+          # Rule 4.7, the guard every step in this file carries: absence is a
+          # failure, not a pass.
+          if not workloads:
+              print("::error::rendered manifests contain no Deployment/StatefulSet/DaemonSet "
+                    "-- discovery broke and this gate checked nothing")
+              sys.exit(1)
+
+          seen, bad, unhardened = set(), 0, []
+          for d in workloads:
+              name = (d.get("metadata") or {}).get("name", "<unnamed>")
+              spec = (d.get("spec") or {}).get("template", {}).get("spec") or {}
+              pod_sc = spec.get("securityContext") or {}
+              for c in spec.get("containers") or []:
+                  cname = c.get("name", "<unnamed>")
+                  gaps = missing(pod_sc, c.get("securityContext") or {})
+                  if (name, cname) not in HARDENED:
+                      if gaps:
+                          unhardened.append(name + "/" + cname + ": " + ", ".join(gaps))
+                      continue
+                  seen.add((name, cname))
+                  for control in gaps:
+                      if (name, cname, control) in EXCEPTIONS:
+                          continue
+                      print("::error::REGRESSION: " + name + "/" + cname + " no longer sets "
+                            + control + ". This workload was hardened deliberately "
+                            "(Factory#503/#521) and the control has been removed. Kyverno is "
+                            "in Audit mode (Factory#522) and will ADMIT this pod, so nothing "
+                            "downstream will catch it.")
+                      bad = 1
+
+          # A banked workload that vanishes from the render silently loosens the
+          # ratchet -- the #148 failure shape exactly (a name the check asserts on
+          # but the tree no longer has, which passes vacuously). Renaming must be
+          # a deliberate edit here, not an accident.
+          for key in sorted(HARDENED - seen):
+              print("::error::" + key[0] + "/" + key[1] + " is in HARDENED but no such "
+                    "container was rendered -- it was renamed or removed. Update HARDENED "
+                    "deliberately; leaving it stale means this gate silently stops checking it.")
+              bad = 1
+
+          # Reported, never fatal. These are the workloads #521 did not reach --
+          # they are visible so the next sweep has a worklist, but they cannot
+          # wedge the required check.
+          if unhardened:
+              print("note: " + str(len(unhardened)) + " container(s) not yet in the ratchet "
+                    "(informational, does not fail):")
+              for u in sorted(unhardened):
+                  print("  -  " + u)
+          print("ratchet: " + str(len(seen)) + "/" + str(len(HARDENED))
+                + " banked workload(s) still carry " + ", ".join(CONTROLS))
+          sys.exit(bad)
+          PYEOF
+
+          python3 /tmp/assert-hardened.py
+
+          # What this does NOT do, so a green tick is not over-read:
+          #   - It checks what this repo DECLARES, not what is RUNNING. Declared
+          #     and live drift, which is the whole premise of #521; only a cluster
+          #     probe or an Enforce-mode admission rule speaks to live state.
+          #   - It does not cover runAsNonRoot or readOnlyRootFilesystem. Both have
+          #     genuine per-image exceptions in this namespace (Factory#621, #622)
+          #     and a ratchet that starts with carve-outs teaches people to add
+          #     carve-outs. Factory#322 owns those two.
+          #   - It cannot see workloads sourced from other repos. skillai-app comes
+          #     from olafkfreund/SkillAi and is unhardened live; Factory#624.
+
       - name: Validate Kyverno policies with Kyverno's own policy validation
         run: |
           set -uo pipefail
