@@ -3,6 +3,10 @@ kind: Kustomization
 namespace: factory
 resources:
 - manifests.yaml
+# Factory#516 — asks the COLLECTOR whether each service is still emitting.
+# Kept in its own file: it is the one control here that does not trust a
+# service's own account of itself.
+- trace-silence-check.yaml
 
 # No `images:` transformer here, deliberately (Factory#573).
 #
