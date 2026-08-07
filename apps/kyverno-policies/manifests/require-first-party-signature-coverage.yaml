@@ -24,13 +24,13 @@
 # fail on its own, the day it lands, without anybody remembering to look.
 #
 # ---------------------------------------------------------------------------
-# WHY THIS IS A SEPARATE POLICY AND NOT A SIXTH RULE IN verify-factory-image-
+# WHY THIS IS A SEPARATE POLICY AND NOT A RULE IN verify-factory-image-
 # signatures
 # ---------------------------------------------------------------------------
 #
 # 1. It needs `pod-policies.kyverno.io/autogen-controllers: none`, and that
-#    annotation is POLICY-WIDE. The five verifyImages rules depend on autogen --
-#    most of their ~66 results come from autogen'd ReplicaSets and Deployments --
+#    annotation is POLICY-WIDE. The verifyImages rules depend on autogen --
+#    most of their results come from autogen'd ReplicaSets and Deployments --
 #    so setting it there would gut the existing board. Here it is wanted: a Pod
 #    is what actually runs, and one result per Pod beats one per Pod plus one
 #    per ReplicaSet plus one per Deployment saying the same thing.
