@@ -13,3 +13,54 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - keda.yaml
+
+# Digest pins (factory-gitops#161). `2.20.1` is a tag, and a tag is a pointer:
+# kedacore can repoint it at any time and this cluster would pull whatever it
+# then names, with nothing in this repo changing. Factory#573 pinned the twelve
+# third-party images in the `factory` namespace and stopped at that boundary,
+# which left every image in `keda`, `kyverno` and `argocd` on a pointer.
+#
+# WHY NOT AN EDIT TO keda.yaml, which is where the refs actually are: the
+# header above tells the next person to re-render that file with `helm
+# template`, and a re-render silently drops any pin written into it. A pin has
+# to live somewhere a re-render cannot erase.
+#
+# WHY THE DIGEST IS INSIDE `newTag:` RATHER THAN IN `digest:`, which is the
+# field that looks like it is for this. `digest:` REPLACES the tag: it renders
+# `ghcr.io/kedacore/keda@sha256:...` and `2.20.1` is gone from the output.
+# That is not cosmetic. The freshness watchdog (factory-gitops#139) answers
+# "has this pin fallen behind?" by re-resolving the TAG and comparing, so a
+# digest-only pin is a pin nothing can ever tell you is stale -- which is
+# precisely the trap #139 exists to describe, dug one level deeper. kustomize
+# concatenates `name` + ":" + `newTag`, so putting `tag@sha256:...` in newTag
+# keeps both halves. Verified in the rendered output, not assumed.
+# (apps/observe/manifests/kustomization.yaml records the other direction of
+# this footgun: a newTag with NO digest strips a digest already in the source.)
+#
+# WHY A TRANSFORMER AND NOT PATCHES: a patch indexes by Deployment name AND
+# container position, and a Helm re-render can move either without saying so --
+# a patch that silently stops matching leaves the image unpinned and the build
+# green. `images:` matches on the image name itself, which is the thing that
+# actually has to be pinned, wherever it appears and however many times.
+#
+# THE TRAP THAT REMAINS, and it is the reason the tag is repeated below: bump
+# `--version` above without re-resolving these and kustomize staples a 2.20.1
+# digest onto whatever tag string is written here. If the tag half is also
+# bumped the ref is internally contradictory and the registry honours the
+# DIGEST -- so you have "upgraded" to the old bytes under a new name. Nothing
+# in kustomize catches that; the freshness watchdog does, because the tag it
+# re-resolves will not match the pinned digest. Re-render and re-resolve all
+# three in the same commit.
+#
+# Resolved live 2026-08-08 with `crane digest`, and each one equals the
+# imageID the running pod already carries, so applying this pulls nothing:
+#   keda:2.20.1                    sha256:8888d189...  keda-operator-7c55ff4d79-wpc64
+#   keda-metrics-apiserver:2.20.1  sha256:ba321720...  keda-operator-metrics-apiserver-558599df4-zhnmz
+#   keda-admission-webhooks:2.20.1 sha256:0350cbb5...  keda-admission-webhooks-58fd99db89-jvqpd
+images:
+  - name: ghcr.io/kedacore/keda
+    newTag: "2.20.1@sha256:8888d1896d316c9e087ce0ca3b72bd945dfbad6f3ef2d64ca24ee394feccc023"
+  - name: ghcr.io/kedacore/keda-metrics-apiserver
+    newTag: "2.20.1@sha256:ba32172082a2ff935d5b62ffa0bd0698424d373b55c5cae0846db057e237b28e"
+  - name: ghcr.io/kedacore/keda-admission-webhooks
+    newTag: "2.20.1@sha256:0350cbb59471123623134801a3e9a753c90e0945bb4eb7e36086746fc4b35fb8"

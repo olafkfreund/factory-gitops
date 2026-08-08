@@ -271,3 +271,69 @@ patches:
   #
   # versus `no matching signatures` / `subject mismatch` / `issuer mismatch`.
   # Kyverno writes `unverified image` for both. That is Factory#430.
+
+  # ---------------------------------------------------------------------
+  # DIGEST PINS FOR KYVERNO'S OWN FIVE IMAGES (factory-gitops#161).
+  #
+  # These are the images of the component that enforces supply-chain policy
+  # for everything else: verify-factory-image-signatures,
+  # require-first-party-signature-coverage and every other rule in
+  # apps/kyverno-policies runs inside these processes. Until now all five ran
+  # on the tag `v1.18.2`, and a tag is a pointer. Repointing it swaps the
+  # admission controller, and the thing that would ordinarily notice a swapped
+  # image IS the admission controller. The Factory#522 Enforce flip made that
+  # worse rather than better: the enforcement now has teeth, and the enforcer
+  # was the one component nothing was watching.
+  #
+  # `v1.18.2` is a patch-level tag, not a floating line like `pg17` was in
+  # Factory#588, so it moves rarely. That lowers the probability, not the
+  # blast radius.
+  #
+  # THE CLI PIN ABOVE DEPENDS ON THIS. The header of
+  # .github/workflows/manifest-validate.yml explains at length that the Kyverno
+  # CLI is pinned to v1.18.2 to MATCH the controller in this cluster, so that
+  # `kyverno test` offline agrees with admission online. That reasoning is only
+  # as good as `v1.18.2` meaning the same bytes in both places, which a mutable
+  # tag does not guarantee and a digest does.
+  #
+  # Resolved live 2026-08-08 with `crane digest`; every one equals the imageID
+  # the running pod already carries, so applying this pulls nothing and rolls
+  # nothing that was not going to come back identical:
+  #   kyverno                sha256:0a540e2d...
+  #   kyvernopre             sha256:cd8cb4a3...
+  #   background-controller  sha256:d62566ce...
+  #   cleanup-controller     sha256:b0395d29...
+  #   reports-controller     sha256:f09cf305...
+  #
+  # THE PINS ARE AN `images:` TRANSFORMER, BELOW THE PATCHES. Mechanics and the
+  # reason the digest sits inside `newTag:` rather than in `digest:` are written
+  # out once, in apps/keda/manifests/kustomization.yaml; the short version is
+  # that `digest:` would drop `v1.18.2` from the rendered ref and a digest with
+  # no tag is a pin nothing can ever tell you is stale.
+  #
+  # BUMPING KYVERNO IS NOW A FOUR-PART CHANGE, and doing three of them is
+  # worse than doing none: the release URL above, the five digests below, the
+  # CLI pin in manifest-validate.yml, and the `kyverno test` suites. Change the
+  # URL alone and kustomize staples v1.18.2 digests onto v1.19.x tags -- a ref
+  # the registry resolves to the DIGEST, i.e. you have "bumped" to the old
+  # bytes under a new name. Re-resolve all five in the same commit.
+  #
+  # ROLL ORDER, if this ever has to be re-applied by hand: cleanup, then
+  # reports, then background, then admission LAST. The admission controller is
+  # the one that can refuse Pod creation cluster-wide; leaving it until the end
+  # means the first three rolls happen while the escape hatch still works.
+  # `kubectl run probe --image=registry.k8s.io/pause:3.9 --dry-run=server`
+  # between each is how you check the escape hatch is still open, and
+  # apps/kyverno-policies/PANIC.sh is the revert if it is not.
+
+images:
+  - name: reg.kyverno.io/kyverno/kyverno
+    newTag: "v1.18.2@sha256:0a540e2ddf74d0d2d3d45f9ef248d7dbc96576accdbcc6a2dd7eaff9fea56504"
+  - name: reg.kyverno.io/kyverno/kyvernopre
+    newTag: "v1.18.2@sha256:cd8cb4a31d25b3992734fb8f24a90ef691c90ce49338c89bea96792160eacb98"
+  - name: reg.kyverno.io/kyverno/background-controller
+    newTag: "v1.18.2@sha256:d62566ce41bd0d4a32bf2cf44b9ebfc02c36374f821f83070890287f62f68671"
+  - name: reg.kyverno.io/kyverno/cleanup-controller
+    newTag: "v1.18.2@sha256:b0395d29ae332276e6910eb40418be9bc127c068d659f90aa1bcddd6be99ccb4"
+  - name: reg.kyverno.io/kyverno/reports-controller
+    newTag: "v1.18.2@sha256:f09cf305170014e191b94e1c54f5be73163d8824eefad49349675c4efe43159a"

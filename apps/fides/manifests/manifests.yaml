@@ -49,7 +49,12 @@ spec:
     spec:
       containers:
       - name: postgres
-        image: postgres:15-alpine
+        # Digest-pinned per factory-gitops#161. `15-alpine` is a floating
+        # patch line -- it moves on every 15.x release -- and this namespace
+        # is outside the scope Factory#573 pinned. Resolved live against the
+        # running pod's imageID on 2026-08-08, so this pin is a rename of what
+        # was already pulled, not a new image.
+        image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
         env:
         - name: POSTGRES_DB
           value: fides
@@ -97,7 +102,33 @@ spec:
     spec:
       containers:
       - name: app
-        image: ghcr.io/olafkfreund/fides-server:latest
+        # factory-gitops#162. Was `:latest`, which carries no version
+        # information at all and is repointed by every push to fides' `main`.
+        # Nobody reading this manifest could tell what was deployed.
+        #
+        # THIS IS THE SAME BYTES, RENAMED. olafkfreund/fides' publish-ghcr.yml
+        # pushes both `:latest` and `:${{ github.sha }}` from one build, so
+        # every `:latest` has an immutable twin. Resolved live 2026-08-08:
+        #   crane digest ...:latest                  -> sha256:4cd50a17...
+        #   crane digest ...:1fc2aa6267...           -> sha256:4cd50a17...
+        #   running pod imageID                      -> sha256:4cd50a17...
+        # and 1fc2aa62 is olafkfreund/fides `main` HEAD. So this pins forward
+        # to what is already running, not backward to something older.
+        #
+        # A 40-char commit tag rather than the fleet's `sha-<short>`: that is
+        # what fides' publish workflow emits, and inventing a second tag scheme
+        # here would name an image that does not exist.
+        #
+        # NOTHING BUMPS THIS. The four service repos push a `cd(...)` commit
+        # into this repo on deploy; fides does not, so a merge to its `main`
+        # now reaches this cluster never rather than within 30 minutes. That is
+        # the #139 trade made deliberately and stated rather than discovered
+        # later: legible-and-frozen beats illegible-and-drifting, but only
+        # while the freeze is visible. olafkfreund/fides#389 tracks the missing
+        # deploy leg; until it lands the bump is this line, by hand.
+        image: ghcr.io/olafkfreund/fides-server:1fc2aa62674233a40c82150c5b964267d5d23ba1
+        # Still Always: an immutable tag makes this a no-op on a warm node, and
+        # it is the correct policy for the day somebody force-pushes a tag.
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
@@ -179,101 +210,33 @@ spec:
   - port: 8080
     targetPort: 8080
   selector: { app: fides-server }
----
-# Hands-off updates: fides-server pulls ghcr:latest (imagePullPolicy Always), so a
-# periodic rolling restart picks up whatever the GHCR publish workflow last pushed
-# on a merge to main. Zero-downtime (rolling surge on a 1-replica Deployment).
-# NOTE: this restarts on a timer regardless of whether the image changed; Argo CD
-# Image Updater (digest-watch) is the no-churn upgrade if that ever matters.
-apiVersion: v1
-kind: ServiceAccount
-metadata: { name: fides-updater, namespace: fides }
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata: { name: fides-updater, namespace: fides }
-rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata: { name: fides-updater, namespace: fides }
-roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: fides-updater }
-subjects:
-  - { kind: ServiceAccount, name: fides-updater, namespace: fides }
----
-# This CronJob had never once succeeded (Factory#567). It wedged on 2026-07-31
-# and stayed wedged for six days, and it took THREE independent defects to do
-# it. Each of the three settings below closes one of them; none of them is
-# decoration.
+# THE `fides-server-updater` CronJob, ITS ServiceAccount, Role AND RoleBinding
+# WERE REMOVED HERE (factory-gitops#162), and the reasoning is worth keeping
+# because deleting a control that was just fixed looks like a mistake.
 #
-# 1. THE IMAGE WAS GONE. `bitnami/kubectl:1.31` stopped resolving when Bitnami
-#    retired their public Docker Hub catalogue -- the same retirement that
-#    broke Kyverno's cleanup CronJobs (see apps/kyverno/manifests/). The
-#    replacement is upstream's own `registry.k8s.io/kubectl`, published by the
-#    Kubernetes release process itself, needing no registry credential and with
-#    nobody's commercial catalogue policy between us and it. v1.31.14 is the
-#    final 1.31 patch, matching this cluster's k3s v1.31.5 server exactly.
-#    Digest-pinned per factory-gitops#140 -- `apps/fides` was out of scope
-#    there, so this closes that gap too.
+# The CronJob did one thing: `kubectl rollout restart deployment/fides-server`
+# every 30 minutes, so that `imagePullPolicy: Always` on `:latest` would pick
+# up whatever the GHCR publish workflow last pushed. Its entire value came from
+# the tag being mutable. With the tag pinned above it restarts a 1-replica
+# Deployment 48 times a day to re-pull bytes it already has -- which is not
+# merely wasted, it costs three real things: pod age stops meaning "how long
+# has this been up", 48 daily Job objects accumulate for job-watchdog and
+# restart-watchdog to read, and a genuine crash-restart becomes indistinguish-
+# able from the timer in the restart counts those two watchdogs alert on.
 #
-#    runAsUser IS LOAD-BEARING: unlike the Bitnami image (uid 1001), the
-#    upstream image declares `USER 0`, so `runAsNonRoot: true` alone would have
-#    traded ImagePullBackOff for CreateContainerConfigError -- a second wedge
-#    wearing a different error string. 65532 is the distroless nonroot uid.
-#    Verified in-cluster before merge: `kubectl version --client` -> v1.31.14,
-#    and `rollout restart` against this exact SA -> "deployment.apps/
-#    fides-server restarted".
+# So it goes, along with the `patch deployments` RBAC that existed only to
+# serve it. Factory#567 / factory-gitops#141 got this CronJob working after it
+# had never once succeeded; that work is not wasted -- it is what made the
+# thing observable enough to see that its premise had gone.
 #
-# 2. `Forbid` LET THE DEAD JOB HOLD THE SLOT. An ImagePullBackOff Job is Active
-#    forever, and Forbid will not start a new Job while one is Active, so the
-#    single 2026-07-31 failure suppressed all 290 schedules after it. `Replace`
-#    evicts the stale Job and runs the new one: a failure costs one cycle, not
-#    every subsequent one.
+# WHAT REPLACES IT: a commit to this file, which is how every other workload in
+# this repo is updated. See the note on the image above for what does NOT yet
+# push that commit (olafkfreund/fides#389).
 #
-# 3. THE CONTROLLER HAD ALREADY GIVEN UP COUNTING. With no
-#    startingDeadlineSeconds, the CronJob controller counts every missed start
-#    since lastScheduleTime and aborts past 100. Six days at */30 is ~290, and
-#    the cluster was emitting it before this landed:
-#      Warning TooManyMissedTimes  cronjob-controller
-#      too many missed start times. Set or decrease .spec.startingDeadlineSeconds
-#    So fixing the image and the concurrency policy alone would still have
-#    scheduled NOTHING. 300s bounds the count to at most one missed cycle.
-#
-# activeDeadlineSeconds bounds a Job that cannot make progress to two minutes
-# (the real run takes ~2s), so it reaches a terminal Failed state instead of
-# sitting Active. That is what makes the failure countable by job-watchdog --
-# the reason this went unseen was not only the namespace gap, it was that a
-# permanently-Active Job produces no *new* failures to alert on.
-#
-# backoffLimit is deliberately left at the default: activeDeadlineSeconds is
-# the stronger bound on exactly the failure mode that wedged this (a pod that
-# never starts burns wall-clock, not attempts), and a second knob capping the
-# same thing would only be another number to get wrong.
-apiVersion: batch/v1
-kind: CronJob
-metadata: { name: fides-server-updater, namespace: fides }
-spec:
-  schedule: "*/30 * * * *"
-  concurrencyPolicy: Replace
-  startingDeadlineSeconds: 300
-  successfulJobsHistoryLimit: 1
-  failedJobsHistoryLimit: 1
-  jobTemplate:
-    spec:
-      activeDeadlineSeconds: 120
-      template:
-        spec:
-          serviceAccountName: fides-updater
-          restartPolicy: OnFailure
-          containers:
-            - name: kubectl
-              image: registry.k8s.io/kubectl:v1.31.14@sha256:74a458e9b800947f4bd1875be5213e8f31f4f2d1e6639548bf05145387ad07bb
-              command: ["kubectl", "rollout", "restart", "deployment/fides-server", "-n", "fides"]
-              securityContext:
-                allowPrivilegeEscalation: false
-                runAsNonRoot: true
-                runAsUser: 65532
-                capabilities: { drop: ["ALL"] }
+# THE LORE IS NOT LOST, and the next person to write a CronJob in this cluster
+# needs it: `Forbid` lets one ImagePullBackOff Job hold the slot forever, no
+# `startingDeadlineSeconds` makes the controller give up counting past 100
+# missed starts, and without `activeDeadlineSeconds` a Job that never starts
+# stays Active and so produces no *new* failure for job-watchdog to see. All
+# three, with the measurements, are in PR #141 and in this file's history at
+# commit cfa5171.
