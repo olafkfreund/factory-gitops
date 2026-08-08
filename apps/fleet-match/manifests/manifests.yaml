@@ -222,6 +222,64 @@ data:
                          ["cfactory-frontend", "ghcr.io/olafkfreund/cfactory-frontend"]]},
     ]
 
+    # ---- JOB RUNNER IMAGES (factory-gitops#89) -------------------------------
+    #
+    # DEFAULT_TARGETS above asks "is every Deployment running the code on its
+    # repo's main?". Every link in that chain -- main HEAD -> deploy run ->
+    # gitops newTag -> running pod -- needs a Deployment and a serving pod. A
+    # Job runner image has neither at rest: nothing runs it until a task
+    # dispatches it, and by then the run is already using whatever the tag
+    # resolved to.
+    #
+    # So TFactory#886 hid in the one place this app could not see.
+    # `tfactory-runner-portal-ui` sat on a hand-run 27 June `docker build` for
+    # FIVE WEEKS with no build workflow at all, while TFactory#875/#876/#877
+    # were merged and green. Every status in the fleet was correct. The lane in
+    # the cluster ran code from before the fixes, took the portal it was testing
+    # offline for the duration of each run, and filed the portal as broken.
+    # This app reported nothing, correctly, because there was no Deployment to
+    # compare.
+    #
+    # WHAT REPLACES THE POD. Three things are knowable without one, and the
+    # third is the load-bearing one:
+    #
+    #   1. has the image been built from a recent enough commit -- the newest
+    #      SUCCESSFUL run of the workflow that builds it;
+    #   2. does the cluster name a specific build -- the env value below;
+    #   3. are they the same commit.
+    #
+    # WHY A WORKFLOW NAME AND NOT A LIST OF INPUT PATHS, which is how #89
+    # framed it. A hand-listed path set is a second copy of the workflow's own
+    # `on.push.paths`, and the two drift. Measured while building this: listing
+    # `portal_testing/**` and `docker/tfactory-runner-portal-ui/**` by hand
+    # gives a newest-input commit of 68a41bc (30 July), against a pin of
+    # sha-6b3f373 (7 Aug) -- a FALSE "behind" verdict, because the real trigger
+    # also includes the workflow file itself and it was touched on 6 Aug.
+    # Reading the newest successful RUN instead asks the question through the
+    # filter that actually decides whether a build happens, so the paths cannot
+    # drift out of sync: they are never copied.
+    #
+    # `pinned_by` is [Deployment, env var] rather than a container image,
+    # because that is genuinely where a Job lane's image is named -- the
+    # dispatcher reads it at run time. Two entries share one image and one
+    # workflow on purpose: TFACTORY_NIX_RUNNER_IMAGE and
+    # TFACTORY_VAL3_K8S_JOB_IMAGE are separate lanes that can be pinned
+    # differently, and reporting them as one row would hide exactly that.
+    DEFAULT_RUNNERS = [
+        {"lane": "portal-ui", "repo": "olafkfreund/TFactory",
+         "workflow": "portal-ui-runner-image.yml",
+         "image": "ghcr.io/olafkfreund/tfactory-runner-portal-ui",
+         "pinned_by": ["tfactory", "PORTAL_UI_IMAGE"]},
+        {"lane": "nix-verify", "repo": "olafkfreund/TFactory",
+         "workflow": "nix-runner-image.yml",
+         "image": "ghcr.io/olafkfreund/tfactory-runner-nix",
+         "pinned_by": ["tfactory", "TFACTORY_NIX_RUNNER_IMAGE"]},
+        {"lane": "nix-val3", "repo": "olafkfreund/TFactory",
+         "workflow": "nix-runner-image.yml",
+         "image": "ghcr.io/olafkfreund/tfactory-runner-nix",
+         "pinned_by": ["tfactory", "TFACTORY_VAL3_K8S_JOB_IMAGE"]},
+    ]
+
 
     def deployment_relevant(filename: str) -> bool:
         """Would this changed file have changed the runtime image?
@@ -470,6 +528,12 @@ data:
         ("rollout_behind", "has not rolled out the image built from main"),
         ("build_failed", "has a commit on main that failed to build"),
         ("build_missing", "has a commit on main that never deployed"),
+        # Runner lanes (#89). Above `unevaluable` so a floating tag is named as
+        # what it is rather than as a generic blind spot -- the fix for it is a
+        # one-line pin and the title is where somebody reads that.
+        ("runner_behind", "dispatches Jobs on an image older than main"),
+        ("runner_unpinned", "has no image pinned for its Job lane"),
+        ("runner_floating", "pins its Job lane to a floating tag, so it cannot be checked"),
         ("unevaluable", "cannot be verified against main"),
     ]
 
@@ -740,7 +804,19 @@ data:
         Matching on the image repo, not on container name or position: every
         Factory Deployment also runs a `python:3.12-slim` cred-sync sidecar, and
         reading containers[0] would compare the sidecar's tag against main.
+
+        THE DIGEST IS STRIPPED FIRST, and that is not defensive coding -- it is
+        a bug this function had. `image:tag@sha256:...` is now the fleet's
+        canonical shape (TFactory#890 for the runner lanes, factory-gitops#161
+        and #162 for everything else), and `rpartition(":")` on one of those
+        splits at the colon INSIDE the digest: name comes back as
+        `ghcr.io/o/x:sha-abc1234@sha256` and never equals `image_repo`, so this
+        returned None and every caller read it as "this Deployment does not run
+        the image we are watching". Measured against the live cluster on
+        2026-08-08, before the fix: all three runner lanes reported CANNOT
+        VERIFY against refs that were perfectly correct.
         """
+        image = image.split("@", 1)[0]
         if ":" not in image:
             return None
         name, _, tag = image.rpartition(":")
@@ -786,6 +862,131 @@ data:
                 if t and t not in running:
                     running.append(t)
         return {"name": name, "exists": True, "spec_sha": spec_tag, "running": running}
+
+
+    def env_image(deployment: str, var: str, deployments: dict) -> str | None:
+        """The image ref a Deployment's env var names, or None.
+
+        None covers three different absences deliberately -- no such Deployment,
+        no such container env, or an empty value -- because all three mean the
+        same thing to the lane: nothing in the cluster names a build, so a
+        dispatch resolves whatever the dispatcher's own default is. The caller
+        reports that as unevaluable rather than guessing which absence it was.
+        """
+        dep = deployments.get(deployment)
+        if dep is None:
+            return None
+        containers = (((dep.get("spec") or {}).get("template") or {})
+                      .get("spec") or {}).get("containers") or []
+        for c in containers:
+            for e in c.get("env") or []:
+                if e.get("name") == var and e.get("value"):
+                    return e["value"]
+        return None
+
+
+    def assess_runner(runner: dict, built: dict | None, runs: list | None,
+                      ref: str | None, now: datetime, tol: int, crit: int) -> dict:
+        """Pure: one Job runner lane's CI and cluster state -> one match record.
+
+        Same record shape as assess() so notify() and severity_of() need no
+        special case -- a runner lane that is behind reaches a human by exactly
+        the path a service that is behind does.
+        """
+        lane, repo = runner["lane"], runner["repo"]
+        service = f"runner:{lane}"
+        var = runner["pinned_by"][1]
+        problems: list[tuple[str, str]] = []
+        notes: list[str] = []
+        ages: list[float] = []
+
+        expected = built["sha"] if built else None
+        exp_age = built["age"] if built else None
+        tag = tag_of(ref or "", runner["image"]) if ref else None
+
+        if runs is None:
+            problems.append(
+                ("unevaluable",
+                 f"CANNOT VERIFY: the run history of {runner['workflow']} in "
+                 f"{repo} could not be read, so nothing can be said about what "
+                 "this lane should be running. A blind spot, not a pass")
+            )
+        elif expected is None:
+            problems.append(
+                ("unevaluable",
+                 f"NEVER BUILT: {runner['workflow']} in {repo} has no successful "
+                 f"run on main, so `{runner['image']}` is whatever somebody last "
+                 "pushed by hand. That is TFactory#886 exactly")
+            )
+
+        if ref is None:
+            problems.append(
+                ("runner_unpinned",
+                 f"NOTHING PINS THIS LANE: `{var}` is not set on the "
+                 f"`{runner['pinned_by'][0]}` Deployment, so a dispatch resolves "
+                 "the dispatcher's own default and this app cannot tell which "
+                 "build ran")
+            )
+        elif tag is None:
+            problems.append(
+                ("unevaluable",
+                 f"CANNOT VERIFY: `{var}` is `{ref}`, which does not name "
+                 f"`{runner['image']}` at all -- either the lane moved to another "
+                 "image or this record is stale")
+            )
+        elif not tag.startswith("sha-"):
+            # THE RULE #89 ASKS FOR BY NAME. A floating tag is not a lane that
+            # passes, it is a lane that cannot be asked the question: a stale
+            # `:latest` is byte-for-byte indistinguishable from a fresh one from
+            # outside, which is precisely how TFactory#886 went unnoticed for
+            # five weeks. "I could not check this" must not look like "this is
+            # fine", so it is a finding rather than an ok.
+            problems.append(
+                ("runner_floating",
+                 f"UNVERIFIABLE BY CONSTRUCTION: `{var}` is `{ref}`. A floating "
+                 "tag names no commit, so a build from today and a hand-run "
+                 "build from five weeks ago look identical from here -- which is "
+                 "how TFactory#886 hid. Pin it to `sha-<short>`, which "
+                 f"{runner['workflow']} already pushes alongside it")
+            )
+        elif expected is not None and not carries(tag, expected):
+            if exp_age is not None and exp_age <= tol:
+                notes.append("deploying")
+            else:
+                ages.append(exp_age if exp_age is not None else 0)
+                problems.append(
+                    ("runner_behind",
+                     f"BEHIND MAIN: `{var}` asks for `{tag}` but the image built "
+                     f"from main is `sha-{expected[:7]}`, whose build succeeded "
+                     f"{_dur(exp_age)} ago (> {_dur(tol)} tolerance). Every task "
+                     "dispatched into this lane runs the older code, and no pod "
+                     "exists at rest to make that visible")
+                )
+
+        status = problems[0][0] if problems else (notes[0] if notes else "ok")
+        return {
+            "_timestamp": int(now.timestamp() * 1_000_000),
+            "source": "fleet-match",
+            "service": service,
+            "repo": repo,
+            "head_sha": "",
+            "head_age_seconds": None,
+            "expected_sha": expected or "",
+            "expected_age_seconds": None if exp_age is None else int(exp_age),
+            # A lane has no Deployment of its own. The row records where its
+            # image is NAMED, so the report says which line to edit.
+            "deployments": [
+                {"name": f"{runner['pinned_by'][0]}:{var}", "exists": ref is not None,
+                 "spec_tag": tag or "", "running_tags": []}
+            ],
+            "status": status,
+            "codes": [p[0] for p in problems],
+            "problems": [p[1] for p in problems],
+            "matches_main": not problems and status == "ok",
+            "behind_seconds": int(max(ages)) if ages else None,
+            "tolerance_seconds": tol,
+            "critical_after_seconds": crit,
+        }
 
 
     def repo_state(token: str, repo: str, workflow: str, now: datetime):
@@ -837,7 +1038,8 @@ data:
 
 
     def build_records(token: str, targets: list, ns: str, workflow: str,
-                      now: datetime, tol: int, crit: int) -> list:
+                      now: datetime, tol: int, crit: int,
+                      runners: list | None = None) -> list:
         deployments = {
             (d.get("metadata") or {}).get("name"): d
             for d in k8s_get(f"/apis/apps/v1/namespaces/{ns}/deployments")["items"]
@@ -857,6 +1059,20 @@ data:
                 change = classify_change(token, t["repo"], exp["sha"], head)
             records.append(
                 assess(t, head, head_age, runs, deps, change, now, tol, crit))
+
+        # Job runner lanes (#89). One repo_state call per DISTINCT workflow, not
+        # per lane: the two nix entries share nix-runner-image.yml, and asking
+        # GitHub the same question twice on every run is a rate limit spent for
+        # nothing.
+        seen: dict[tuple, list | None] = {}
+        for r in runners or []:
+            key = (r["repo"], r["workflow"])
+            if key not in seen:
+                seen[key] = repo_state(token, r["repo"], r["workflow"], now)[2]
+            runs = seen[key]
+            built = latest_success(runs) if runs is not None else None
+            ref = env_image(r["pinned_by"][0], r["pinned_by"][1], deployments)
+            records.append(assess_runner(r, built, runs, ref, now, tol, crit))
         return records
 
 
@@ -867,6 +1083,8 @@ data:
         workflow = os.environ.get("DEPLOY_WORKFLOW", "deploy.yml")
         targets = json.loads(os.environ["TARGETS_JSON"]) if os.environ.get(
             "TARGETS_JSON") else DEFAULT_TARGETS
+        runners = json.loads(os.environ["RUNNERS_JSON"]) if os.environ.get(
+            "RUNNERS_JSON") else DEFAULT_RUNNERS
         oo = os.environ.get(
             "OBSERVE_URL", "http://observe.factory.svc.cluster.local:5080").rstrip("/")
         org = os.environ.get("OO_ORG", "default")
@@ -891,7 +1109,8 @@ data:
 
         now = datetime.now(timezone.utc)
         try:
-            records = build_records(token, targets, ns, workflow, now, tol, crit)
+            records = build_records(token, targets, ns, workflow, now, tol, crit,
+                                    runners)
         except Exception as e:  # noqa: BLE001 — cannot see == cannot report
             eprint(f"FATAL: kubernetes API unreachable: {e!r}")
             return 3
@@ -1230,6 +1449,103 @@ data:
             assert not writes(), writes()
         finally:
             globals()["gh"] = real_gh
+
+        # ---- Job runner lanes (#89) -----------------------------------------
+        # The case with teeth is `floating`: before this existed, a lane on
+        # `:latest` was not merely unchecked, it was UNCHECKABLE, and the app
+        # said nothing at all. If that case ever returns "ok" the whole leg is
+        # decorative again -- which is the state TFactory#886 hid in for five
+        # weeks.
+        R = {"lane": "portal-ui", "repo": "olafkfreund/TFactory",
+             "workflow": "portal-ui-runner-image.yml",
+             "image": "ghcr.io/olafkfreund/tfactory-runner-portal-ui",
+             "pinned_by": ["tfactory", "PORTAL_UI_IMAGE"]}
+        IMG = R["image"]
+        built = {"sha": HEAD, "status": "completed", "conclusion": "success",
+                 "age": 7200}
+        fresh = {"sha": HEAD, "status": "completed", "conclusion": "success",
+                 "age": 60}
+
+        def runner(ref, built=built, runs=(1,)):
+            return assess_runner(R, built, list(runs) if runs is not None else None,
+                                 ref, now, 900, 3600)
+
+        ok = runner(f"{IMG}:sha-3063493")
+        assert ok["codes"] == [], ok
+        assert ok["matches_main"] and ok["status"] == "ok", ok
+
+        # `tag@digest` is the fleet's canonical shape and USED TO BREAK tag_of:
+        # rpartition(":") split inside the digest, so a perfectly current lane
+        # reported CANNOT VERIFY. Measured against the live cluster, all three
+        # lanes, before the fix. Both grains asserted here because the bug was
+        # in the shared helper and deployment_state() reads it too.
+        pinned = runner(f"{IMG}:sha-3063493@sha256:" + "0" * 64)
+        assert pinned["codes"] == [], pinned
+        assert tag_of(f"{IMG}:sha-3063493@sha256:" + "0" * 64, IMG) == "sha-3063493"
+        assert tag_of(f"{IMG}@sha256:" + "0" * 64, IMG) is None
+        assert tag_of(f"{IMG}:latest", IMG) == "latest"
+
+        # The real TFactory#886 shape: pinned to a build from five weeks ago.
+        old = runner(f"{IMG}:sha-0bfadd9")
+        assert old["codes"] == ["runner_behind"], old
+        assert "BEHIND MAIN" in old["problems"][0], old
+
+        # Inside tolerance the build is still propagating, not stranded.
+        assert runner(f"{IMG}:sha-0bfadd9", built=fresh)["status"] == "deploying"
+
+        floating = runner(f"{IMG}:latest")
+        assert floating["codes"] == ["runner_floating"], floating
+        assert not floating["matches_main"], floating
+        assert "TFactory#886" in floating["problems"][0], floating
+
+        unpinned = runner(None)
+        assert unpinned["codes"] == ["runner_unpinned"], unpinned
+
+        # An env naming some other image is a stale record, not a pass.
+        assert runner("ghcr.io/olafkfreund/somethingelse:sha-3063493")["codes"] \
+            == ["unevaluable"]
+
+        # Blind and never-built both refuse to read as fine, and a blind lane
+        # that is ALSO on a floating tag reports both rather than the first.
+        assert runner(f"{IMG}:sha-3063493", runs=None)["codes"] == ["unevaluable"]
+        never = runner(f"{IMG}:sha-3063493", built=None)
+        assert never["codes"] == ["unevaluable"], never
+        assert "NEVER BUILT" in never["problems"][0], never
+        both = runner(f"{IMG}:latest", runs=None)
+        assert both["codes"] == ["unevaluable", "runner_floating"], both
+
+        # A runner finding must reach a human by the SAME path a service
+        # finding does -- the record shape is shared so notify() needs no case.
+        assert issue_title(floating, "warning") == (
+            "[warning] runner:portal-ui pins its Job lane to a floating tag, "
+            "so it cannot be checked"), issue_title(floating, "warning")
+        assert issue_title(old, "critical") == (
+            "[critical] runner:portal-ui dispatches Jobs on an image older than main")
+        assert severity_of(ok, None, now) is None
+
+        # env_image reads the value out of a real Deployment shape, and returns
+        # None for all three absences rather than raising.
+        dep = {"spec": {"template": {"spec": {"containers": [
+            {"name": "cred-sync", "env": [{"name": "OTHER", "value": "x"}]},
+            {"name": "tfactory", "env": [
+                {"name": "PORTAL_UI_IMAGE", "value": f"{IMG}:sha-3063493"},
+                {"name": "EMPTY", "value": ""},
+            ]},
+        ]}}}}
+        deps = {"tfactory": dep}
+        assert env_image("tfactory", "PORTAL_UI_IMAGE", deps) == f"{IMG}:sha-3063493"
+        assert env_image("tfactory", "EMPTY", deps) is None
+        assert env_image("tfactory", "NOPE", deps) is None
+        assert env_image("absent", "PORTAL_UI_IMAGE", deps) is None
+
+        # Every DEFAULT_RUNNERS row must be shaped so assess_runner can read it.
+        # A typo'd key would otherwise surface as a KeyError in the pod at 03:00
+        # rather than here.
+        for r in DEFAULT_RUNNERS:
+            assert set(r) == {"lane", "repo", "workflow", "image", "pinned_by"}, r
+            assert len(r["pinned_by"]) == 2, r
+            assert assess_runner(r, built, [1], None, now, 900, 3600)["codes"] \
+                == ["runner_unpinned"], r
 
         print("selftest OK")
         return 0

@@ -11,8 +11,12 @@
 # No paths filter: this takes seconds, and a required check that does not run on
 # a PR leaves that PR blocked forever.
 #
-# All three embedded selftests now run here — job-watchdog, restart-watchdog and
-# argocd-drift — which closes factory-gitops#152.
+# Four embedded selftests run here — job-watchdog, restart-watchdog,
+# argocd-drift (factory-gitops#152) and fleet-match (#89). The fourth is the one
+# that shows the shape of this gap rather than closing an instance of it: it was
+# never in #152's list, so "all three now run" was true and this app's ~470
+# assertions still had never executed in CI. Whoever adds the fifth embedded
+# script adds it here in the same commit.
 name: job-watchdog selftest
 
 on:
@@ -71,3 +75,24 @@ jobs:
             /tmp/argocd_drift_extracted.py
       - name: Selftest (argocd-drift)
         run: python3 /tmp/argocd_drift_extracted.py selftest
+
+      # fleet-match, the FOURTH embedded selftest, and it was the one nobody
+      # noticed was missing (#89). The header above says "all three ... which
+      # closes factory-gitops#152" -- that was true of the three apps #152
+      # named, and fleet-match has the same shape and was not among them. Its
+      # ~470 lines of assertions have never run in CI: `grep -rn
+      # fleet-match .github/workflows/` returned nothing before this step.
+      #
+      # It is the app that answers "is the fleet running the code on main", so
+      # a silently-broken assertion in it is a fleet-wide blind spot reported as
+      # green -- which is the same class of defect it exists to catch, one level
+      # up. Found while adding the Job-runner leg for #89: the new cases passed
+      # locally and nothing in CI would ever have run them.
+      - name: Extract fleet-match's match.py from the ConfigMap
+        run: |
+          python3 .github/scripts/extract_embedded_script.py \
+            apps/fleet-match/manifests/manifests.yaml \
+            match.py \
+            /tmp/fleet_match_extracted.py
+      - name: Selftest (fleet-match)
+        run: python3 /tmp/fleet_match_extracted.py selftest
