@@ -28,6 +28,32 @@ resources:
   - https://raw.githubusercontent.com/argoproj/argo-cd/v2.13.1/manifests/install.yaml
   - argocd-root-app.yaml
 
+# Digest pins (factory-gitops#161). ArgoCD has the same self-reference property
+# as Kyverno: it is what reconciles every pin in this repo, so a repointed
+# `v2.13.1` swaps the reconciler, and the thing that would notice a swapped
+# image is the reconciler. Ten container/initContainer references across seven
+# workloads resolve to these three names.
+#
+# THIS ONE IS INERT UNTIL SOMEBODY RE-RUNS THE BOOTSTRAP UNIT, and that is
+# stated rather than glossed: nothing reconciles bootstrap/. It is applied once
+# by the Nix k3d-cluster-bootstrap unit, after which ArgoCD self-manages via
+# the root Application, and this file is not touched again. So this pin does
+# not change what is running today -- it changes what a REBUILD gets, which is
+# the only moment these images are ever pulled and therefore the only moment
+# the mutable tag could have handed the cluster something different. Verified
+# against the seven running pods rather than against a rollout: all ten refs
+# resolve to the digests below right now (2026-08-08).
+#
+# Mechanics of `newTag: "tag@sha256:..."` -- and why not `digest:` -- are
+# written out in apps/keda/manifests/kustomization.yaml.
+images:
+  - name: quay.io/argoproj/argocd
+    newTag: "v2.13.1@sha256:19608c266cc41e4986d9b1c2b79ea4c42bb9430269eefc5005e9d65be4d22868"
+  - name: ghcr.io/dexidp/dex
+    newTag: "v2.41.1@sha256:bc7cfce7c17f52864e2bb2a4dc1d2f86a41e3019f6d42e81d92a301fad0c8a1d"
+  - name: redis
+    newTag: "7.0.15-alpine@sha256:c9d92d840fd011c908f040592857c724ae6d877f2aba5c40ad963276507386b2"
+
 patches:
   - path: argocd-server-insecure-patch.yaml
     target:
