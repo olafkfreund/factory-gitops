@@ -110,8 +110,23 @@ data:
     # sync time, so every candidate fix hardcodes it somewhere; the difference is
     # that this hardcodes it ONCE, and apps/host-k3d-internal-probe fails loudly
     # within ~50 minutes if this record ever stops resolving or stops serving.
-    # On a rebuild: re-read `docker network inspect k3d-factory` and correct this
-    # one line. The probe is what tells you to.
+    #
+    # To re-derive it after a rebuild, with kubectl alone — the k3d node
+    # containers sit on the bridge and the host is that subnet's gateway, so the
+    # node addresses give it away without needing access to the Docker daemon
+    # (which runs as another user here):
+    #
+    #   $ kubectl --context factory get nodes -o wide
+    #   k3d-factory-server-0   172.18.0.2
+    #   k3d-agent-0-0          172.18.0.3     -> subnet 172.18.0.0/16, host .1
+    #
+    # Confirm before committing it, rather than trusting the convention:
+    #   $ kubectl --context factory -n factory run ollama-probe --rm -it \
+    #       --restart=Never --image=python:3.12-slim --command -- \
+    #       python3 -c "import urllib.request as u; \
+    #                   print(u.urlopen('http://172.18.0.1:11434/api/tags').status)"
+    #
+    # The probe is what tells you to go and look.
     k3d.internal:53 {
         errors
         hosts {

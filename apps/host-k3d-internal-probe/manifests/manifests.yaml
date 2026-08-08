@@ -118,9 +118,10 @@ data:
                 "fleet that reaches the self-hosted model by name is working, and "
                 "each caller is reporting it as a model/provider error rather than "
                 "as name resolution. Fix: the `k3d.internal` server block in "
-                "apps/coredns-upstream. If the cluster was rebuilt, re-read "
-                "`docker network inspect k3d-factory` — the gateway address "
-                "hardcoded in that block may have moved."
+                "apps/coredns-upstream. If the cluster was rebuilt, the address "
+                "hardcoded in that block may have moved — `kubectl get nodes "
+                "-o wide` shows the node IPs on the bridge subnet, and the host "
+                "is that subnet's gateway."
             )
 
         try:
