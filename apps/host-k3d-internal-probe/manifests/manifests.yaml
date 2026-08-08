@@ -1,0 +1,300 @@
+# host-k3d-internal-probe — does the fleet's self-hosted-model name still work?
+# (factory-gitops#195, #196)
+#
+# THE DEFECT THIS CLOSES. `host.k3d.internal` is the fleet-wide spelling for the
+# p510 host running ollama. It stopped resolving from every pod in the cluster and
+# nothing said so. Two agents rediscovered it independently on the same day and
+# filed it twice, which is the signature of a failure that nothing is watching.
+#
+# It was invisible because of WHERE it surfaced. A name that does not resolve is
+# reported by an HTTP client as a connection error, and by an LLM SDK as a
+# provider error against the model it was trying to reach. So the operator sees
+# "ollama is flaky" and files it against ollama. Everything anyone concluded about
+# self-hosted model quality, latency or availability was therefore measured
+# against a connection that never opened — AIFactory#1099 named
+# OPENAI_COMPATIBLE_BASE_URL as "the only working route to the self-hosted box"
+# while that route was dead at DNS, and AIFactory#1213 sits on top of it.
+# Factory#642 is this same class: a failure that presents one layer above where
+# it actually happened, so every investigation starts in the wrong place.
+#
+# THREE LAYERS, REPORTED SEPARATELY, BECAUSE THEY FAIL SEPARATELY AND THE WHOLE
+# POINT IS TO SAY WHICH ONE BROKE:
+#
+#   DNS      the name does not resolve. This is #195/#196 recurring — most likely
+#            the CoreDNS `k3d.internal` block in apps/coredns-upstream is gone, or
+#            a cluster rebuild moved the Docker bridge off 172.18.0.0/16 and the
+#            hardcoded address in that block is now wrong.
+#   CONNECT  the name resolves but nothing accepts on :11434. ollama is down on
+#            the host, or the address is right for the network and wrong for the
+#            host, or the sandbox-job egress rule in apps/factory-namespace no
+#            longer covers it.
+#   SERVE    the name resolves, something answers, and it is not a usable ollama —
+#            no models, or not the ollama API at all. A name that resolves to
+#            something that does not serve is the SAME defect one layer down, and
+#            a probe that stopped at a successful DNS lookup would pass through it
+#            without noticing. This is why the check ends in an API call and not
+#            in getaddrinfo().
+#
+# ITS CEILING, STATED. The SERVE layer stops at `/api/tags`: it proves the name
+# reaches a live ollama holding at least one model. It does NOT run a completion,
+# so a model that is present but broken at inference reads as OK here. That was a
+# deliberate trade — a completion every 10 minutes pins a multi-GB model resident
+# on a single-node cluster whose ceiling is already storage-bound, to catch a
+# failure mode nobody has yet observed. If inference itself ever starts failing
+# while /api/tags stays healthy, the upgrade is a short `/api/generate` against
+# the smallest model with `keep_alive: 0`, not a second probe.
+#
+# WHY IT EXITS NON-ZERO, AGAINST THIS REPO'S USUAL CONVENTION. apps/job-watchdog,
+# apps/fleet-match and apps/endpoint-guard all exit 0 on their findings, because
+# for a WATCHDOG "the job failed" is indistinguishable from "the watchdog is
+# broken". That reasoning does not transfer: this is a PROBE of one external
+# dependency, its finding is binary, and there is already something watching Job
+# failure cluster-wide. apps/job-watchdog reads `/apis/batch/v1/cronjobs`
+# unscoped, counts consecutive failures against FAIL_THRESHOLD=2, opens a GitHub
+# issue on olafkfreund/Factory and closes it on recovery. So the loud path exists
+# and is proven; the alternative was a fourth copy of that ~400-line notification
+# state machine, in a repo whose own apps/endpoint-guard header already records
+# that three copies is one too many.
+#
+#   Worst-case time to a human: probe every 10 min, 2 consecutive failures to
+#   cross the threshold, job-watchdog polls every 30 min -> an issue inside ~50
+#   minutes. Deliberately not faster: a single failed run must not page anyone,
+#   and an alarm that fires on one flaky lookup is muted within a week, which is
+#   the same silence this exists to end.
+#
+# NO SECRET, NO SERVICE ACCOUNT TOKEN, NO RBAC. The probe reads nothing from the
+# Kubernetes API — it only resolves a name and makes one HTTP GET. Anything more
+# would be privilege it has no use for.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: host-k3d-internal-probe-script
+  namespace: factory
+  labels: { app: host-k3d-internal-probe }
+data:
+  probe.py: |
+    #!/usr/bin/env python3
+    """Can a pod reach the self-hosted model BY NAME? (factory-gitops#195, #196)
+
+    Answers in three layers — DNS, CONNECT, SERVE — because the reason this defect
+    survived is that all three of them presented to the caller as the same thing:
+    a provider error blamed on the model. Naming the layer is the entire product.
+
+    Exits non-zero on a finding. apps/job-watchdog is what turns that into a
+    GitHub issue; see the manifest header for why that is the right split here and
+    not in the watchdogs.
+    """
+
+    from __future__ import annotations
+
+    import json
+    import os
+    import socket
+    import sys
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlsplit
+
+    TIMEOUT = float(os.environ.get("PROBE_TIMEOUT_SECONDS", "15"))
+
+
+    def check(base: str, timeout: float = TIMEOUT) -> tuple[str, str]:
+        """(layer, detail). layer == "OK" is the only healthy answer.
+
+        Ordered so that each stage only runs once the previous one has succeeded,
+        which is what lets the failure name its own layer instead of collapsing
+        into "could not connect".
+        """
+        parts = urlsplit(base)
+        host, port = parts.hostname or "", parts.port or 80
+
+        try:
+            addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(
+                host, port, type=socket.SOCK_STREAM)})
+        except socket.gaierror as e:
+            return "DNS", (
+                f"`{host}` DOES NOT RESOLVE from this pod ({e}). Nothing in the "
+                "fleet that reaches the self-hosted model by name is working, and "
+                "each caller is reporting it as a model/provider error rather than "
+                "as name resolution. Fix: the `k3d.internal` server block in "
+                "apps/coredns-upstream. If the cluster was rebuilt, re-read "
+                "`docker network inspect k3d-factory` — the gateway address "
+                "hardcoded in that block may have moved."
+            )
+
+        try:
+            with urllib.request.urlopen(
+                    f"{base.rstrip('/')}/api/tags", timeout=timeout) as r:
+                payload = json.load(r)
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            return "CONNECT", (
+                f"`{host}` resolves to {addrs} but :{port} did not answer ({e}). "
+                "The NAME is fine, so this is not #195/#196 recurring: either "
+                "ollama is down on the host, or the egress rule for this address "
+                "in apps/factory-namespace no longer covers it."
+            )
+        except ValueError as e:
+            return "SERVE", (
+                f"`{host}` ({addrs}) answered on :{port} but not with JSON ({e}) — "
+                "something is listening there and it is not ollama."
+            )
+
+        models = [m.get("name") for m in (payload.get("models") or []) if m.get("name")]
+        if not models:
+            return "SERVE", (
+                f"`{host}` ({addrs}) is reachable and speaks the ollama API but "
+                "has ZERO models. Every self-hosted-model call will fail at model "
+                "selection, one layer below where the caller will report it."
+            )
+        return "OK", f"{host} -> {addrs}, {len(models)} model(s): {sorted(models)}"
+
+
+    def main() -> int:
+        base = os.environ.get("BASE_URL", "http://host.k3d.internal:11434")
+        layer, detail = check(base)
+        print(f"{layer}: {base} — {detail}")
+        if layer == "OK":
+            return 0
+        sys.stderr.write(
+            f"FAIL [{layer}] {base}\n{detail}\n"
+            "Raised as a GitHub issue by the job-watchdog CronJob once this has "
+            "failed twice in a row. Refs factory-gitops#195, #196.\n")
+        return 1
+
+
+    # ------------------------------------------------------------------------
+    # Self-test. Mutation-checked in both directions: each layer must be told
+    # apart from the others, and a working endpoint must come back OK. A probe
+    # that can only ever say "broken" is worth as little as one that can only
+    # ever say "fine".
+    # ------------------------------------------------------------------------
+
+
+    def _selftest() -> int:
+        import http.server
+        import threading
+
+        # DNS. `.invalid` is reserved by RFC 6761 and is guaranteed never to
+        # resolve, so this case is real and needs no network.
+        layer, detail = check("http://host.k3d.internal.invalid:11434", timeout=2)
+        assert layer == "DNS", f"unresolvable name must report DNS, got {layer}"
+        assert "DOES NOT RESOLVE" in detail, detail
+
+        # CONNECT. Resolves (localhost) and refuses (port 1 is never bound).
+        layer, detail = check("http://127.0.0.1:1", timeout=2)
+        assert layer == "CONNECT", f"closed port must report CONNECT, got {layer}"
+
+        # SERVE, the case that matters most: the name resolves AND something
+        # answers AND it is useless. A probe that stopped at getaddrinfo() would
+        # call this healthy, which is the original defect moved down one layer.
+        class _H(http.server.BaseHTTPRequestHandler):
+            body = b'{"models": []}'
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(self.body)))
+                self.end_headers()
+                self.wfile.write(self.body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{srv.server_address[1]}"
+
+        layer, detail = check(url, timeout=5)
+        assert layer == "SERVE", f"zero models must report SERVE, got {layer}"
+        assert "ZERO models" in detail, detail
+
+        # Not JSON at all.
+        _H.body = b"<html>hello</html>"
+        layer, _ = check(url, timeout=5)
+        assert layer == "SERVE", f"non-JSON must report SERVE, got {layer}"
+
+        # And the healthy case must be SILENT. Both directions, or this proves
+        # nothing.
+        _H.body = b'{"models": [{"name": "qwen2.5:7b"}]}'
+        layer, detail = check(url, timeout=5)
+        assert layer == "OK", f"a serving endpoint must report OK, got {layer}: {detail}"
+        assert "qwen2.5:7b" in detail, detail
+
+        srv.shutdown()
+        print("host-k3d-internal-probe self-test: PASS — DNS, CONNECT, SERVE "
+              "(no models / not JSON) and OK are each distinguished")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(_selftest() if sys.argv[1:2] == ["selftest"] else main())
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: host-k3d-internal-probe
+  namespace: factory
+  labels: { app: host-k3d-internal-probe }
+spec:
+  # Every 10 minutes. With apps/job-watchdog's FAIL_THRESHOLD=2 and its own
+  # 30-minute cadence, a broken name reaches a GitHub issue inside ~50 minutes,
+  # and a single flaky lookup reaches nobody.
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Higher than the successful limit on purpose: the failed Jobs ARE the evidence,
+  # and apps/job-watchdog's first signal counts them. GC'ing them eagerly would
+  # blind the thing that reports this.
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      # One attempt. A retry inside the Job would convert a real outage into a
+      # slower real outage while hiding the first failure from the count.
+      backoffLimit: 0
+      template:
+        # app=host-k3d-internal-probe, deliberately not a label any Service in this
+        # namespace selects on — see apps/endpoint-guard for what that costs.
+        metadata: { labels: { app: host-k3d-internal-probe } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          # It reads nothing from the Kubernetes API.
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: probe
+              # Stock python; the script is stdlib-only, so there is no image to
+              # build and nothing to rebuild when it changes. Same digest the other
+              # watchdogs in this repo already pin.
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+              command: ["python3", "/script/probe.py"]
+              env:
+                # The exact value apps/aifactory and apps/tfactory set as
+                # OPENAI_COMPATIBLE_BASE_URL and apps/fides sets as
+                # OLLAMA_BASE_URL. If the fleet's URL is ever changed, change it
+                # here too — a probe pointed somewhere else is a green light for a
+                # route nobody uses.
+                - { name: BASE_URL, value: "http://host.k3d.internal:11434" }
+                - { name: PROBE_TIMEOUT_SECONDS, value: "15" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - name: script
+                  mountPath: /script
+                  readOnly: true
+          volumes:
+            - name: script
+              configMap:
+                name: host-k3d-internal-probe-script

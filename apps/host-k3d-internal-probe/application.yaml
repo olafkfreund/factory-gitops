@@ -1,0 +1,51 @@
+# host-k3d-internal-probe — can a pod in `factory` still reach the self-hosted
+# model BY NAME? (factory-gitops#195, #196)
+#
+# The question none of the existing watchdogs answer. apps/job-watchdog asks
+# whether CronJobs run; apps/fleet-match asks whether services run their repo's
+# main; apps/endpoint-guard asks whether Service backends can serve;
+# apps/argocd-drift asks whether ArgoCD's claimed revision is honest. All four
+# were green for the entire period in which `host.k3d.internal` did not resolve
+# from any pod in the cluster, because none of them looks OUTWARD at a dependency
+# the fleet reaches by name.
+#
+# That gap is expensive in a specific way: a DNS failure on this name surfaces to
+# the caller as a provider connection error, so it is read as "the model is
+# flaky" and filed against the model. Every judgement made about self-hosted
+# model quality, latency and availability in that window was made against a
+# connection that never opened (AIFactory#1099, #1213). Factory#642 is the same
+# defect class — a failure presenting one layer above where it happened.
+#
+# It deliberately does NOT carry its own notification machinery. A CronJob that
+# exits non-zero is watched cluster-wide by apps/job-watchdog, which reads
+# `/apis/batch/v1/cronjobs` unscoped, raises a GitHub issue on FAIL_THRESHOLD=2
+# consecutive failures and closes it on recovery. A fourth copy of that state
+# machine, in a repo whose own endpoint-guard header already flags three copies
+# as one too many, would be the larger change and the worse one.
+#
+# App-of-apps auto-discovers this file (apps/**/application.yaml). The CronJob
+# runs in `factory` and not kube-system on purpose: `factory` is where the
+# consumers live, so the probe traverses the same resolver, the same namespace
+# and the same NetworkPolicy surface they do.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: host-k3d-internal-probe
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/host-k3d-internal-probe/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
