@@ -147,7 +147,13 @@
 #
 # ---------------------------------------------------------------------------
 # THE COVERED LIST BELOW MIRRORS THE GLOBS IN verify-factory-image-signatures.
-# KEEP THEM IN STEP. When a rule is added there, add its glob here in the same
+# KEEP THEM IN STEP. Since #181 that is no longer a convention -- CI compares
+# the two lists (and the probe's) and fails when they disagree, because the
+# drift direction that matters is silent everywhere else:
+#
+#   python3 apps/kyverno-policies/assert-signature-lists-agree.py
+#
+# When a rule is added there, add its glob here in the same
 # commit, or this rule will report a false gap for an image that is in fact
 # covered. Re-check the mirror against the live webhook with:
 #

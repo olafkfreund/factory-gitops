@@ -613,6 +613,32 @@ jobs:
           #   - It cannot see workloads sourced from other repos. skillai-app comes
           #     from olafkfreund/SkillAi and is unhardened live; Factory#624.
 
+      # #181. Narrowing an `imageReferences` glob un-verifies an image SILENTLY:
+      # the result is not a `fail`, it is `pass: 0, fail: 0, warn: 0, error: 0,
+      # skip: 0`. Two agents hit it on two different rules on the same day.
+      #
+      # Measured on THIS repo, on the tree with `tfactory-runner-*` narrowed to
+      # `tfactory-runner-pytest:*` -- the exact narrowing quoted in #181 -- every
+      # gate that existed before this step stayed green:
+      #
+      #   kyverno-test-verify-factory-image-signatures.yaml
+      #     Test Summary: 98 tests passed and 0 tests failed   (guard 5: ok)
+      #
+      # and this step went red on twelve counts. The suite is all-negative by
+      # design, so a narrowed glob makes its cases MORE true; #148's rule
+      # inventory catches a rule renamed or deleted, not one narrowed.
+      #
+      # It runs no CLI and touches no network, which is the point: the obvious
+      # fix -- a positive test case on a MATCHED image -- sends the Kyverno CLI
+      # to ghcr.io, and #149 and #148 both declined to put a third-party registry
+      # inside a required status check. Three text comparisons need neither.
+      #
+      # Ordered here, before the Kyverno CLI steps, because it does not need
+      # them and because a drifted list should be reported before a CLI download
+      # can fail for unrelated reasons.
+      - name: The signature globs, the coverage mirror and the probe must agree
+        run: python3 apps/kyverno-policies/assert-signature-lists-agree.py
+
       # Factory#620. A Kyverno `Fail` webhook can stop every write it covers, so
       # the blast radius of a Fail policy is decided entirely by its
       # matchConditions -- and by how many Fail policies share the webhook.
@@ -1136,12 +1162,15 @@ jobs:
           #     because every case in that suite is legitimately negative and
           #     legitimately Excluded. Asserting the positive half means a
           #     MATCHED image, which means a call to ghcr.io from a required
-          #     status check; that is a worse trade than the gap. The narrowing
-          #     direction is covered off-CI instead, by
-          #     require-first-party-signature-coverage, which reports any
-          #     first-party image in `factory` that its mirror list does not
-          #     name. Guard 5's rule-inventory half DOES catch the blunter
-          #     version of this -- a rule renamed or deleted outright.
+          #     status check; that is a worse trade than the gap. Guard 5's
+          #     rule-inventory half DOES catch the blunter version of this -- a
+          #     rule renamed or deleted outright.
+          #     STILL TRUE OF THIS STEP, no longer true of this workflow: #181
+          #     added "The signature globs, the coverage mirror and the probe
+          #     must agree" above, which catches the narrowing by comparing the
+          #     three hand-maintained copies of the covered-image list instead
+          #     of by evaluating a rule. Its ceiling is a glob narrowed in all
+          #     three copies in one commit, which is a deliberate change.
           #   - Signature verification. No case here reaches a registry or
           #     rekor, by design; the suite is offline rule logic only.
           #   - Anything the webhook checks at admission time that the CLI does
