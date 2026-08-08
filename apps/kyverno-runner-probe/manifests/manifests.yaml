@@ -17,13 +17,19 @@
 # For these eleven images that inference is invalid. This CronJob is what makes
 # it checkable.
 #
-# WHAT IT DOES. Every six hours it submits ONE synthetic Pod carrying all
-# eleven runner images plus a canary through the real admission path with
-# `dryRun=All`, reads the `Warning` response headers Kyverno writes, and emits
-# one durable record per run to the OpenObserve stream `image_signature_probe`.
-# Nothing is ever scheduled or pulled -- the dry run is rejected by the API
-# server before persistence, and the admission webhook is the only thing that
-# actually executes.
+# WHAT IT DOES. Every six hours it submits one synthetic single-container Pod
+# PER IMAGE -- the eleven runner images, odin, and two canaries -- through the
+# real admission path with `dryRun=All`, reads whatever verdict Kyverno returns
+# for each, and emits one durable record per run to the OpenObserve stream
+# `image_signature_probe`. Nothing is ever scheduled or pulled -- the dry run is
+# rejected by the API server before persistence, and the admission webhook is
+# the only thing that actually executes.
+#
+# The verdict arrives by one of two channels and the probe treats them as the
+# same thing, because they carry the same text: a `Warning` response header
+# while the policy is Audit, and the `.status.message` of the 400 denial while
+# it is Enforce (Factory#522). See probe() for why it does not ask which mode
+# it is in, and why the requests are per-image rather than one batch.
 #
 # WHY dryRun=All AND NOT THE ALTERNATIVES.
 #
@@ -46,8 +52,10 @@
 #
 # dryRun=All exercises the identical code path a real runner Pod takes -- same
 # webhook, same rule, same cosign verification, same registry and Rekor round
-# trips -- for the cost of one API call and no image pull. It is the only
-# option that reports on the two private images honestly.
+# trips -- for the cost of one API call per image and no image pull. It is the
+# only option that reports on the two private images honestly. A real runner
+# Pod carries one image, so one image per request is also the more faithful
+# shape, not merely the more robust one.
 #
 # HOW IT KNOWS IT ACTUALLY RAN -- THE CANARY. This is the whole point of the
 # issue, so it is a mechanism and not a comment. A probe that reads "no warning
@@ -71,6 +79,20 @@
 # rather than per-repository, that registry reads work, that Fulcio/Rekor are
 # reachable, and that a genuine signature verdict is being computed -- all
 # without needing anything published specially for the probe.
+#
+# UNDER ENFORCE THE CANARY IS DENIED RATHER THAN WARNED ABOUT, AND THAT IS THE
+# SAME SIGNAL -- Factory#646. Flipping the policy (Factory#522) did not weaken
+# this control, it strengthened it: Kyverno now REFUSES the canary instead of
+# admitting it with a complaint attached. The probe reads the denial message,
+# which is the same `failed to verify image ... no signatures found` string, so
+# the contract is unchanged in either mode -- red for the reason `signature`, or
+# the run is void. What DID change is that a denial takes the whole request with
+# it, which is why the canary no longer shares a Pod with anything; see probe().
+#
+# Note the anti-vacuity property survives the flip intact, in both directions:
+# a canary that comes back SILENT (admitted, no denial, no warning) still means
+# the rule did not run and still voids the run. The only thing a canary can no
+# longer do is fail quietly.
 #
 # WHY THE TWO REDS DO NOT FAIL THE JOB. Exit code is reserved for "the probe
 # could not do its job" -- API server unreachable (3), canary contract broken
@@ -142,6 +164,13 @@
 #     the existing validate rule denies and returns its full message. Cleanest
 #     signal, but it flips a shared ClusterPolicy to Enforce, which is Factory
 #     #522 and explicitly out of scope.
+#
+#     Factory#522 has since LANDED, so the whole policy is Enforce and denial
+#     messages are now available for free. This does NOT reopen the option:
+#     that shape was about making the `validate` coverage rule speak, and the
+#     coverage answer still comes from the verify-images annotation, which a
+#     denial does not return at all. Enforce made the signature channel louder
+#     and the coverage channel more fragile, not the other way round.
 #
 # TWO CANARIES, BECAUSE THEY CATCH OPPOSITE LIES. The signature canary above is
 # also the coverage POSITIVE control: it is a `tfactory-runner-*` image, so it
@@ -278,6 +307,7 @@ data:
     import re
     import ssl
     import sys
+    import urllib.error
     import urllib.request
     from datetime import datetime, timezone
 
@@ -413,10 +443,17 @@ data:
         """Fold warnings and the verify-images annotation into one verdict.
 
         An image with no warning at all passed -- BUT ONLY IF THE RULE RAN, and
-        establishing that is the canary's job, not this function's. Measured on
-        kyverno v1.18.2 with twelve simultaneously-failing images: all twelve
-        were named in distinct Warning headers, so absence here is absence of a
-        complaint and not header truncation.
+        establishing that is the canary's job, not this function's. Absence has
+        to mean "nobody complained" and never "the complaint was dropped",
+        which is why probe() submits one image per request: measured on kyverno
+        v1.18.2 under Enforce, a request carrying two images that both fail the
+        SAME rule names only one of them (Factory#646). One image per request
+        leaves nothing to be masked by.
+
+        `warnings` therefore carries both channels, and deliberately does not
+        distinguish them: a Warning header under Audit and the Status message
+        of an Enforce denial are the same `failed to verify image` text, so the
+        verdict is identical either way.
 
         FACTORY#574. That is true of images a rule NAMES. For an image no glob
         names, silence means nobody looked -- and reading that as `pass` is
@@ -465,11 +502,36 @@ data:
     VERIFY_ANN = "kyverno.io/verify-images"
 
 
-    def probe(images: list[str], ns: str) -> tuple[list[str], dict]:
-        """Dry-run one Pod carrying every image.
+    def probe(image: str, ns: str) -> tuple[list[str], dict]:
+        """Dry-run ONE Pod carrying ONE image through the real admission path.
 
-        Returns Kyverno's warnings and its verify-images annotation. Both come
-        from the one POST; see VERIFY_ANN.
+        Returns Kyverno's messages about this image and its verify-images
+        annotation, both from the one POST; see VERIFY_ANN.
+
+        ONE IMAGE PER POST, BECAUSE ENFORCE MASKS -- Factory#646. This used to
+        submit every image on a single Pod, which was sound while the policy was
+        Audit: a failing image produced a Warning header and the request was
+        still admitted, so one response carried every verdict plus the coverage
+        annotation. Factory#522 flipped `verify-factory-image-signatures` to
+        Enforce and that shape stopped being measurable. Measured on this
+        cluster at kyverno v1.18.2, Enforce:
+
+          * A denied request returns a `Status`, not the mutated object, so the
+            `kyverno.io/verify-images` annotation is GONE -- coverage
+            (Factory#574) becomes unmeasurable for every image on the Pod, not
+            just the failing one.
+          * The denial names at most ONE failing image PER RULE. Submitting the
+            unsigned canary alongside `tfactory-runner-jest:nope` -- both under
+            `verify-tfactory-runner-signature` -- named only jest; the canary
+            was invisible. All eleven runners share that one rule, so any batch
+            containing the canary can surface at most one runner verdict.
+
+        So under Enforce a batch does not degrade, it collapses: one red erases
+        every other verdict in the request, including the reds. Per-image POSTs
+        are the only shape where an image cannot mask another. The cost is 13
+        API calls instead of 1; the number of cosign verifications is UNCHANGED
+        at 12, because each covered image is still verified exactly once, just
+        in a request of its own -- the ~4% figure in the manifest header stands.
         """
         with open(f"{SA}/token") as fh:
             token = fh.read().strip()
@@ -481,8 +543,9 @@ data:
                 "restartPolicy": "Never",
                 # Hardened so a future restricted PodSecurity label on the
                 # namespace rejects the spec on its merits, not on ours -- a
-                # 400 here would surface as "could not run", which is loud but
-                # would be our own fault.
+                # rejection that does not name our image is re-raised below and
+                # surfaces as "could not run", which is loud but would be our
+                # own fault.
                 "securityContext": {
                     "runAsNonRoot": True,
                     "runAsUser": 65532,
@@ -490,8 +553,8 @@ data:
                 },
                 "containers": [
                     {
-                        "name": f"probe-{n}",
-                        "image": img,
+                        "name": "probe",
+                        "image": image,
                         "command": ["/bin/true"],
                         "securityContext": {
                             "allowPrivilegeEscalation": False,
@@ -499,7 +562,6 @@ data:
                             "capabilities": {"drop": ["ALL"]},
                         },
                     }
-                    for n, img in enumerate(images)
                 ],
             },
         }
@@ -514,9 +576,48 @@ data:
             method="POST",
         )
         ctx = ssl.create_default_context(cafile=f"{SA}/ca.crt")
-        with urllib.request.urlopen(req, context=ctx, timeout=180) as r:
-            warnings = parse_warnings(r.headers.get_all("Warning") or [])
-            body = json.load(r)
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=180) as r:
+                messages = parse_warnings(r.headers.get_all("Warning") or [])
+                body = json.load(r)
+        except urllib.error.HTTPError as e:
+            # UNDER ENFORCE A DENIAL *IS* THE VERDICT. Kyverno delivers the
+            # identical `failed to verify image <ref>: <why>` text it writes as
+            # a Warning under Audit, just in the Status body of a 400 instead
+            # of a header, so classify() and verdicts() read it unchanged and
+            # the probe never has to know which mode the policy is in. That
+            # matters: asking the ClusterPolicy for its failureAction would
+            # answer from a second source that can disagree with the webhook,
+            # which is the same trap as re-implementing Kyverno's glob matching
+            # (see the manifest header).
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                denial = json.loads(raw)["message"]
+            except (ValueError, KeyError, TypeError):
+                denial = raw
+            # A rejection that does not name the image we submitted is not a
+            # signature verdict -- it is PodSecurity, a quota, some unrelated
+            # policy, or a broken API server. Re-raise so it reports "could not
+            # run" (exit 3) instead of being classified as an image finding.
+            #
+            # Raise the BODY, not the bare HTTPError. `probe could not run:
+            # <HTTPError 400: 'Bad Request'>` is precisely what this failure
+            # looked like for two days while the reason -- the denial text --
+            # sat unread in the Status message (Factory#646). An exit-3 record
+            # has to carry why.
+            if image not in denial:
+                raise RuntimeError(
+                    f"HTTP {e.code} rejecting {image}, and it does not name "
+                    f"that image so it is not a signature verdict: {denial}"
+                ) from e
+            # No mutated object comes back with a denial, so there is no
+            # coverage annotation. That is not a coverage gap: the denial
+            # itself proves a rule named this image, and the message matches
+            # FAILED, so verdicts() overwrites the not_covered default with the
+            # real reason. If the message ever stops naming a cause the image
+            # stays not_covered, which breaks the canary contract loudly rather
+            # than inventing a verdict.
+            return parse_warnings(e.headers.get_all("Warning") or []) + [denial], {}
         ann = (body.get("metadata") or {}).get("annotations") or {}
         # A malformed or absent annotation must read as "nothing was examined",
         # never as "everything is fine" -- {} makes every first-party image
@@ -526,7 +627,7 @@ data:
             verified = json.loads(ann.get(VERIFY_ANN) or "{}")
         except ValueError:
             verified = {}
-        return warnings, (verified if isinstance(verified, dict) else {})
+        return messages, (verified if isinstance(verified, dict) else {})
 
 
     def notify(record: dict) -> None:
@@ -590,8 +691,15 @@ data:
         }
 
         submitted = images + [i for i in (canary, cov_canary) if i]
+        # One POST per image -- see probe(). Any image failing to yield a
+        # verdict at all aborts the run: a partial sweep is not evidence.
+        warnings: list[str] = []
+        verified: dict = {}
         try:
-            warnings, verified = probe(submitted, ns)
+            for img in submitted:
+                w, v = probe(img, ns)
+                warnings += w
+                verified.update(v)
         except Exception as e:  # noqa: BLE001 -- any failure means no evidence
             eprint(f"ERROR: probe could not run: {e!r}")
             record.update(status="not_checked", problem=f"probe could not run: {e!r}")
@@ -751,6 +859,42 @@ data:
         # Warn-value envelope unwrapping.
         assert parse_warnings(['299 - "hello \\"x\\""']) == ['hello "x"']
         assert parse_warnings(["bare text"]) == ["bare text"]
+
+        # --- Factory#646: an Enforce denial is a verdict ------------------------
+        # Captured verbatim from this cluster after Factory#522 flipped the
+        # policy to Enforce: the `.status.message` of the 400 the API server
+        # returns for the canary. It must classify exactly as the Audit-mode
+        # Warning header did, with no mode-specific parsing -- that equivalence
+        # is the entire fix, so it is pinned here rather than described.
+        denial = (
+            'admission webhook "mutate.kyverno.svc-ignore" denied the request: \n\n'
+            "resource Pod/factory/ was blocked due to the following policies \n\n"
+            "verify-factory-image-signatures:\n"
+            "  verify-tfactory-runner-signature: 'failed to verify image "
+            "ghcr.io/olafkfreund/tfactory-runner-pytest:"
+            "9c039089b1afc4d4c7f98823fbdacf9e7516ec6a:\n"
+            "    .attestors[0].entries[0].keyless: no signatures found'\n"
+        )
+        cn = (
+            "ghcr.io/olafkfreund/tfactory-runner-pytest:"
+            "9c039089b1afc4d4c7f98823fbdacf9e7516ec6a"
+        )
+        # No annotation comes back with a denial, hence `{}` -- and the canary
+        # must still read `signature`, NOT not_covered. A denial proves a rule
+        # named the image; letting the missing annotation win would report the
+        # anti-vacuity control as a coverage gap and void every run.
+        v = verdicts([cn], [denial], {})
+        assert v[cn]["verdict"] == "fail", v[cn]
+        # `signature` is CANARY_EXPECT's default, so this is literally the
+        # comparison main() makes before it will let a run stand.
+        assert v[cn]["reason"] == "signature", v[cn]
+        # A denial that names a DIFFERENT image must not be laundered into a
+        # verdict for this one; probe() re-raises those, and if one ever did
+        # reach here the image stays not_covered rather than reading pass.
+        other = "ghcr.io/olafkfreund/tfactory-runner-jest:latest"
+        v = verdicts([other], [denial], {})
+        assert v[other]["reason"] == "not_covered", v[other]
+        assert v[other]["verdict"] == "fail", "never pass on someone else's denial"
         print("selftest OK")
         return 0
 
