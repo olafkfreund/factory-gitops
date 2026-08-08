@@ -727,6 +727,23 @@ jobs:
       # made `Fail` safe would take BOTH offline Kyverno gates down with it, and
       # under `shell: bash -e` it does so before either step can print why.
       #
+      # RE-MEASURED 2026-08-08 on v1.18.2 (#175): it STILL panics, at the same
+      # `pkg/validation/policy/validate.go:139`. So the strip stays. The two
+      # follow-ups #175 asks for are done and are in the CLI steps below: the
+      # `rc` capture is now reachable (`|| rc=$?`), and a crash is annotated as
+      # a crash rather than mis-reported as "Kyverno rejected this policy".
+      # Re-check the panic when the cluster moves off v1.18.2, and drop this
+      # step then rather than carrying it forever.
+      #
+      # THE STRIP-TOOK-EFFECT ASSERTION BELOW IS MUTATION-CHECKED, #175. With
+      # the `yq -i del(...)` line removed and nothing else changed:
+      #
+      #   ::error file=apps/kyverno-policies/manifests/gate-task-pods-on-network-policy.yaml::
+      #     matchConditions survived the strip -- the CLI steps below will segfault
+      #   rc=1
+      #
+      # and with it restored, `1 policy file(s) adjusted for the CLI`, rc=0.
+      #
       # This is a CLI defect, not a policy defect. The live webhook accepts the
       # same file -- `kubectl apply --dry-run=server` succeeds, and the policy
       # has been applied to the cluster and its generated webhook read back.
@@ -896,11 +913,33 @@ jobs:
 
           fail=0
           for f in "${POLICIES[@]}"; do
-            out=$(kyverno apply "$f" --resource /tmp/kyverno-probe.yaml -v 4 2>&1)
-            rc=$?
+            # `|| rc=$?` is load-bearing, not style. GitHub runs `run:` under
+            # `bash -e` and `set -uo pipefail` does NOT clear it -- measured,
+            # `$-` is `ehuB` inside these steps. So a bare `out=$(kyverno ...)`
+            # that exits non-zero kills the step THERE, and the whole
+            # rc-handling ladder below is unreachable for every CLI failure.
+            # That is #175: the required check went red on the second of five
+            # files with no message at all. Reproduced outside CI:
+            #
+            #   $ bash -e -c 'set -uo pipefail; out=$(exit 2); rc=$?
+            #                 echo "REACHED: rc=$rc"'
+            #   $ echo $?
+            #   2                      # and "REACHED" never printed
+            # rc is reset each iteration on purpose: `|| rc=$?` does not run on
+            # success, so a stale rc from the previous file would be read as
+            # this one's.
+            rc=0
+            out=$(kyverno apply "$f" --resource /tmp/kyverno-probe.yaml -v 4 2>&1) || rc=$?
             rules=$(printf '%s\n' "$out" | sed -n 's/^Applying \([0-9]\{1,\}\) policy rule(s).*/\1/p' | head -1)
 
-            if [ "$rc" -ne 0 ]; then
+            # A CRASH is not a verdict, and #175 is the reason to say so in
+            # words. Kyverno CLI v1.18.2 segfaults on
+            # `spec.webhookConfiguration.matchConditions`; without this branch
+            # the annotation would read "Kyverno rejected this policy", which is
+            # the one thing that did not happen -- the live webhook accepts it.
+            if printf '%s\n' "$out" | grep -q '^panic:\|SIGSEGV'; then
+              echo "::error file=$f::the Kyverno CLI CRASHED on this file (rc=$rc) rather than judging it. This is a CLI defect, not a policy defect -- see #175, and check the strip step above still covers whatever field triggered it"
+            elif [ "$rc" -ne 0 ]; then
               echo "::error file=$f::Kyverno rejected this policy -- the live webhook would refuse it, and ArgoCD would keep serving the PREVIOUS version while reporting Synced (Factory#430)"
             elif [ -z "$rules" ]; then
               echo "::error file=$f::could not read the rule count from kyverno output -- this gate cannot confirm it checked anything"
@@ -1120,15 +1159,21 @@ jobs:
 
           fail=0
           for f in "${SUITES[@]}"; do
-            out=$(kyverno test "$(dirname "$f")" -f "$(basename "$f")" 2>&1)
-            rc=$?
+            # `|| rc=$?`, and rc reset each iteration -- see the same note in the
+            # step above. Under `bash -e` a bare capture of a failing CLI kills
+            # the step before any of this ladder runs, which is how #175's
+            # segfault produced a red required check with no message at all.
+            rc=0
+            out=$(kyverno test "$(dirname "$f")" -f "$(basename "$f")" 2>&1) || rc=$?
             counts=$(printf '%s\n' "$out" \
               | sed -n 's/.*Test Summary:[[:space:]]*\([0-9]\{1,\}\) tests passed and \([0-9]\{1,\}\) tests failed.*/\1 \2/p' \
               | tail -1)
             passed=${counts%% *}
             failed=${counts##* }
 
-            if [ -z "$counts" ]; then
+            if printf '%s\n' "$out" | grep -q '^panic:\|SIGSEGV'; then
+              echo "::error file=$f::the Kyverno CLI CRASHED running this suite (rc=$rc) rather than judging it. This is a CLI defect, not a suite defect -- see #175, and check the strip step above still covers whatever field triggered it"
+            elif [ -z "$counts" ]; then
               echo "::error file=$f::kyverno test printed no summary -- this gate cannot confirm it ran anything"
             elif [ $((passed + failed)) -eq 0 ]; then
               echo "::error file=$f::kyverno test ran 0 cases -- a suite that tests nothing cannot pass (#143)"
