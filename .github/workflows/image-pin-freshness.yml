@@ -1,0 +1,200 @@
+name: image pin freshness
+
+# "Has any digest pin in this repo fallen behind the tag it names?", asked out
+# of band (#139).
+#
+# Factory#573 pinned the third-party images in `factory`, and #161/#162 pinned
+# everything outside it. `manifest-validate.yml` asserts they STAY pinned. None
+# of that asks whether a pin is still the RIGHT bytes -- a pinned digest never
+# moves, including past a CVE fix, and until this existed nothing proposed the
+# bump. The Renovate GitHub App is not installed on this account (zero Renovate
+# PRs across all five Factory repos, ever), its `kubernetes` manager has an
+# empty default file match in any case, and Dependabot's docker ecosystem
+# parses `FROM` lines in Dockerfiles rather than `image:` fields in Kubernetes
+# YAML. `renovate.json` records both facts.
+#
+# So the pins were honest and frozen, which is worse than it sounds: "nobody
+# has proposed a bump" and "there is nothing to bump" look identical from
+# outside, and that is how the same gap sat unnoticed for nine weeks in
+# Factory#436. A freshness assertion cannot be silently not-running -- if it
+# stops, this job goes red.
+#
+# WHY SCHEDULED AND NOT A PR GATE, which is the opposite call from the
+# immutability gate in manifest-validate.yml and deliberately so. A pull
+# request does not make a pin stale; TIME does. A pre-merge test would fail
+# PRs for something the PR did not cause, which is the cry-wolf shape that gets
+# a gate muted. The comparator itself IS covered on every PR that touches it,
+# offline, by its own --self-test.
+#
+# WHY IT DOES NOT FIRE WEEKLY ON EVERY IMAGE, which is the failure this fleet
+# has hit repeatedly and the thing #139 asks for by name. Two decisions, both
+# measured on this repo's real pins on 2026-08-08 rather than guessed:
+#
+#   1. It compares the PLATFORM digest, not the index digest. Of 23 pins, 22
+#      resolved to exactly their pinned index and one did not -- and diffing
+#      the two `python:3.12-slim` indexes showed linux/amd64 BYTE-IDENTICAL,
+#      with only linux/riscv64 and an attestation rebuilt. Both cluster nodes
+#      are linux/amd64, so nothing this cluster runs had changed. An
+#      index-digest alarm would have fired in its first week on a riscv64
+#      rebuild, and one non-event is all it takes to train everyone to ignore
+#      the signal.
+#
+#   2. A grace budget on the age of the bytes WE run, not on how recently
+#      upstream rebuilt. "How recently did upstream rebuild" is always a small
+#      number for a fast-moving tag, so a fast-moving tag would stay silent
+#      forever however far behind we fell. "How old are our bytes, given the
+#      tag has moved on" is the question that actually answers "are we sitting
+#      on something unpatched".
+#
+#   Measured result on the day this landed: 23 pins, 23 CURRENT, zero alerts --
+#   including the one whose index digest had moved.
+#
+# IT REPORTS, IT DOES NOT BUMP. A bad upstream rebuild must not reach the
+# cluster because a bot merged it unattended. Re-resolving a digest is a commit
+# that goes through the immutability gate and a human.
+#
+# WHY IT DOES NOT FILE AN ISSUE: same call as Factory's pin-freshness.yml and
+# branch-divergence.yml. A failing scheduled workflow on a repo you own already
+# emails you and shows red in the Actions tab; an auto-filed issue needs
+# auto-closing logic, which is a second small state machine that rots.
+#
+# WHY NO CREDENTIAL: every registry named by a pin here serves anonymous
+# manifest reads -- docker.io, ghcr.io, quay.io, registry.k8s.io,
+# reg.kyverno.io, public.ecr.aws. If one ever stops, this job fails on the read
+# and reports UNREADABLE rather than passing, which is the correct answer.
+
+on:
+  schedule:
+    # Weekly, Monday 05:41. Weekly rather than daily because the budget is 30
+    # days: a daily run would repeat the same verdict thirty times before it
+    # could change. Offset from cli-canary (05:00 Mon) so the two do not
+    # contend. Note BST != UTC.
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: "How old our bytes may be, once the tag has moved past them, before this alerts"
+        type: string
+        required: false
+        default: "30"
+  pull_request:
+    # The pins themselves cannot make this job right or wrong -- time does. What
+    # a PR here can change is the watchdog, so gate the watchdog.
+    paths:
+      - ".github/workflows/image-pin-freshness.yml"
+      - ".github/scripts/check_image_pin_freshness.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-pin-freshness
+  cancel-in-progress: false
+
+jobs:
+  freshness:
+    name: every digest pin is still the current bytes for its tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Self-test the comparator before trusting it
+        # First, not last, for the same reason every other watchdog in this
+        # fleet does it: a broken comparator cannot be trusted to say
+        # "everything is fresh", so it must fail as a broken comparator rather
+        # than quietly pass everything (rule 4.7). The case with teeth is
+        # "index moved, platform identical" -- if that ever goes red the
+        # comparison has drifted back to the index and this is a weekly alarm
+        # again.
+        run: python3 .github/scripts/check_image_pin_freshness.py --self-test
+
+      - name: Install kustomize and crane
+        run: |
+          set -euo pipefail
+          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kustomize
+          curl -sfL https://github.com/google/go-containerregistry/releases/download/v0.21.6/go-containerregistry_Linux_x86_64.tar.gz \
+            | tar -xz -C /usr/local/bin crane
+          # Rule 4.7: a download that 404s into a 0-byte file still leaves a
+          # file behind. Prove both are usable before claiming anything passed.
+          kustomize version
+          crane version
+
+      - name: Collect every digest pin this repo renders
+        # DERIVED, NOT LISTED -- the same principle as the immutability gate in
+        # manifest-validate.yml, by a deliberately simpler route. That gate
+        # needs Application scope so it can name WHO deploys an unpinned image;
+        # this one only needs the set of pinned refs, so it renders every
+        # kustomization and reads every loose file. That over-covers rather
+        # than under-covers, which is the right direction for a watchdog, and
+        # it reaches the pins that exist ONLY in rendered output -- kyverno,
+        # keda and bootstrap all pin via `images:` transformers over remote
+        # resources, so their digests appear in no `image:` line in git.
+        #
+        # A FAILED RENDER IS NOT A SMALLER SET. Without the guard below, one
+        # directory failing to build silently shrinks what gets checked and the
+        # job stays green having watched less than it did last week -- the
+        # exact defect #139 is about, reproduced inside its own fix.
+        run: |
+          set -uo pipefail
+          fail=0
+          : > /tmp/rendered.yaml
+          while read -r d; do
+            if ! kustomize build "$d" >> /tmp/rendered.yaml 2>/tmp/err; then
+              echo "::error file=$d/kustomization.yaml::kustomize build failed -- this watchdog would silently check fewer pins: $(head -1 /tmp/err)"
+              fail=1
+            fi
+          done < <(find . -name kustomization.yaml -not -path './.git/*' -printf '%h\n' | sort -u)
+          [ "$fail" -eq 0 ] || exit 2
+
+          git ls-files -z '*.yaml' '*.yml' | xargs -0 -r cat >> /tmp/rendered.yaml 2>/dev/null
+
+          sed -nE 's/^[[:space:]]*-?[[:space:]]*image:[[:space:]]*"?([^"[:space:]]+).*/\1/p' /tmp/rendered.yaml \
+            | grep '@sha256:' | sort -u > /tmp/pins.txt
+
+          n=$(wc -l < /tmp/pins.txt)
+          if [ "$n" -eq 0 ]; then
+            echo "::error::no digest pin found anywhere -- either every pin was removed or this discovery is broken; both are failures"
+            exit 2
+          fi
+          echo "collected $n distinct digest pin(s)"
+          cat /tmp/pins.txt
+
+      - name: Re-resolve every pinned tag against its registry
+        # Exit 1 = a pin is stale past the budget, or undated so its staleness
+        # cannot be computed. Exit 2 = a registry could not be read, which is
+        # also a failure: a watchdog that read nothing must not report
+        # freshness.
+        env:
+          BUDGET: ${{ inputs.max_age_days || '30' }}
+        run: |
+          set -o pipefail
+          python3 .github/scripts/check_image_pin_freshness.py \
+            --max-age-days "${BUDGET}" --platform linux/amd64 \
+            < /tmp/pins.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: What to do when this job is red
+        if: failure()
+        run: |
+          echo "STALE means the tag has moved on from the bytes we pinned, and those"
+          echo "bytes are older than the budget. Re-resolve it:"
+          echo
+          echo "    crane digest <image>:<tag>"
+          echo
+          echo "and commit the new digest in the SAME shape it already has --"
+          echo "image:tag@sha256:... . Do not switch to kustomize's digest: field: it"
+          echo "drops the tag, and a digest with no tag is a pin this watchdog can"
+          echo "never evaluate again. Read the upstream release notes first; this job"
+          echo "reports, it does not decide that the new bytes are good."
+          echo
+          echo "UNDATED means the tag moved and the image declares no usable creation"
+          echo "time, so how far behind we are cannot be computed. Check that one by"
+          echo "hand. It is deliberately an alert and not a pass -- 'I could not check"
+          echo "this' must never look like 'this is fine'."
+          echo
+          echo "UNREADABLE, or a failed kustomize build, means this watchdog is blind"
+          echo "on something rather than happy about it. Fix the input; do not add a"
+          echo "skip (rule 4.7)."
+          echo
+          echo "If a pin is deliberately held back, raise --max-age-days with the"
+          echo "reason rather than muting the job -- and say so where the pin lives."
