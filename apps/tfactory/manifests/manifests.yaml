@@ -646,6 +646,22 @@ spec:
             # provider keys — power the claude / codex / antigravity CLIs seeded above
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             - { name: GEMINI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: GEMINI_API_KEY } } }
+            # Headless/automated runs: the gemini/antigravity CLI refuses to run in
+            # an "untrusted" workspace and exits BEFORE any API call, so a Gemini
+            # verify run fails with no request ever leaving the pod. AIFactory hit
+            # exactly this on 2026-06-13 and fixed it the same way; TFactory can
+            # invoke Gemini (providers/gemini_agentic.py) and was still missing it.
+            # TFactory#871.
+            - { name: GEMINI_CLI_TRUST_WORKSPACE, value: "true" }
+            # Self-hosted Ollama for the native (non-openai-compatible) route. The
+            # provider class defaults to http://localhost:11434 and reads no env of
+            # its own, so without this every ollama-routed phase talks to a port
+            # nothing listens on inside the pod. TFactory#870 resolves this var in
+            # phase_config.get_provider_extra_kwargs and forwards it to the verify
+            # Job. Same address as OPENAI_COMPATIBLE_BASE_URL below — note that name
+            # currently does NOT resolve from any pod (factory-gitops#196); fixing
+            # that record fixes both routes at once.
+            - { name: OLLAMA_BASE_URL, value: "http://host.k3d.internal:11434" }
             # Ollama (openai-compatible) so the verify lanes (planner/evaluator/qa)
             # can run on openai-compatible:<model> models routed via the handoff
             # contract — same config AIFactory uses. Without the base URL the
