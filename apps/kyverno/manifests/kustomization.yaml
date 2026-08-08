@@ -174,6 +174,98 @@ patches:
         path: /spec/template/spec/containers/0/resources/requests/memory
         value: 256Mi
 
+  # Stop the background-controller crash loop (Factory#651).
+  #
+  # THE DEFECT: 128Mi is below what a v1.18.2 Kyverno controller needs resident,
+  # so this cgroup lives permanently AT its limit in direct reclaim. It is never
+  # OOM-killed, because reclaim always succeeds -- the pages it evicts are the
+  # controller's own executable text, which it then faults straight back in.
+  #
+  # THE MEASUREMENT, read off the pod cgroup on the node, against the two
+  # healthy siblings running the same binary class as controls:
+  #
+  #                          background     reports     admission
+  #   memory.max                  128Mi       512Mi         384Mi
+  #   memory.peak           134,307,840        76Mi         193Mi
+  #                        (= memory.max
+  #                         to the byte)
+  #   memory.events max       1,950,659           0             0
+  #   workingset_refault_file
+  #                          85,798,949           0             0
+  #   io.pressure full/300        12.30%       0.00%         0.00%
+  #   user_usec                     40.5s       41.8s         33.5s
+  #   system_usec                  254.7s        6.3s          7.3s
+  #
+  # USER TIME IS THE SAME ON ALL THREE. This controller is not doing more work;
+  # it is spending 40x the kernel time of its siblings, and all of it is page
+  # reclaim. cpu.pressure is 0.00 and cpu.stat nr_throttled is 0, so it is not
+  # CPU-starved and not CFS-throttled. oom_kill is 0, which is why every restart
+  # reports `Error`/exit 1 and never `OOMKilled`.
+  #
+  # WHY EVERY EARLIER LOOK CLEARED MEMORY, including Factory#561's "~40Mi":
+  # `kubectl top` reports working_set = memory.current - inactive_file. It
+  # SUBTRACTS the reclaimable file cache -- which is precisely the thing being
+  # thrashed here. The honest figures are memory.peak (pinned at the limit) and
+  # memory.events max. A point-in-time top against a cgroup pegged at its limit
+  # reads healthy by construction. Do not re-clear memory with `kubectl top`.
+  #
+  # WHY NOW, having been fine for months: the 2026-07-26 bump from v1.12.6 to
+  # v1.18.2 grew this image from 36MB to 45.7MB on-node (`crictl images`), ~27%
+  # more text to keep resident. 128Mi fit v1.12.6 and does not fit v1.18.2. The
+  # limit was simply never resized with the bump.
+  #
+  # WHY IT CRASHLOOPS NOW WHERE FACTORY#561 SAW A CLEAN exit 0. The thrash makes
+  # startup glacial -- 12.9s to LIST, 21s to acquire an UNCONTESTED lease, 60-80s
+  # before leader election is even attempted -- so the 12s lease (renew deadline
+  # ~8s) is lost 20-25s after it is taken, mid-startup. What the exit code then
+  # depends on is a RACE: v1.18.2 runs two controller-runtime Kind sources this
+  # controller did not have at v1.12.6 (MutatingPolicy and
+  # NamespacedMutatingPolicy). Lose the lease AFTER they sync and the manager
+  # drains cleanly -> exit 0, the #561 signature. Lose it BEFORE, and the drain
+  # blocks on informers that are still syncing, blows controller-runtime's
+  # hardcoded 30s GracefulShutdownTimeout, and the manager returns an error ->
+  # exit 1 -> CrashLoopBackOff, the #651 signature:
+  #
+  #   failed to start manager: failed waiting for all runnables to end within
+  #   grace period of 30s: context deadline exceeded
+  #
+  # BOTH exits were observed on the SAME pod eight minutes apart -- restart 15
+  # exit 1, restart 16 exit 0. So #651 is not a new fault and #651 is not a
+  # duplicate of #561 either: it is #561's trigger, now firing early enough in
+  # startup to catch the two new informers unsynced. Nothing about shutdown
+  # changed. What changed is WHEN the lease is lost.
+  #
+  # SIZING, so this is a measured number and not a bigger one. The lower bound
+  # is observed, not guessed: kyverno-admission-controller, the same binary
+  # class, PEAKS AT 193Mi -- already 1.5x this controller's entire limit. So the
+  # limit has to clear ~193Mi. 512Mi/256Mi is then the value this repo already
+  # uses for kyverno-reports-controller, applied for this same exit signature in
+  # Factory#501, which has run since with 0 restarts, memory.events max = 0 and
+  # workingset_refault_file = 0. Matching the proven sibling beats inventing a
+  # third number.
+  #
+  # NO QPS PATCH HERE, DELIBERATELY, and this is the trap the #501 block above
+  # warns about. `--clientRateLimitQPS` is already an effective 100/200 (read
+  # off the running binary's own `--v=2` flag dump, not from `--help`), and a
+  # full container lifetime was grepped for `client-side throttling`: ZERO
+  # lines. Cluster apiserver load is also unchanged between this controller's
+  # up-windows and its 5m-backoff down-windows (~10-18 req/s either way), so it
+  # is not flooding anything. The "client rate limiter Wait returned an error"
+  # line is still what #501 says it is -- a context that was already dead --
+  # and raising QPS here would change nothing.
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: kyverno-background-controller
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 512Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 256Mi
+
   # KYVERNO HAS NO ghcr.io CREDENTIAL, AND DOES NOT NEED ONE. Factory#563.
   #
   # It runs with `--registryCredentialHelpers=default,google,amazon,azure,github`
