@@ -1178,7 +1178,40 @@ jobs:
           #   - A `Fail` policy widening beyond its matchConditions. That is not
           #     a property of a rule, it is a property of the generated webhook,
           #     and `kyverno test` never generates one. See the next step.
+          #   - A mutate rule that is not IDEMPOTENT. `kyverno test` applies each
+          #     rule exactly once and never simulates the API server's
+          #     reinvocation, so this whole step is structurally blind to it.
+          #     That is #166 and it now has its own step, below.
           exit "$fail"
+
+      # #166. The resource mutating webhook is registered
+      # `reinvocationPolicy: IfNeeded`, so the API server calls Kyverno AGAIN
+      # when another webhook alters the object in the same admission, and a
+      # mutate rule sees an object its own patch has already been applied to.
+      # `kyverno test` applies each rule ONCE. Nothing above simulates the
+      # second pass, and the failure mode is not subtle: measured on
+      # `inject-netpol-gate` with its guarding precondition removed, the offline
+      # suite was fully green with every REASON `Ok` while the live webhook
+      # answered
+      #
+      #   The Pod "t517-dbg" is invalid: spec.initContainers[1].name:
+      #     Duplicate value: "netpol-gate"
+      #
+      # deterministically. Shipped, that is every task pod in the fleet failing
+      # admission, green in CI the whole way.
+      #
+      # The second-pass input is already committed as the expected output --
+      # each mutate result carries a `patchedResources` file -- so this needs no
+      # new fixtures. Measured with a deliberately non-idempotent mutate rule
+      # added alongside an ordinary passing suite case, every gate above stayed
+      # green (five suites, "0 tests failed", guard 5 ok) and this step was the
+      # only thing that went red.
+      #
+      # It runs AFTER the strip step for the same reason the CLI steps do, but
+      # does not depend on it: the script strips matchConditions from its own
+      # temporary copy (#175) so it is runnable on its own.
+      - name: Every mutate rule must be idempotent under webhook reinvocation
+        run: python3 apps/kyverno-policies/assert-mutate-idempotent.py
 
   # Second gate, deliberately NOT the required status check (branch protection
   # requires only "kustomize build + schema"). It currently FAILS, on purpose:

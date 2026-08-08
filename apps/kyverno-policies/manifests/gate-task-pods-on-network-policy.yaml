@@ -312,6 +312,13 @@ spec:
       # carries an explicit `task-already-gated` case standing in for the
       # reinvocation pass. Do not delete it as redundant -- it is the only
       # thing between this rule and rejecting every task pod in the fleet.
+      #
+      # Since #166 it is no longer the ONLY thing, and no longer a convention
+      # one file happens to follow: `assert-mutate-idempotent.py` re-applies
+      # every mutate rule in this repo to its own committed `patchedResources`
+      # and fails on any rule that mutates twice -- or that has no
+      # patchedResources to be re-applied to, so a new mutate rule cannot opt
+      # out by leaving the check nothing to iterate over.
       preconditions:
         all:
           - key: "{{ length(request.object.spec.initContainers[?name == 'netpol-gate'] || `[]`) }}"
