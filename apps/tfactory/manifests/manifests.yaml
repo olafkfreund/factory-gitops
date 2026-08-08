@@ -458,7 +458,17 @@ spec:
             # specs without a disposable-target requirement. Job is torn down
             # on all paths, no credentials in Job env/argv.
             - { name: TFACTORY_VAL3_K8S_JOB, value: "1" }
-            - { name: TFACTORY_VAL3_K8S_JOB_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
+            # Pinned :sha-<short>@sha256:<digest>, not :latest (TFactory#890).
+            # The DIGEST is what resolves and it cannot move -- which matters
+            # more now the Kyverno signature gate is at Enforce (Factory#522),
+            # because a tag can be repointed at something unsigned between one
+            # admission check and the next. The TAG rides along as readable
+            # provenance ("which commit produced this verdict"), which the Nix
+            # lane -- the DEFAULT verify execution path -- needs to be able to
+            # answer. nix-runner-image.yml rewrites both lines on every publish
+            # and FAILS if either is absent, rather than sed-ing a silent no-op
+            # (the #719 failure mode). Do not hand-edit.
+            - { name: TFACTORY_VAL3_K8S_JOB_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:sha-6b3f373@sha256:2828a3e38e340d891a608441a82d2ef7bbbf7ca0259830057a05430d16489511" }
             # RFC-0005 Tier A / RFC-0016 #469: the Nix-lane k8s-Job sandbox
             # co-mounts the worktree from this PVC and runs the per-task flake in
             # the thin Nix image. nixjob is now the DEFAULT verify execution path
@@ -480,7 +490,7 @@ spec:
             # --dry-run=server (VAL-2). Set => the kubectl rung runs; unset =>
             # honest not_run. RBAC = the tfactory-deploy-dryrun SA/Role above.
             - { name: TFACTORY_DEPLOY_DRYRUN_SA, value: "tfactory-deploy-dryrun" }
-            - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
+            - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:sha-6b3f373@sha256:2828a3e38e340d891a608441a82d2ef7bbbf7ca0259830057a05430d16489511" }
             - { name: TFACTORY_NIX_IN_IMAGE, value: "true" }
             # TFACTORY_IMAGE pins the TFactory backend image the verify Job runs
             # on (the image that now ships the `agents` package on PYTHONPATH —
@@ -521,7 +531,7 @@ spec:
             # is rebuilt only when its inputs change, so it lags the backend tag
             # and that is correct. It must always name a commit whose
             # portal_testing/ is the one intended to run.
-            - { name: PORTAL_UI_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-6b3f373" }
+            - { name: PORTAL_UI_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-6b3f373@sha256:3a7cf8ed96a4bd92280cd38a7d23cc3b0feec7c2b9ec2eb1ffcd0505076f2c3c" }
             # RFC-0016 #466 / RFC-0017: Job-native verify orchestration.
             # FLIP #1 (2026-06-21) REVERTED — verify_dispatch was present but NOT
             # WIRED (nothing called verify_exec_mode), so the flip was inert.
