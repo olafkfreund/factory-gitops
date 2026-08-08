@@ -599,8 +599,17 @@ data:
             # signature verdict -- it is PodSecurity, a quota, some unrelated
             # policy, or a broken API server. Re-raise so it reports "could not
             # run" (exit 3) instead of being classified as an image finding.
+            #
+            # Raise the BODY, not the bare HTTPError. `probe could not run:
+            # <HTTPError 400: 'Bad Request'>` is precisely what this failure
+            # looked like for two days while the reason -- the denial text --
+            # sat unread in the Status message (Factory#646). An exit-3 record
+            # has to carry why.
             if image not in denial:
-                raise
+                raise RuntimeError(
+                    f"HTTP {e.code} rejecting {image}, and it does not name "
+                    f"that image so it is not a signature verdict: {denial}"
+                ) from e
             # No mutated object comes back with a denial, so there is no
             # coverage annotation. That is not a coverage gap: the denial
             # itself proves a rule named this image, and the message matches
