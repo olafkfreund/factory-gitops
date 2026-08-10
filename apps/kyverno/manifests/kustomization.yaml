@@ -266,6 +266,51 @@ patches:
         path: /spec/template/spec/containers/0/resources/requests/memory
         value: 256Mi
 
+  # Give the cleanup controller headroom (Factory#654) — the last controller
+  # still carrying the v1.12.6-era 128Mi that Factory#651 showed is below what a
+  # v1.18.2 Kyverno controller needs resident.
+  #
+  # SAME SIGNATURE AS #651, ~1000x MILDER. Read off the pod cgroup on the node:
+  #
+  #                          cleanup      background (#651)
+  #   memory.max               128Mi            128Mi
+  #   memory.peak        134,737,920      134,307,840
+  #                     (= memory.max)   (= memory.max)
+  #   memory.current     133,828,608       at the limit
+  #   memory.events max        1,932        1,950,659
+  #   workingset_refault_file 33,194       85,798,949
+  #   io.pressure full/300      0.00%           12.30%
+  #
+  # Pinned at the ceiling and reclaiming, never OOM-killed, because reclaim
+  # always succeeds — it evicts the controller's own executable text and faults
+  # it straight back in. It is not stalling TODAY (io.pressure 0.00), which is
+  # why this is headroom rather than an incident.
+  #
+  # WHY 256Mi AND NOT A ROUND NUMBER. `memory.peak` here is truncated BY the
+  # limit, so the real working set is unknown and only known to be >= 128Mi —
+  # sizing to the observed peak would re-pin it exactly. The class reference is
+  # the sibling running the same binary: admission peaks at 193Mi, i.e. 1.5x
+  # this entire limit. 256Mi clears that peak with room and stays below the two
+  # controllers that do materially more work (both 512Mi). The request moves
+  # 64Mi -> 128Mi so the scheduler stops treating it as a 64Mi workload.
+  #
+  # DO NOT VALIDATE THIS WITH `kubectl top`. It reports
+  # working_set = memory.current - inactive_file, which subtracts exactly the
+  # reclaimable page cache being thrashed, so it reads healthy by construction
+  # in precisely this failure mode. Read the cgroup on the node.
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: kyverno-cleanup-controller
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 256Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 128Mi
+
   # KYVERNO HAS NO ghcr.io CREDENTIAL, AND DOES NOT NEED ONE. Factory#563.
   #
   # It runs with `--registryCredentialHelpers=default,google,amazon,azure,github`
