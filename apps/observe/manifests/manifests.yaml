@@ -311,7 +311,12 @@ data:
 
 
     def drifted(rv):
-        """Consumers whose stamped annotation is not `rv`.
+        """(consumers whose stamp is not `rv`, consumers actually examined).
+
+        The second element exists so the caller can report what it VERIFIED
+        rather than what it hoped. Printing "all 4 stamped" after a 404 skipped
+        one is a count asserted instead of measured — the defect this whole
+        script is about, one level down.
 
         This is the question the reconciler has to ask every run. "Is the
         Secret right?" is NOT it — that is the mistake Factory#606 is about,
@@ -321,7 +326,7 @@ data:
         treated as drift, because a consumer whose state cannot be read has
         not been shown to be current (rule 4.7).
         """
-        out = []
+        out, seen = [], []
         for name in CONSUMERS:
             try:
                 d = k8s("GET", f"/apis/apps/v1/namespaces/{NS}/deployments/{name}")
@@ -330,17 +335,20 @@ data:
                     continue
                 eprint(f"cannot read {name}, assuming drift: {e!r}")
                 out.append(name)
+                seen.append(name)
                 continue
             except Exception as e:  # noqa: BLE001 — unreadable == unverified
                 eprint(f"cannot read {name}, assuming drift: {e!r}")
                 out.append(name)
+                seen.append(name)
                 continue
+            seen.append(name)
             ann = (
                 ((d.get("spec") or {}).get("template") or {}).get("metadata") or {}
             ).get("annotations") or {}
             if ann.get(ANNOTATION) != rv:
                 out.append(name)
-        return out
+        return out, seen
 
     def roll(rv, names=CONSUMERS):
         """Stamp `rv` on each named consumer's pod template. Returns failures.
@@ -413,11 +421,17 @@ data:
                 eprint(f"FATAL: {DST} exists but the API returned no "
                        "resourceVersion; cannot verify consumers are current")
                 return 4
-            behind = drifted(rv)
+            behind, seen = drifted(rv)
             if not behind:
+                # Report what was VERIFIED, not len(CONSUMERS): a consumer that
+                # is not deployed was skipped, not checked, and saying "all 4"
+                # after examining 3 is the same unmeasured claim this script
+                # exists to stop.
+                absent = len(CONSUMERS) - len(seen)
+                tail = f", {absent} not deployed" if absent else ""
                 # Never log the header itself; the scheme is the whole diagnosis.
                 print(f"ok: {DST} derived from {SRC} (scheme=Basic), "
-                      f"all {len(CONSUMERS)} consumers stamped {rv}")
+                      f"{len(seen)}/{len(CONSUMERS)} consumers stamped {rv}{tail}")
                 return 0
             print(f"converging: {DST} is correct but these are not stamped "
                   f"{rv}: {', '.join(behind)}")

@@ -130,9 +130,20 @@ check("unreadable consumer: treated as drift, not as current",
       f"exit={rc} rolled={sorted(rolled)}")
 
 # 1e. A consumer that is not deployed has no pod on the old header.
-rc, rolled, patched, m = run("correct", stamped=STAMPED, get_status={"cfactory": 404})
+import contextlib as _c, io as _io  # noqa: E402
+_buf = _io.StringIO()
+with _c.redirect_stdout(_buf):
+    rc, rolled, patched, m = run("correct", stamped=STAMPED, get_status={"cfactory": 404})
+_msg = _buf.getvalue()
 check("consumer not deployed: not drift, nothing rolled",
       rc == 0 and not rolled, f"exit={rc} rolled={sorted(rolled)}")
+
+# 1f. ...and the success line must report what was VERIFIED, not len(CONSUMERS).
+#     Saying "all 4 stamped" after a 404 skipped one is a count asserted rather
+#     than measured -- the defect this script exists to stop, one level down.
+check("success line counts only the consumers actually examined",
+      "3/4" in _msg and "1 not deployed" in _msg and "all 4" not in _msg,
+      _msg.strip().splitlines()[-1] if _msg.strip() else "<no output>")
 
 # 2. The regression itself: value corrected, consumers must be rolled with the
 #    Secret's NEW resourceVersion.
