@@ -219,12 +219,18 @@ rules:
   # that was already running — aifactory exported no spans for 23 hours after
   # the value was corrected. Rolling the consumers belongs to the thing that
   # knows the value changed. resourceNames pins it to the four Deployments that
-  # actually mount `otel-otlp-auth`; `get` is not needed, only the annotation
-  # patch that rolls the pod template.
+  # actually mount `otel-otlp-auth`.
+  #
+  # `get` was deliberately excluded here while the job was edge-triggered, and
+  # adding it is what makes the job CONVERGENT: it must read each consumer's
+  # stamp to know whether that consumer is current. Without `get` the reader
+  # 403s, the script's fail-closed rule reads every consumer as drifted, and it
+  # rolls all four EVERY HOUR — a self-inflicted rolling restart of the fleet.
+  # The two changes are one change; do not split them.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: ["aifactory", "pfactory", "tfactory", "cfactory"]
-    verbs: ["patch"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -304,8 +310,40 @@ data:
         return json.loads(raw) if raw else None
 
 
-    def roll(rv):
-        """Stamp `rv` on every consumer's pod template. Returns names that failed.
+    def drifted(rv):
+        """Consumers whose stamped annotation is not `rv`.
+
+        This is the question the reconciler has to ask every run. "Is the
+        Secret right?" is NOT it — that is the mistake Factory#606 is about,
+        and answering it was how this job reported ok for ten days while no
+        consumer carried the stamp at all. A 404 is not drift: an app that is
+        not deployed has no pod on the old header. A read that FAILS is
+        treated as drift, because a consumer whose state cannot be read has
+        not been shown to be current (rule 4.7).
+        """
+        out = []
+        for name in CONSUMERS:
+            try:
+                d = k8s("GET", f"/apis/apps/v1/namespaces/{NS}/deployments/{name}")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    continue
+                eprint(f"cannot read {name}, assuming drift: {e!r}")
+                out.append(name)
+                continue
+            except Exception as e:  # noqa: BLE001 — unreadable == unverified
+                eprint(f"cannot read {name}, assuming drift: {e!r}")
+                out.append(name)
+                continue
+            ann = (
+                ((d.get("spec") or {}).get("template") or {}).get("metadata") or {}
+            ).get("annotations") or {}
+            if ann.get(ANNOTATION) != rv:
+                out.append(name)
+        return out
+
+    def roll(rv, names=CONSUMERS):
+        """Stamp `rv` on each named consumer's pod template. Returns failures.
 
         A 404 is not a failure: an app that is not deployed has no pod running
         on the old header. Anything else is, and it is the state worth an exit
@@ -313,7 +351,7 @@ data:
         the value it read at startup.
         """
         failed = []
-        for name in CONSUMERS:
+        for name in names:
             try:
                 k8s(
                     "PATCH",
@@ -357,8 +395,37 @@ data:
             cur = None
 
         if cur and (cur.get("data") or {}).get("headers") == wanted:
-            # Never log the header itself; the scheme is the whole diagnosis.
-            print(f"ok: {DST} already derived from {SRC} (scheme=Basic)")
+            # Factory#606, one layer up. Returning here made this reconciler
+            # EDGE-triggered: it rolled consumers only on the run that changed
+            # the Secret. A roll that failed once — a transient 403, an API
+            # timeout, a Deployment not yet created — was never retried,
+            # because every later run took this branch and printed ok while a
+            # pod stayed on the old header forever. Observed 2026-08-10: this
+            # job had reported ok hourly for ten days and NOT ONE of the four
+            # consumers carried the annotation.
+            #
+            # So converge instead of edge-trigger. The property to hold is
+            # "every consumer is stamped with the current Secret", not "the
+            # Secret is correct" — asserting the latter while the former is
+            # false is exactly the defect #606 describes.
+            rv = (cur.get("metadata") or {}).get("resourceVersion")
+            if not rv:
+                eprint(f"FATAL: {DST} exists but the API returned no "
+                       "resourceVersion; cannot verify consumers are current")
+                return 4
+            behind = drifted(rv)
+            if not behind:
+                # Never log the header itself; the scheme is the whole diagnosis.
+                print(f"ok: {DST} derived from {SRC} (scheme=Basic), "
+                      f"all {len(CONSUMERS)} consumers stamped {rv}")
+                return 0
+            print(f"converging: {DST} is correct but these are not stamped "
+                  f"{rv}: {', '.join(behind)}")
+            failed = roll(rv, behind)
+            if failed:
+                eprint(f"FATAL: could not roll {', '.join(failed)}; they may "
+                       "still be exporting with the value read at startup")
+                return 4
             return 0
 
         had = "absent"

@@ -32,17 +32,35 @@ def wanted_header(m):
     return base64.b64encode(f"Authorization=Basic {basic}".encode()).decode()
 
 
-def run(existing, deployment_status=None):
-    """existing: 'correct' | 'stale' | 'absent'. deployment_status: {name: http code}."""
+def run(existing, deployment_status=None, stamped=None, get_status=None):
+    """Drive main() against a fake API server.
+
+    existing          : 'correct' | 'stale' | 'absent'
+    deployment_status : {name: http code} -- the PATCH (roll) fails with this
+    stamped           : {name: resourceVersion} already on the pod template.
+                        Absent from the dict means the consumer carries no
+                        annotation, which is the state the live cluster was in
+                        for ten days (Factory#606 convergence).
+    get_status        : {name: http code} -- the READ of that Deployment fails
+    """
     m = load()
     deployment_status = deployment_status or {}
-    rolled, patched_secret = {}, []
+    stamped = stamped or {}
+    get_status = get_status or {}
+    rolled, patched_secret, read = {}, [], []
 
     def fake_k8s(method, path, body=None, content_type="application/json"):
         if path.endswith(f"/secrets/{m.SRC}"):
             return ROOT
         if "/deployments/" in path:
             name = path.rsplit("/", 1)[-1]
+            if method == "GET":
+                read.append(name)
+                code = get_status.get(name)
+                if code:
+                    raise urllib.error.HTTPError(path, code, "nope", {}, None)
+                ann = {m.ANNOTATION: stamped[name]} if name in stamped else {}
+                return {"spec": {"template": {"metadata": {"annotations": ann}}}}
             code = deployment_status.get(name)
             if code:
                 raise urllib.error.HTTPError(path, code, "nope", {}, None)
@@ -60,6 +78,7 @@ def run(existing, deployment_status=None):
 
     m.k8s = fake_k8s
     rc = m.main()
+    m._read = read
     return rc, rolled, patched_secret, m
 
 
@@ -73,11 +92,47 @@ def check(label, cond, detail=""):
         failures.append(label)
 
 
-# 1. Nothing changed -> nothing rolled. A rotation that did not happen must not
-#    restart the fleet every hour.
-rc, rolled, patched, m = run("correct")
-check("already derived: exit 0, no Secret write, no roll", rc == 0 and not patched and not rolled,
+# 1. Nothing changed AND every consumer already carries the current stamp ->
+#    nothing rolled. A rotation that did not happen must not restart the fleet
+#    every hour. This is the property that makes the convergence below safe:
+#    lose it and the reconciler rolls all four on every run, forever.
+STAMPED = dict.fromkeys(CONSUMERS, "1")  # "1" = the Secret's resourceVersion in the fake
+rc, rolled, patched, m = run("correct", stamped=STAMPED)
+check("already derived and all stamped: exit 0, no Secret write, no roll",
+      rc == 0 and not patched and not rolled,
       f"exit={rc} rolled={sorted(rolled)}")
+
+# 1b. Factory#606 convergence. The live cluster spent ten days here: the Secret
+#     was correct, the job printed ok hourly, and NOT ONE consumer carried the
+#     annotation -- because the old code returned early whenever the Secret
+#     matched, so `roll` was reachable only on the run that changed it. A roll
+#     that failed once was never retried. Reverting to that early return makes
+#     this case report ok while rolling nothing, which is the failure.
+rc, rolled, patched, m = run("correct", stamped={})
+check("derived but nothing stamped: converge and roll all four",
+      rc == 0 and not patched and sorted(rolled) == sorted(CONSUMERS),
+      f"exit={rc} rolled={sorted(rolled)}")
+
+# 1c. Only the drifted consumer is touched. Rolling the compliant ones would be
+#     an unnecessary restart of a healthy pod.
+rc, rolled, patched, m = run("correct", stamped={**STAMPED, "pfactory": "old"})
+check("one consumer behind: only that one is rolled",
+      rc == 0 and sorted(rolled) == ["pfactory"],
+      f"exit={rc} rolled={sorted(rolled)}")
+
+# 1d. A consumer whose state cannot be READ has not been shown to be current,
+#     so it is treated as drift (rule 4.7). NOTE the coupling this creates: the
+#     Role must grant `get` on deployments, or every run reads 403, calls every
+#     consumer drifted, and rolls the fleet hourly. Asserted below.
+rc, rolled, patched, m = run("correct", stamped=STAMPED, get_status={"tfactory": 403})
+check("unreadable consumer: treated as drift, not as current",
+      rc == 0 and sorted(rolled) == ["tfactory"],
+      f"exit={rc} rolled={sorted(rolled)}")
+
+# 1e. A consumer that is not deployed has no pod on the old header.
+rc, rolled, patched, m = run("correct", stamped=STAMPED, get_status={"cfactory": 404})
+check("consumer not deployed: not drift, nothing rolled",
+      rc == 0 and not rolled, f"exit={rc} rolled={sorted(rolled)}")
 
 # 2. The regression itself: value corrected, consumers must be rolled with the
 #    Secret's NEW resourceVersion.
@@ -113,7 +168,22 @@ out = buf.getvalue()
 check("no credential material in the output",
       wanted_header(m) not in out and "pw" not in out.replace("password", ""))
 
+# 7. The RBAC coupling behind case 1d, asserted against the manifest rather
+#    than trusted. `drifted` READS each Deployment; if the Role grants only
+#    `patch`, every read 403s, the fail-closed rule calls all four drifted, and
+#    the reconciler rolls the entire fleet EVERY HOUR. The script change and the
+#    Role change are one change, and this is what keeps them together.
+import pathlib, re  # noqa: E402
+
+_MANIFEST = pathlib.Path(__file__).resolve().parents[2] / "apps/observe/manifests/manifests.yaml"
+_rule = re.search(
+    r'resources:\s*\["deployments"\].*?verbs:\s*\[([^\]]*)\]', _MANIFEST.read_text(), re.S
+)
+_verbs = _rule.group(1) if _rule else "<no deployments rule found>"
+check("Role grants get AND patch on deployments (else hourly fleet restart)",
+      '"get"' in _verbs and '"patch"' in _verbs, f"verbs=[{_verbs}]")
+
 if failures:
     print(f"::error::observe-otlp-auth-sync wrong for: {', '.join(failures)}")
     sys.exit(1)
-print("rotation reaches the consumers")
+print("rotation reaches the consumers, and a missed roll converges")
