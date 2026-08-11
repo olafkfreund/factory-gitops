@@ -39,10 +39,26 @@ spec:
         - containerPort: 8000
           name: http
         env:
+        # #212: these were literal 32-hex API keys in a PUBLIC repo from
+        # 2026-06-08. Removing them from HEAD does not remove them from the
+        # published history, so the values themselves must be treated as
+        # disclosed and rotated in Sonarr/Radarr — this change only stops the
+        # next one being committed.
+        #
+        # The Secret is created out-of-band (it holds credentials, so it cannot
+        # live here) and is NOT part of this kustomization, so ArgoCD's prune
+        # does not own it. Rotation is then: change the key in the app, update
+        # `odin-api-keys`, restart. No repo change, no sync.
         - name: SONARR_API_KEY
-          value: "b33eac69aaa94e2ab426f2934eabfb96"
+          valueFrom:
+            secretKeyRef:
+              name: odin-api-keys
+              key: SONARR_API_KEY
         - name: RADARR_API_KEY
-          value: "7d825135970740c1bc5845badc47c4ed"
+          valueFrom:
+            secretKeyRef:
+              name: odin-api-keys
+              key: RADARR_API_KEY
         # Keeps CPython from trying to write .pyc into a now read-only /app.
         # Not load-bearing (a failed .pyc write is non-fatal) but it is the
         # configuration that was actually measured, so it is the one shipped.
