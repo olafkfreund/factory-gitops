@@ -165,6 +165,37 @@ data:
 
         rt = oauth.get("refreshToken")
         if not rt:
+            # A `claude setup-token` credential HAS no refresh token — there is
+            # nothing to rotate, which is the whole reason to seed one. Treating
+            # its absence as fatal made the correctly-seeded fleet fail every 4
+            # hours forever, and the only way to silence that was to keep a
+            # USABLE refresh token in the Secret — which let this job perform a
+            # real refresh and rotate the year-long credential away, reporting
+            # "OK: credential refreshed, access TTL 8.0h" while undoing the fix.
+            # Verified by hash on 2026-08-11 (Factory#679).
+            #
+            # So: absent refresh token is an incident ONLY when the runway is
+            # short. With months left it is the expected steady state, and the
+            # same reasoning as the invalid_grant branch below applies — an
+            # alarm that is always red is as useless as a gate that is always
+            # green.
+            if days_left is not None and days_left > LONG_LIVED_DAYS:
+                eprint(
+                    f"NOTE: no refreshToken, and none is needed — {days_left:.0f} days of "
+                    "runway means this is a `claude setup-token` credential. Nothing to "
+                    "rotate and nothing at risk."
+                )
+                eprint(runway)
+                eprint(
+                    "reporting SUCCESS. This job goes red once the runway reaches "
+                    f"{LONG_LIVED_DAYS}d or less with no refresh token to renew it."
+                )
+                record(
+                    "not-applicable:long-lived-credential",
+                    f"no refreshToken, {days_left:.0f}d runway",
+                    exp_ms,
+                )
+                return 0
             eprint(f"FATAL: no refreshToken in the Secret — needs a human re-seed. {runway}")
             record("no-refresh-token", "Secret has no refreshToken", exp_ms)
             return 2
@@ -218,8 +249,8 @@ data:
                     )
                     eprint(
                         "reporting SUCCESS: nothing to rotate and nothing at risk. This "
-                        "job goes red again the moment the runway drops below "
-                        f"{LONG_LIVED_DAYS}d with the grant still rejected."
+                        "job goes red again once the runway reaches "
+                        f"{LONG_LIVED_DAYS}d or less with the grant still rejected."
                     )
                     record(
                         "not-applicable:long-lived-credential",
