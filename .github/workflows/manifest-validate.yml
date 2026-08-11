@@ -138,8 +138,51 @@ jobs:
 
           fail=0
 
+          # Two kustomizations resource a pinned upstream release over the
+          # network (kyverno's install.yaml, argo-cd's), which this repo does
+          # deliberately — the release URL is the version pin, and the digest
+          # pins and patches layer on top of it. The cost is that this REQUIRED
+          # gate can fail for reasons that have nothing to do with the
+          # manifests: seen 2026-08-11 as
+          #
+          #   tls: failed to verify certificate: x509: certificate is not valid
+          #   for any names, but wanted to match github.com
+          #
+          # which passed on a re-run with no change. An intermittently-red
+          # required check trains people to re-run without reading, and that
+          # blindness is exactly what let two live API keys sit in this public
+          # repo for two months behind the sibling job (#212).
+          #
+          # So: retry, but NEVER silently. A build that needed a retry still
+          # says so in the log, because "this gate is network-flaky" is
+          # information worth keeping — it is the argument for vendoring these
+          # two resources, and hiding it would bury that argument.
+          build_with_retry() {
+            local dir="$1" attempt out
+            for attempt in 1 2 3; do
+              if out=$(kustomize build "$dir" 2>&1); then
+                # >&2, NOT stdout. The caller captures this function's stdout AS
+                # THE RENDERED MANIFEST and pipes it to kubeconform, so a stray
+                # annotation here would be parsed as the first YAML document.
+                [ "$attempt" -gt 1 ] && echo "::warning file=$dir/kustomization.yaml::kustomize build succeeded only on attempt $attempt -- this kustomization fetches a remote release, see #212" >&2
+                printf '%s' "$out"
+                return 0
+              fi
+              # Only a network/TLS failure is worth retrying. A genuine
+              # manifest error is deterministic, and retrying it three times
+              # just makes a real failure slower to report.
+              case "$out" in
+                *tls:*|*"connection reset"*|*"i/o timeout"*|*"TLS handshake"*|*"no such host"*|*"unexpected EOF"*) ;;
+                *) printf '%s' "$out"; return 1 ;;
+              esac
+              [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+            done
+            printf '%s' "$out"
+            return 1
+          }
+
           for d in "${DIRS[@]}"; do
-            if ! built=$(kustomize build "$d" 2>&1); then
+            if ! built=$(build_with_retry "$d"); then
               echo "::error file=$d/kustomization.yaml::kustomize build failed: $(printf '%s' "$built" | head -1)"
               fail=1
               continue
