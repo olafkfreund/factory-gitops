@@ -187,8 +187,8 @@ data:
                 )
                 eprint(runway)
                 eprint(
-                    "reporting SUCCESS. This job goes red the moment the runway drops "
-                    f"below {LONG_LIVED_DAYS}d with no refresh token to renew it."
+                    "reporting SUCCESS. This job goes red once the runway reaches "
+                    f"{LONG_LIVED_DAYS}d or less with no refresh token to renew it."
                 )
                 record(
                     "not-applicable:long-lived-credential",
@@ -249,8 +249,8 @@ data:
                     )
                     eprint(
                         "reporting SUCCESS: nothing to rotate and nothing at risk. This "
-                        "job goes red again the moment the runway drops below "
-                        f"{LONG_LIVED_DAYS}d with the grant still rejected."
+                        "job goes red again once the runway reaches "
+                        f"{LONG_LIVED_DAYS}d or less with the grant still rejected."
                     )
                     record(
                         "not-applicable:long-lived-credential",
