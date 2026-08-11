@@ -1435,6 +1435,20 @@ jobs:
               next
             }
             var != "" && /^[[:space:]]*value:[[:space:]]*[^[:space:]]/ {
+              # A value that is an absolute PATH is a pointer to a credential,
+              # not the credential: ODIN_SSH_KEY=/etc/odin/ssh/id_ed25519 names
+              # where the key is mounted. Flagging it taught everyone to ignore
+              # this job, which is how two real 32-hex API keys sat in a PUBLIC
+              # repo for two months underneath the noise (#212).
+              #
+              # Deliberately narrow: leading /, no whitespace, and nothing that
+              # looks like inline PEM material. A secret that happens to start
+              # with / and contains no spaces would still be missed, which is
+              # why this exempts the VALUE SHAPE and never a variable name.
+              if ($0 ~ /value:[[:space:]]*"?\/[^[:space:]"]*"?[[:space:]]*$/ && $0 !~ /PRIVATE KEY/) {
+                var = ""
+                next
+              }
               if ($0 !~ /value:[[:space:]]*("" *|'"''"' *)$/) {
                 printf "::error file=%s,line=%d::%s is set with a literal value: -- use secretKeyRef (#116)\n", FILENAME, FNR, var
                 hits++
