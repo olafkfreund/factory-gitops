@@ -1,0 +1,21 @@
+# factory-gitops had no dependabot config and alerts switched off at the repo
+# level, on a PUBLIC repo (Factory#711).
+#
+# There is no requirements.txt or package.json here -- the Python that runs in
+# the cluster is embedded in the manifests and uses stdlib only. The real
+# dependency surface is the ACTIONS these workflows call, which deploy to a live
+# cluster and run with repo credentials. An unpinned or abandoned action there
+# is a supply-chain path straight into the deploy lane.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "security"

@@ -1,0 +1,23 @@
+# CodeQL config for factory-gitops.
+#
+# security-and-quality is listed EXPLICITLY. A config-file REPLACES the
+# workflow's `queries:` input, so omitting it silently drops the repo to
+# CodeQL's narrower default suite. That is not hypothetical: TFactory and
+# PFactory both did exactly that when they adopted their custom query packs,
+# and their alert counts fell in a way that read as an improvement
+# (Factory#711). This repo starts at full breadth so its first number is honest.
+name: "factory-gitops CodeQL config"
+
+queries:
+  - uses: security-and-quality
+
+paths:
+  # The eight CI helpers, and the extracted copies of the block scalars that
+  # are the real in-cluster code. Without the second entry this scan would
+  # cover the helpers only and report clean over everything that matters.
+  - .github/scripts
+  - _codeql_extracted
+
+paths-ignore:
+  # Vendored/third-party trees would drown the first triage pass.
+  - "**/node_modules"

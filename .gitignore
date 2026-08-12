@@ -1,0 +1,3 @@
+
+# Transient: CodeQL lifts the manifests embedded Python here at scan time.
+_codeql_extracted/
