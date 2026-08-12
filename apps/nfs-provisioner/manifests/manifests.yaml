@@ -235,7 +235,56 @@ kind: StorageClass
 apiVersion: storage.k8s.io/v1
 metadata: { name: nfs, labels: { app: nfs-provisioner } }
 provisioner: factory.io/nfs
+# `soft` is the difference between a bad afternoon and a dead cluster
+# (Factory#687). This NFS server is a POD IN THE CLUSTER IT SERVES, so stopping
+# docker stops the server underneath its own clients. On a hard mount the
+# client then retries forever:
+#
+#   AnyIO worker  rpc_wait_bit_killable <- nfs4_do_close <- nfs_file_release
+#                 <- __fput <- do_exit
+#
+# A process holding an open file on this export cannot finish exiting, its PID
+# namespace never drains, and docker reports the container `Up` with zero
+# processes inside — SIGKILL-proof kernel state that `restart: unless-stopped`
+# never fires for. That killed the agent on 2026-08-06 (7h) and the server on
+# 2026-08-12 (~6h). Both needed the container rebuilt by hand.
+#
+# `soft` bounds the retry: the RPC returns EIO after timeo x retrans, __fput
+# completes, and the container dies properly. 60s x 3 is deliberately generous
+# — a transient blip must not produce EIO, only a server that is genuinely gone
+# should, and 3 minutes is far longer than any real ganesha hiccup.
+#
+# The cost of `soft` is that a write can fail with EIO instead of blocking
+# forever. That is acceptable HERE and would not be everywhere: the sole
+# consumer is tfactory-data-rwx (workspace state; git clones re-materialize via
+# TFactory#539), so an EIO is a retryable failed verify run. Every datastore in
+# this cluster — postgres, minio, redis, fides, observe — is on `local-path`
+# and is untouched by this. Do not extend this class to a database without
+# revisiting the option.
+#
+# `softreval` lets a revalidation that would block use the cached attributes
+# instead, which is what keeps `soft` from turning a slow server into spurious
+# ENOENT during lookup.
+#
+# THIS DOES NOT REACH THE PV THAT ALREADY EXISTS. StorageClass.mountOptions are
+# COPIED ONTO A PV WHEN IT IS PROVISIONED; changing the class never rewrites a
+# bound volume. So this line is correct for every future PV and inert for
+# tfactory-data-rwx, which is the only one there is. Patch it directly, once:
+#
+#   kubectl --context factory patch pv "$(kubectl --context factory get pvc \
+#     tfactory-data-rwx -n factory -o jsonpath='{.spec.volumeName}')" \
+#     --type merge -p '{"spec":{"mountOptions":["vers=4.1","soft","softreval","timeo=600","retrans=3"]}}'
+#
+# then confirm with `kubectl get pv <name> -o jsonpath='{.spec.mountOptions}'`.
+# It takes effect on the next MOUNT, so the consuming pods must be restarted
+# (or the node rebooted) before the option is actually in force — check
+# /proc/mounts on the node, not the PV spec, to know it is live. Tracked in
+# Factory#687.
 mountOptions:
   - vers=4.1
+  - soft
+  - softreval
+  - timeo=600
+  - retrans=3
 reclaimPolicy: Retain
 volumeBindingMode: Immediate
