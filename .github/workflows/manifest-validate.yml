@@ -1445,8 +1445,10 @@ jobs:
   # and permanent, but it does not wedge every merge in the repo behind a
   # decision that is not CI's to make.
   #
-  # When #116 closes, add "no literal secrets in manifests" to the required
-  # checks in branch protection. That is the only change needed.
+  # This job IS a required check on main as of #209 — declared in the hub's
+  # scripts/apply_branch_protection.sh, which is the single place the fleet's
+  # required contexts live. Renaming this job renames a required context and
+  # blocks every PR until that table is updated to match.
   secrets:
     name: no literal secrets in manifests
     runs-on: ubuntu-latest
