@@ -96,7 +96,18 @@ def die(msg):
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, text=True, check=False, **kw)
+    # A missing binary is a gate that CANNOT DO ITS WORK, and this file's own
+    # workflow header promises those are an explicit exit 1 rather than a
+    # surprise ("missing tools" is the first item in that list). Without this
+    # the failure is a raw FileNotFoundError traceback out of subprocess —
+    # non-zero, so never unsafe, but illegible anywhere the CLI is not
+    # installed, which is every developer's machine.
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, **kw)
+    except FileNotFoundError:
+        die(f"`{cmd[0]}` is not on PATH — this check needs it and cannot "
+            f"report anything without it. Install it (the workflow pins the "
+            f"same version) and re-run.")
 
 
 def yq(expr, path):
