@@ -17,6 +17,12 @@ paths:
   # cover the helpers only and report clean over everything that matters.
   - .github/scripts
   - _codeql_extracted
+  # `paths` applies to EVERY language in the matrix, not just python. Omitting
+  # this left the `actions` pack with no workflows to read, and CodeQL failed
+  # the job with "could not process any code written in GitHub Actions" rather
+  # than reporting a clean scan -- the right way round, but it still has to be
+  # fixed here rather than by dropping the language.
+  - .github/workflows
 
 paths-ignore:
   # Vendored/third-party trees would drown the first triage pass.
