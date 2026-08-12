@@ -2536,7 +2536,13 @@ data:
         # the stamp must come after the notify call. If it ever drifts above it,
         # a watchdog that cannot notify would keep its heartbeat fresh and report
         # itself healthy while telling nobody anything.
-        src = open(__file__).read() if os.path.exists(__file__) else ""
+        # Context-managed: the bare open() leaked the handle (py/file-not-closed,
+        # the one true positive in factory-gitops' first CodeQL baseline).
+        if os.path.exists(__file__):
+            with open(__file__) as _self_src:
+                src = _self_src.read()
+        else:
+            src = ""
         if src:
             # Sliced at _selftest, not to end-of-file: the assertions below name
             # the very strings they forbid, so an unbounded slice matches its own
