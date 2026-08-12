@@ -119,6 +119,8 @@ jobs:
           is_skipped() {
             case "$1" in
               .github/workflows/*) return 0 ;;   # GitHub Actions, not Kubernetes
+              .github/dependabot.yml) return 0 ;;   # Dependabot config, not Kubernetes
+              .github/codeql/*)    return 0 ;;   # CodeQL config, not Kubernetes
               mkdocs.yml)          return 0 ;;   # MkDocs site config
               *)                   return 1 ;;
             esac

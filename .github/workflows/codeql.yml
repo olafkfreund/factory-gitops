@@ -1,0 +1,78 @@
+name: CodeQL
+
+# factory-gitops had NO code scanning at all -- the API answered "no analysis
+# found" while the other five fleet repos were being scanned (Factory#711). It
+# is also a public repo, which makes it the worst place in the fleet to have
+# zero coverage.
+#
+# The subtlety that makes this workflow different from the other repos':
+# scanning this tree as checked out would be close to worthless. The only .py
+# FILES here are the eight CI helpers under .github/scripts. Everything that
+# actually runs in the cluster -- job-watchdog, restart-watchdog, cred-broker,
+# endpoint-guard, fleet-match, evidence-collector -- lives as a block scalar
+# inside apps/*/manifests/manifests.yaml, which CodeQL reads as a YAML string
+# and reports nothing about. That is ~423 KB of privileged, credential-handling
+# code, and a badge over it would be a lie of exactly the kind Factory#711 is
+# about.
+#
+# So the analysis runs against extracted copies as well. Alert paths look like
+# `_codeql_extracted/job-watchdog__watchdog.py`; the prefix names the app the
+# code came from, so a finding is traceable back to its manifest.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so a newly published query still finds old code.
+    - cron: "23 4 * * 1"
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      # The `actions` pack reads workflow definitions it does not have on disk.
+      actions: read
+    strategy:
+      fail-fast: false
+      # `actions` is included deliberately: this repo's workflows deploy to a
+      # live cluster, so they are attack surface in their own right.
+      matrix:
+        language: [python, actions]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Must run BEFORE init, so the extracted files exist when CodeQL builds
+      # its database. The script exits 1 if it extracts nothing at all -- an
+      # empty directory would scan clean and mean nothing.
+      - name: Lift embedded Python out of the manifests
+        if: matrix.language == 'python'
+        run: |
+          set -o pipefail
+          python3 .github/scripts/extract_all_embedded.py _codeql_extracted | tee extract.log
+          echo "--- extracted files:"
+          ls -1 _codeql_extracted/
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
