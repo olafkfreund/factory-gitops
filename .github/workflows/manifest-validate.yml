@@ -35,7 +35,7 @@ jobs:
     name: kustomize build + schema
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install kustomize, kubeconform, yq and the Kyverno CLI
         run: |
@@ -1561,7 +1561,7 @@ jobs:
     name: no literal secrets in manifests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Scan manifests for credentials committed as literal values
         run: |
