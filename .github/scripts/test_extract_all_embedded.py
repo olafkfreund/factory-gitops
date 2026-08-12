@@ -15,7 +15,6 @@ import subprocess
 import sys
 
 _SCRIPTS = pathlib.Path(__file__).resolve().parent
-_REPO_ROOT = _SCRIPTS.parents[1]
 
 
 def _run(outdir: pathlib.Path) -> subprocess.CompletedProcess[str]:
