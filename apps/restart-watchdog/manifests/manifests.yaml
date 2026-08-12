@@ -215,6 +215,20 @@ data:
     SEVERITY_LABELS = {"critical": "severity:critical", "warning": "severity:warning"}
     MARKER = "<!-- restart-watchdog:{key} -->"
 
+    # Terminations the kubelet could not attribute, because it had no exit status
+    # to report -- the runtime went away underneath the container. Spelled exactly
+    # as apps/job-watchdog maps them to `runtime_lost` (its `Unknown` and
+    # `ContainerStatusUnknown` rows), because the two must agree on what a node
+    # event IS or the suppression below aims at the wrong thing.
+    RUNTIME_LOST_REASONS = {"Unknown", "ContainerStatusUnknown"}
+
+    # How long after a node event a container's own death still counts as a
+    # consequence of it rather than a fault of its own. Same 300s job-watchdog
+    # uses to correlate a kill with a node condition transition (Factory#673):
+    # tight enough that it corroborates something, since every node has SOME
+    # event within an hour and a correlation that always fires proves nothing.
+    DEPENDENT_WINDOW_SECONDS = 300
+
 
     def eprint(*a):
         print(*a, file=sys.stderr, flush=True)
@@ -303,6 +317,72 @@ data:
                 "status": "crashloop" if crashloop else "restarting",
             })
         return out
+
+
+    def collapse_node_event(records, window=DEPENDENT_WINDOW_SECONDS):
+        """Split records into (report, suppressed-with-a-reason). Pure.
+
+        Factory#673: one containerd restart across two nodes produced SIX issues.
+        Two were job-watchdog's, one per node, correctly grouped. The other four
+        were this watchdog's, and all four were the same fault seen again:
+
+          - `cloudflared` exit 255 / reason Unknown -- literally the node event,
+            counted a second time from the loop side.
+          - three `oauth2-proxy` instances that crash-looped 12 times each in
+            seven seconds against a keycloak that had not finished coming back,
+            then settled. Three issues; one consequence.
+
+        Six alerts for one fault is an alert channel people learn to skip, which
+        is how the next real outage gets missed. Two rules, both run-local:
+
+        1. A `runtime_lost` termination is NOT reported here at all. apps/job-
+           watchdog already files it, grouped per node, with the node conditions
+           that prove it. Note this skips only the NODE-scoped reasons, not all of
+           job-watchdog's NOTIFY_CODES -- a repeated OOM still reports here,
+           because "killed by the OOM killer" and "for the fortieth time" are two
+           different facts and a human wants both.
+
+        2. A container on a node that just lost its runtime, whose own death
+           lands within `window` AFTER that, is a dependent. It was waiting on
+           something that was also restarting. It attaches to the node event
+           rather than opening its own.
+
+        Deliberately NOT suppressed, because these are faults in their own right:
+        a dependent still in CrashLoopBackOff NOW (it did not recover with the
+        cohort, so something else is wrong), and anything that died BEFORE the
+        node event (nothing that happens later can have caused it).
+
+        No shared state with job-watchdog, no second API call: the node event is
+        recovered from the same `lastState.terminated` data this run already read.
+        Same-node is the constraint on purpose. A dependency can of course live on
+        the other node, but widening this cluster-wide would let one node event
+        mute every unrelated restart in the fleet, and a suppression rule that
+        broad is indistinguishable from a broken watchdog.
+        """
+        report, suppressed = [], []
+        lost_ages_by_node = {}
+        for r in records:
+            if r["reason"] in RUNTIME_LOST_REASONS and r["last_terminated_age_seconds"] is not None:
+                lost_ages_by_node.setdefault(r["node"], []).append(r["last_terminated_age_seconds"])
+
+        for r in records:
+            if r["reason"] in RUNTIME_LOST_REASONS:
+                suppressed.append((r, "runtime_lost -- apps/job-watchdog files this "
+                                      "per node, with the node conditions that prove it"))
+                continue
+            age = r["last_terminated_age_seconds"]
+            if r["status"] == "crashloop" or age is None:
+                report.append(r)
+                continue
+            # A node event is OLDER, so its age is LARGER. Closest one wins: taking
+            # the earliest would miss a dependent of the second of two restarts.
+            gaps = [ev - age for ev in lost_ages_by_node.get(r["node"], []) if 0 <= ev - age <= window]
+            if gaps:
+                suppressed.append((r, f"died {_dur(min(gaps))} after node `{r['node']}` "
+                                      "lost its runtime, and recovered with it"))
+                continue
+            report.append(r)
+        return report, suppressed
 
 
     def severity_of(record):
@@ -544,11 +624,19 @@ data:
                 live.add(f"{p['metadata']['namespace']}/{workload_key(p)}/{cs['name']}")
             records.extend(assess(p, now, min_restarts, window_hours))
 
+        found = len(records)
+        records, suppressed = collapse_node_event(records)
+        # Suppressed findings are PRINTED, never silently dropped. The log is this
+        # job's only other witness, and a mute nobody can see is the failure mode
+        # this change exists to avoid, one level up (#673).
+        for r, why in sorted(suppressed, key=lambda rw: key_of(rw[0])):
+            eprint(f"SUPPRESSED {key_of(r)} reason={r['reason']} exit={r['exit_code']}: {why}")
         for r in sorted(records, key=lambda r: -r["restarts"]):
             eprint(f"UNHEALTHY {key_of(r)} restarts={r['restarts']} "
                    f"reason={r['reason']} exit={r['exit_code']} "
                    f"last={_dur(r['last_terminated_age_seconds'])} ago")
-        eprint(f"scanned {len(pods)} pods, {len(records)} unhealthy container(s)")
+        eprint(f"scanned {len(pods)} pods, {found} unhealthy container(s), "
+               f"{len(suppressed)} attached to a node event, {len(records)} reported")
 
         try:
             sent = notify(token, repo, records, live, now, renotify)
@@ -564,7 +652,8 @@ data:
         now = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
 
         def pod(name, ns="kyverno", kind="ReplicaSet", start="2026-07-28T12:00:00Z",
-                restarts=0, reason="Completed", code=0, fin=None, began=None, waiting=None):
+                restarts=0, reason="Completed", code=0, fin=None, began=None, waiting=None,
+                node="k3d-agent-0-0"):
             cs = {"name": "controller", "restartCount": restarts, "state": {}}
             if fin:
                 cs["lastState"] = {"terminated": {"reason": reason, "exitCode": code,
@@ -575,7 +664,7 @@ data:
                 cs["state"] = {"running": {"startedAt": start}}
             return {"metadata": {"name": name, "namespace": ns,
                                  "ownerReferences": [{"kind": kind, "name": "owner"}] if kind else []},
-                    "spec": {"nodeName": "k3d-agent-0-0"},
+                    "spec": {"nodeName": node},
                     "status": {"startTime": start, "containerStatuses": [cs]}}
 
         # The real Factory#561 pod: 392 restarts, last one 73 minutes ago.
@@ -615,6 +704,44 @@ data:
                          fin="2026-08-07T11:00:00Z"), now, 5, 6)
         assert oom[0]["reason"] == "OOMKilled" and oom[0]["exit_code"] == 137
         assert "OOMKilled" in issue_body(oom[0]) and "137" in issue_body(oom[0])
+
+        # THE Factory#673 INCIDENT, replayed. One containerd restart across two
+        # nodes filed six issues; four of them were this watchdog's and all four
+        # were the same fault counted again. Times are the real ones, shifted:
+        # node event 16m before the run, the dependents 4m20s after the event.
+        NODE_EVENT = "2026-08-07T11:44:00Z"     # runtime went away
+        DEPENDENT = "2026-08-07T11:48:20Z"      # 4m20s later -- inside the window
+        lost = assess(pod("cloudflared-6d4f8c9b77-x2k1m", ns="factory", restarts=6,
+                          reason="Unknown", code=255, fin=NODE_EVENT), now, 5, 6)
+        deps = [assess(pod(f"oauth2-proxy-{n}-7c9d4b6f85-abcde", ns="factory", restarts=12,
+                           reason="Error", code=1, fin=DEPENDENT), now, 5, 6)[0]
+                for n in ("cfactory", "observe", "odin")]
+        report, muted = collapse_node_event(lost + deps)
+        assert report == [], [key_of(r) for r in report]
+        assert len(muted) == 4, muted
+        # ...and each mute says WHICH of the two rules caught it, because a
+        # suppression that cannot be explained is one nobody will trust.
+        assert "job-watchdog" in dict((key_of(r), w) for r, w in muted)["factory/cloudflared/controller"]
+        assert "lost its runtime" in [w for r, w in muted if r["reason"] == "Error"][0]
+
+        # THE REGRESSION THAT MATTERS HERE: the node event must not become a
+        # blanket mute. Each of these is a fault in its own right and must survive.
+        other_node = assess(pod("elsewhere-aaaaaaaaaa-bbbbb", restarts=9, reason="Error",
+                                code=1, fin=DEPENDENT, node="k3d-factory-server-0"), now, 5, 6)
+        # 2 minutes BEFORE the node event -- inside the window in absolute terms,
+        # so this is what proves the correlation is directional. Nothing that
+        # happens later can have caused it.
+        before = assess(pod("earlier-aaaaaaaaaa-bbbbb", restarts=9, reason="Error", code=1,
+                            fin="2026-08-07T11:42:00Z"), now, 5, 6)
+        still_down = assess(pod("stuck-aaaaaaaaaa-bbbbb", restarts=9, reason="Error", code=1,
+                                fin=DEPENDENT, waiting="CrashLoopBackOff"), now, 5, 6)
+        far = assess(pod("later-aaaaaaaaaa-bbbbb", restarts=9, reason="Error", code=1,
+                         fin="2026-08-07T11:55:00Z"), now, 5, 6)
+        survives, _ = collapse_node_event(lost + other_node + before + still_down + far)
+        assert len(survives) == 4, [key_of(r) for r in survives]
+        # The OOM loop keeps reporting: rule 1 skips the NODE-scoped reason only,
+        # not everything job-watchdog notifies, so "for the fortieth time" survives.
+        assert collapse_node_event(oom)[0] == oom
 
         # Workload key survives a reschedule (new pod hash) AND a redeploy (new RS
         # hash), or every restart of a rolling Deployment opens a brand new issue.
