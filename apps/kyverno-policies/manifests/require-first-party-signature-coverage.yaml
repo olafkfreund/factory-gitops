@@ -249,7 +249,7 @@ spec:
             jmesPath: >-
               request.object.spec.[containers, initContainers, ephemeralContainers][].image
               | [?regex_match('^ghcr\.io/olafkfreund/', @)]
-              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|odin:|skillai:|skillai-migrator:|tfactory-runner-)', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|odin:|skillai:|skillai-migrator:|tfactory-runner-|fides-server:|fides-k8s-reporter:)', @)]
             # A Pod with no containers matching cannot produce a null here.
             default: []
       preconditions:

@@ -143,3 +143,22 @@ kind: Pod
 metadata: {name: covered-image-wrong-namespace, namespace: default}
 spec:
   containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:sha-6b116ee"}]
+---
+# fides#395. The `fides` namespace also runs third-party Postgres, which is not
+# ours to sign. verify-fides-signature names only the two first-party globs, so
+# this must stay unexamined -- a rule broadened to the namespace rather than the
+# images would demand a signature nobody can produce and deny the database.
+apiVersion: v1
+kind: Pod
+metadata: {name: thirdparty-in-fides-namespace, namespace: fides}
+spec:
+  containers: [{name: c, image: "postgres:15-alpine"}]
+---
+# The mirror of covered-image-wrong-namespace, for the one rule here that is
+# NOT scoped to `factory`: a first-party fides image outside the two fides
+# namespaces must not drag a Rekor round trip in front of an unrelated Pod.
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-image-wrong-namespace, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/fides-server:d02b1fde5017a1c0e6ffebb6e74ef63e463fc510"}]

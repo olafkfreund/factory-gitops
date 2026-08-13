@@ -593,3 +593,45 @@ spec:
                     # rejected outright and ArgoCD cannot apply the file.
                     rekor:
                       url: "https://rekor.sigstore.dev"
+    # Fides (fides#395). The ONLY rule here that matches namespaces other than
+    # `factory`: fides runs in its own `fides` / `fides-reporter` namespaces.
+    #
+    # Both images are published by a single workflow, publish-ghcr.yml, so the
+    # subject is one path and not an alternation. Signing landed in fides#393;
+    # everything built before 2026-08-12 is UNSIGNED, so this rule could not be
+    # added until the cluster actually ran a signed image. It does now
+    # (fides-server d02b1fd, fides-k8s-reporter :latest, both cosign-verified).
+    #
+    # If you ever roll fides back to a pre-2026-08-12 image, this rule DENIES it
+    # at admission -- the policy is Enforce and there is no per-rule override.
+    # ./PANIC.sh 1 returns the whole policy to Audit.
+    - name: verify-fides-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [fides, fides-reporter]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/olafkfreund/fides-server:*"
+            - "ghcr.io/olafkfreund/fides-k8s-reporter:*"
+          # Deliberately narrow: the `fides` namespace also runs
+          # postgres:15-alpine, which is third-party and not ours to sign. These
+          # two globs name only the first-party images.
+          verifyDigest: false
+          mutateDigest: false
+          required: true
+          # Kyverno's default, pinned so an upgrade cannot silently change the
+          # freshness of the evidence. See the useCache note in the header.
+          useCache: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/olafkfreund/fides/\\.github/workflows/publish-ghcr\\.yml@refs/heads/main$"
+                    # Same Kyverno v1.18 requirement as the rules above: a
+                    # keyless attestor with neither `rekor` nor `roots` is
+                    # rejected outright and ArgoCD cannot apply the file.
+                    rekor:
+                      url: "https://rekor.sigstore.dev"

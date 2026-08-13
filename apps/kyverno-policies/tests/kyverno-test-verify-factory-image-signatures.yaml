@@ -164,6 +164,8 @@ results:
       - other-registry-same-name
       - thirdparty-out-of-scope
       - covered-image-wrong-namespace
+      - thirdparty-in-fides-namespace
+      - fides-image-wrong-namespace
   - policy: verify-factory-image-signatures
     rule: verify-pfactory-signature
     kind: Pod
@@ -196,6 +198,18 @@ results:
   # quietly asserting nothing about it.
   - policy: verify-factory-image-signatures
     rule: verify-odin-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match
+  # fides#395. Same reason as the odin entry above: this names
+  # `verify-fides-signature` so gate check 1 ties it to the loaded-rule
+  # inventory. It is also the only rule here scoped outside `factory`, so the
+  # two fides resources in the anchor above are what prove that scope is the
+  # two fides namespaces and the two first-party globs -- not the namespace
+  # alone (which would deny Postgres) and not the image alone (which would
+  # reach into `factory`).
+  - policy: verify-factory-image-signatures
+    rule: verify-fides-signature
     kind: Pod
     result: skip
     resources: *no-rule-may-match
