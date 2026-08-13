@@ -51,7 +51,7 @@ jobs:
     name: the fleet pins the same agent CLIs, and they install + launch
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Self-test the pin checker
         # A gate whose own comparison logic is untested is how #90 happened.

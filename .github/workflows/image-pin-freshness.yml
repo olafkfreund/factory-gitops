@@ -96,7 +96,7 @@ jobs:
     name: every digest pin is still the current bytes for its tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Self-test the comparator before trusting it
         # First, not last, for the same reason every other watchdog in this
