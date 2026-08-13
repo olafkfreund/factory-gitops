@@ -64,6 +64,14 @@ spec:
           args:
             - --provider=keycloak-oidc
             - --oidc-issuer-url=https://keycloak.freundcloud.org.uk/realms/factory
+            # Discovery against the public issuer hairpins out through
+            # cloudflared and back, so a cold start 502s and oauth2-proxy
+            # exits(1) with no retry. Same change and same reasoning as
+            # apps/odin-auth/ — see the comment there.
+            - --skip-oidc-discovery=true
+            - --login-url=https://keycloak.freundcloud.org.uk/realms/factory/protocol/openid-connect/auth
+            - --redeem-url=http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/token
+            - --oidc-jwks-url=http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/certs
             - --redirect-url=https://observe.freundcloud.org.uk/oauth2/callback
             - --upstream=http://observe.factory.svc.cluster.local:5080
             - --http-address=0.0.0.0:4180

@@ -62,8 +62,18 @@ data:
         provider: oidc
         clientID: cfactory
         clientSecretFile: /etc/oauth2-proxy/secrets/client-secret
+        # Browser-facing, so it stays public. The backchannel calls below go
+        # to the Service — see oidcConfig.skipDiscovery.
+        loginURL: https://keycloak.freundcloud.org.uk/realms/factory/protocol/openid-connect/auth
+        redeemURL: http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/token
         oidcConfig:
           issuerURL: https://keycloak.freundcloud.org.uk/realms/factory
+          # Discovery against the public issuer hairpins out through cloudflared
+          # and back to reach a Keycloak in this same namespace; on a cold start
+          # it 502s and oauth2-proxy exits(1) with no retry. Same change and
+          # same reasoning as apps/odin-auth/ — see the comment there.
+          skipDiscovery: true
+          jwksURL: http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/certs
           audienceClaims: [aud]
           # editor OIDC layer: accept factory-vscode JWT bearers (was --oidc-extra-audience)
           extraAudiences: [factory-vscode]
