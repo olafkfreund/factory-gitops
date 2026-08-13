@@ -57,6 +57,25 @@ spec:
           args:
             - --provider=keycloak-oidc
             - --oidc-issuer-url=https://keycloak.freundcloud.org.uk/realms/factory
+            # oauth2-proxy's FIRST action is OIDC discovery against the issuer
+            # URL, and it exits(1) if that fails — no retry. Against the public
+            # URL that discovery hairpins out through cloudflared -> Cloudflare
+            # -> back into this cluster to reach a Keycloak sitting in this very
+            # namespace. On any cold start (reboot, nightly nixos-upgrade on
+            # p510) that path is not up yet, discovery gets a 502, and the pod
+            # crash-loops until it converges: 20 restarts in 7 days.
+            #
+            # Skip discovery and supply the endpoints directly. They are exactly
+            # the values the discovery document advertises, with the two
+            # BACKCHANNEL calls (token redemption, JWKS) pointed at the Service
+            # instead of the internet. login-url stays public because the
+            # BROWSER is redirected there, and issuer stays public so the `iss`
+            # claim still validates — Keycloak advertises the public issuer even
+            # when queried in-cluster, so nothing about token validation moves.
+            - --skip-oidc-discovery=true
+            - --login-url=https://keycloak.freundcloud.org.uk/realms/factory/protocol/openid-connect/auth
+            - --redeem-url=http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/token
+            - --oidc-jwks-url=http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/certs
             - --redirect-url=https://odin.freundcloud.org.uk/oauth2/callback
             - --upstream=http://odin-dashboard.factory.svc.cluster.local:8000
             - --http-address=0.0.0.0:4180
