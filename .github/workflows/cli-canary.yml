@@ -57,7 +57,7 @@ jobs:
         # A gate whose own comparison logic is untested is how #90 happened.
         run: python3 .github/scripts/test_check_cli_pins.py
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
 
