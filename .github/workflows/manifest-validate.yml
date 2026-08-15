@@ -122,6 +122,7 @@ jobs:
               .github/dependabot.yml) return 0 ;;   # Dependabot config, not Kubernetes
               .github/codeql/*)    return 0 ;;   # CodeQL config, not Kubernetes
               mkdocs.yml)          return 0 ;;   # MkDocs site config
+              .pre-commit-config.yaml) return 0 ;;   # pre-commit hook config, not Kubernetes
               *)                   return 1 ;;
             esac
           }
