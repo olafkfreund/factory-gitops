@@ -128,7 +128,8 @@ def discover(api_prefix, kind_re):
     for f in files:
         if not f:
             continue
-        head = open(f, encoding="utf-8", errors="replace").read()
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            head = fh.read()
         if not re.search(rf'^apiVersion:[ \t]*"?{api_prefix}', head, re.M):
             continue
         if not re.search(kind_re, head, re.M):

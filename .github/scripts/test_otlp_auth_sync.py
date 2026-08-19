@@ -11,7 +11,6 @@ Run after extract_embedded_script.py has lifted sync.py out of the ConfigMap.
 """
 import base64
 import importlib.util
-import json
 import sys
 import urllib.error
 

@@ -45,7 +45,6 @@ def run(days_left, refresh_token="rt-fake", grant_ok=False):
 
     m.k8s = fake_k8s
     m.urllib.request.urlopen = fake_urlopen
-    real_record = m.record
     def cap(outcome, detail, exp=None):
         recorded["outcome"] = outcome
     m.record = cap
