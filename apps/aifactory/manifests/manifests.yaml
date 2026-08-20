@@ -629,13 +629,26 @@ spec:
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
             # string like "openai-compatible:qwen3-coder:480b" routes here.
-            - { name: OPENAI_COMPATIBLE_BASE_URL, value: "http://host.k3d.internal:11434" }
+            # Pointed at Ollama CLOUD, not the p510 daemon. Loading a large
+            # model locally took the host down twice on 2026-08-20 (a 17.7GB
+            # qwen3.8:27b run), and the cloud endpoint is OpenAI-compatible so
+            # the same `openai-compatible:<model>` strings route there unchanged
+            # -- no provider change (TFactory#306). It DOES require a real API
+            # key, unlike the local daemon.
+            #
+            # Free tier reaches 7 of the 19 models it lists: gpt-oss:120b,
+            # gpt-oss:20b, gemma4:31b, minimax-m3, nemotron-3-nano:30b,
+            # nemotron-3-super, nemotron-3-ultra. The rest (qwen3.5:397b,
+            # kimi-k2.7-code, kimi-k3, deepseek-v4-*, glm-5.*,
+            # mistral-large-3:675b, minimax-m2.7) answer HTTP 403. Probe with a
+            # real completion before pinning one -- listing is not access.
+            - { name: OPENAI_COMPATIBLE_BASE_URL, value: "https://ollama.com" }
             - { name: OPENAI_COMPATIBLE_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_COMPATIBLE_API_KEY } } }
             # Local reasoning models (Ollama gemma4/gpt-oss) spend the response
             # budget on hidden thinking; bound it + reserve an output budget so
             # structured/tool turns actually emit (else finish=length, empty).
             - { name: OPENAI_COMPATIBLE_REASONING_EFFORT, value: "low" }
-            - { name: OPENAI_COMPATIBLE_MAX_TOKENS, value: "4096" }
+            - { name: OPENAI_COMPATIBLE_MAX_TOKENS, value: "32768" }
             # TFactory handoff (#496) — opt-in auto-handover of finished tasks
             # for testing. send_handoff is a no-op without this base URL.
             - { name: TFACTORY_BASE_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }

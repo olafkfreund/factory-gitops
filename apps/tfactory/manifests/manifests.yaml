@@ -677,13 +677,26 @@ spec:
             # contract — same config AIFactory uses. Without the base URL the
             # provider defaults to api.openai.com and the planner session fails
             # fast (missing/None → planner_failed) for an Ollama-routed verify.
-            - { name: OPENAI_COMPATIBLE_BASE_URL, value: "http://host.k3d.internal:11434" }
+            # Pointed at Ollama CLOUD, not the p510 daemon. Loading a large
+            # model locally took the host down twice on 2026-08-20 (a 17.7GB
+            # qwen3.8:27b run), and the cloud endpoint is OpenAI-compatible so
+            # the same `openai-compatible:<model>` strings route there unchanged
+            # -- no provider change (TFactory#306). It DOES require a real API
+            # key, unlike the local daemon.
+            #
+            # Free tier reaches 7 of the 19 models it lists: gpt-oss:120b,
+            # gpt-oss:20b, gemma4:31b, minimax-m3, nemotron-3-nano:30b,
+            # nemotron-3-super, nemotron-3-ultra. The rest (qwen3.5:397b,
+            # kimi-k2.7-code, kimi-k3, deepseek-v4-*, glm-5.*,
+            # mistral-large-3:675b, minimax-m2.7) answer HTTP 403. Probe with a
+            # real completion before pinning one -- listing is not access.
+            - { name: OPENAI_COMPATIBLE_BASE_URL, value: "https://ollama.com" }
             - { name: OPENAI_COMPATIBLE_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_COMPATIBLE_API_KEY } } }
             # Bound local-model thinking + reserve output budget (verify Planner
             # else returns finish=length empty on big prompts). Forwarded to the
             # verify Job by verify_dispatch._SDK_PASSTHROUGH_ENV.
             - { name: OPENAI_COMPATIBLE_REASONING_EFFORT, value: "low" }
-            - { name: OPENAI_COMPATIBLE_MAX_TOKENS, value: "4096" }
+            - { name: OPENAI_COMPATIBLE_MAX_TOKENS, value: "32768" }
             - { name: CONTEXT7_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CONTEXT7_KEY } } }
             - { name: LANGCHAIN_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: LANGCHAIN_API_KEY } } }
             - { name: RAPIDAPI_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: RAPIDAPI_KEY } } }
