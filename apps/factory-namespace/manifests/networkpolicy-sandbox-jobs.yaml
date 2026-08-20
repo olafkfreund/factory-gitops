@@ -195,8 +195,18 @@ spec:
     - to:
         - ipBlock:
             cidr: 10.43.0.1/32   # `kubernetes` Service ClusterIP (pre-DNAT)
+        # The server node's own address, post-DNAT. It MOVES: .2 on the
+        # p620 cluster, .4 on the p510 one it replaced, and it will move
+        # again on the next rebuild -- Docker hands out bridge addresses in
+        # start order. Both are listed rather than tracking whichever is
+        # current, because getting it wrong wedges every verify run and the
+        # only symptom is the netpol-gate refusing to start, which looks
+        # identical to no enforcement at all (Factory#871).
+        # Re-derive with: kubectl get endpoints kubernetes -n default
         - ipBlock:
-            cidr: 172.18.0.4/32  # k3d-factory-server-0, the real endpoint (post-DNAT)
+            cidr: 172.18.0.2/32  # k3d server node (p620)
+        - ipBlock:
+            cidr: 172.18.0.4/32  # k3d server node (p510, kept for rollback)
       ports:
         - protocol: TCP
           port: 6443
