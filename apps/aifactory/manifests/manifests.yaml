@@ -315,6 +315,20 @@ spec:
             - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+            # git cannot see gh's credential on its own, so `git push` to the https
+            # origin has no username to send and dies non-interactively with
+            # "could not read Username for 'https://github.com'". That surfaced as
+            # an HTTP 409 on /worktree/create-pr AFTER a fully successful build --
+            # every subtask green, branch never left the pod.
+            #
+            # Delivered as env rather than git config because the pod filesystem is
+            # read-only at runtime, so `git config --global` cannot be applied live.
+            # AIFactory#1373 bakes the same helper into the image; these three may
+            # be dropped once that ships. No secret here -- the helper shells out
+            # to gh, which reads its own token from GITHUB_TOKEN above.
+            - { name: GIT_CONFIG_COUNT, value: "1" }
+            - { name: GIT_CONFIG_KEY_0, value: "credential.https://github.com.helper" }
+            - { name: GIT_CONFIG_VALUE_0, value: "!gh auth git-credential" }
             # Static API token for programmatic/MCP access (alongside OIDC SSO).
             - { name: APP_API_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
             # Federated cross-portal search (#149): read-scoped cockpit key so this
