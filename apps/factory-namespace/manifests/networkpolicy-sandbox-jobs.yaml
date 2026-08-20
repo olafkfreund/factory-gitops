@@ -196,7 +196,7 @@ spec:
         - ipBlock:
             cidr: 10.43.0.1/32   # `kubernetes` Service ClusterIP (pre-DNAT)
         - ipBlock:
-            cidr: 172.18.0.2/32  # k3d-factory-server-0, the real endpoint (post-DNAT)
+            cidr: 172.18.0.4/32  # k3d-factory-server-0, the real endpoint (post-DNAT)
       ports:
         - protocol: TCP
           port: 6443

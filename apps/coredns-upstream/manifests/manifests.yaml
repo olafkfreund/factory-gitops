@@ -117,8 +117,12 @@ data:
     # (which runs as another user here):
     #
     #   $ kubectl --context factory get nodes -o wide
-    #   k3d-factory-server-0   172.18.0.2
-    #   k3d-agent-0-0          172.18.0.3     -> subnet 172.18.0.0/16, host .1
+    #   k3d-agent-0-0          172.18.0.3
+    #   k3d-factory-server-0   172.18.0.4     -> subnet 172.18.0.0/16, host .1
+    #
+    # (Those two addresses moved once already: the server was .2 before the
+    # rebuild. Read them from the cluster rather than copying them from here --
+    # only the subnet and the .1 gateway convention are stable.)
     #
     # Confirm before committing it, rather than trusting the convention:
     #   $ kubectl --context factory -n factory run ollama-probe --rm -it \
