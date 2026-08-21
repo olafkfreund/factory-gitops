@@ -159,7 +159,11 @@ spec:
           readinessProbe: { httpGet: { path: /healthz, port: 5080 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /healthz, port: 5080 }, initialDelaySeconds: 30, periodSeconds: 20 }
           # Modest for a k3d box, per design note.
-          resources: { requests: { cpu: 100m, memory: 256Mi }, limits: { memory: 1Gi } }
+          # 2Gi, not 1Gi: OpenObserve sits at ~571Mi idle holding ~3.6GB of
+          # stream data, so a search spike cleared the old cap and the kernel
+          # OOM-killed it (2026-08-21, memory.oom.group took the whole pod).
+          # Request raised to match the real floor rather than a quarter of it.
+          resources: { requests: { cpu: 100m, memory: 512Mi }, limits: { memory: 2Gi } }
       volumes: [{ name: data, persistentVolumeClaim: { claimName: observe-data } }]
 ---
 ################################################################################
