@@ -56,6 +56,20 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Runs BEFORE the extraction it guards, so a broken extractor fails here
+      # with four named assertions rather than downstream as an empty scan.
+      #
+      # This test existed since Factory#711 and had never once run: no workflow
+      # invoked it, and it had no `__main__` driver, so the repo's own
+      # convention (`python3 .github/scripts/test_X.py`) would have imported it,
+      # defined four functions and exited 0 having executed nothing. A pass
+      # indistinguishable from four passing tests, guarding the one property
+      # that decides whether CodeQL scans real code or an empty directory
+      # (Factory#844).
+      - name: The extractor's own tests
+        if: matrix.language == 'python'
+        run: python3 .github/scripts/test_extract_all_embedded.py
+
       # Must run BEFORE init, so the extracted files exist when CodeQL builds
       # its database. The script exits 1 if it extracts nothing at all -- an
       # empty directory would scan clean and mean nothing.
