@@ -152,6 +152,19 @@
 # VALIDATE ANY EDIT AGAINST THE LIVE WEBHOOK BEFORE MERGING:
 #   kubectl --context factory apply --dry-run=server -f <this file>
 #   kyverno test apps/kyverno-policies/tests/kyverno-test-gate-task-pods-on-network-policy.yaml
+#
+# THE SECOND COMMAND SEGFAULTS ON AN UNMODIFIED COPY OF THIS FILE, and the
+# crash says nothing about why. The Kyverno CLI v1.18.2 nil-derefs on
+# `spec.webhookConfiguration.matchConditions` (kyverno/kyverno#15833, still
+# open), so CI strips that field from its checked-out copy before running the
+# CLI -- see manifest-validate.yml, "Work around a Kyverno CLI segfault". Do
+# the same locally or the suite is unrunnable:
+#   cp -r . /tmp/kyv && yq -i 'del(.spec.webhookConfiguration.matchConditions)' \
+#     /tmp/kyv/apps/kyverno-policies/manifests/gate-task-pods-on-network-policy.yaml
+#   cd /tmp/kyv/apps/kyverno-policies/tests && kyverno test . -f kyverno-test-gate-task-pods-on-network-policy.yaml
+# That crash is why Factory#919 sat unfixed: it reads as "I cannot validate
+# this", and shipping an unvalidated admission policy was the wrong trade. It
+# is a workaround, not a blocker.
 # AND READ BACK WHAT KYVERNO ACTUALLY GENERATED -- this file is a request, not
 # the webhook. Kyverno v1.18.2 renders it as its own per-policy "finegrained"
 # entry, which is why the scope holds; a future version that folded it back
@@ -413,6 +426,33 @@ spec:
                   done
                   # Fail closed. A build that never starts beats a build that
                   # starts unconfined.
+                  #
+                  # SAY WHICH LEG LOST (Factory#919). Giving up has two causes
+                  # with opposite fixes -- "nothing is enforced" is a CNI/datapath
+                  # problem, "the kube-api allow rule no longer matches this
+                  # cluster" is one line of egress rule 4 -- and until this block
+                  # existed both printed the same sentence. That cost a full
+                  # cluster-wide investigation and a wrong issue: Factory#871
+                  # concluded enforcement was dead fleet-wide when enforcement was
+                  # fine and the server node address had simply moved. Closed as
+                  # invalid.
+                  #
+                  # The helpers are re-run once, on the same two destinations the
+                  # loop already probes. No new probing, and the verdict is exit 1
+                  # whichever branch wins -- this reports, it does not decide.
+                  #
+                  # The both-blocked case is reported as UNKNOWN rather than as
+                  # the stale-rule case it usually is. From inside the pod it is
+                  # genuinely indistinguishable from "this pod has no network at
+                  # all", and a confident wrong answer here is what Factory#871
+                  # already cost once.
+                  if allowed; then
+                    echo "netpol-gate: kube-api reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
+                  elif denied; then
+                    echo "netpol-gate: UNKNOWN -- neither kube-api nor kubelet is reachable. Either the policy IS enforced and its kube-api allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default" >&2
+                  else
+                    echo "netpol-gate: kubelet reachable but kube-api is NOT -- the deny leg is open, so nothing is enforced, and the allow destination 10.43.0.1:443 is down as well. Fix API reachability first; this gate cannot pass while it is unreachable." >&2
+                  fi
                   echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
                   exit 1
               securityContext:
