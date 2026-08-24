@@ -54,7 +54,7 @@ spec:
         # is outside the scope Factory#573 pinned. Resolved live against the
         # running pod's imageID on 2026-08-08, so this pin is a rename of what
         # was already pulled, not a new image.
-        image: postgres:15-alpine@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+        image: postgres:15-alpine@sha256:fe0737ba566a2c5b2a28f34433c0a423261900ec17b9bf7ad115e1aae7e57f1b
         env:
         - name: POSTGRES_DB
           value: fides
@@ -126,7 +126,7 @@ spec:
         # later: legible-and-frozen beats illegible-and-drifting, but only
         # while the freeze is visible. olafkfreund/fides#389 tracks the missing
         # deploy leg; until it lands the bump is this line, by hand.
-        image: ghcr.io/olafkfreund/fides-server:d9b2d8072274afaa75f6ce15df948f54ec8fd717
+        image: ghcr.io/olafkfreund/fides-server:8aa5a8ab623d37a724b17025d88ffbef777e3f64
         # Still Always: an immutable tag makes this a no-op on a warm node, and
         # it is the correct policy for the day somebody force-pushes a tag.
         imagePullPolicy: Always

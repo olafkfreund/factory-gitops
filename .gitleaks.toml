@@ -1,0 +1,10 @@
+title = "gitleaks config for factory-gitops"
+
+[extend]
+useDefault = true
+
+[allowlist]
+  description = "Kyverno policy test fixtures use a fixed placeholder value, never a real credential"
+  paths = [
+    '''apps/kyverno-policies/tests/.*\.yaml''',
+  ]

@@ -17,6 +17,15 @@ paths:
   # cover the helpers only and report clean over everything that matters.
   - .github/scripts
   - _codeql_extracted
+  # The manifests tree, for the code that is checked in rather than embedded.
+  # This list enumerated CI directories and stopped, so
+  # `apps/kyverno-policies/assert-*.py` -- two admission-policy assertions that
+  # run in-cluster -- were outside every entry above. Ten of the repo's twelve
+  # python files were scanned and the result was published as a repo-wide
+  # clean, which is the exact reading Factory#711 was filed about. `apps`
+  # rather than the one directory, so the next checked-in script is covered by
+  # default instead of by remembering to come back here.
+  - apps
   # `paths` applies to EVERY language in the matrix, not just python. Omitting
   # this left the `actions` pack with no workflows to read, and CodeQL failed
   # the job with "could not process any code written in GitHub Actions" rather

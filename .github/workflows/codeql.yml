@@ -36,6 +36,7 @@ jobs:
   analyze:
     name: analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write
@@ -48,12 +49,26 @@ jobs:
       matrix:
         language: [python, actions]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+
+      # Runs BEFORE the extraction it guards, so a broken extractor fails here
+      # with four named assertions rather than downstream as an empty scan.
+      #
+      # This test existed since Factory#711 and had never once run: no workflow
+      # invoked it, and it had no `__main__` driver, so the repo's own
+      # convention (`python3 .github/scripts/test_X.py`) would have imported it,
+      # defined four functions and exited 0 having executed nothing. A pass
+      # indistinguishable from four passing tests, guarding the one property
+      # that decides whether CodeQL scans real code or an empty directory
+      # (Factory#844).
+      - name: The extractor's own tests
+        if: matrix.language == 'python'
+        run: python3 .github/scripts/test_extract_all_embedded.py
 
       # Must run BEFORE init, so the extracted files exist when CodeQL builds
       # its database. The script exits 1 if it extracts nothing at all -- an
@@ -67,12 +82,12 @@ jobs:
           ls -1 _codeql_extracted/
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           languages: ${{ matrix.language }}
           config-file: ./.github/codeql/codeql-config.yml
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           category: "/language:${{ matrix.language }}"

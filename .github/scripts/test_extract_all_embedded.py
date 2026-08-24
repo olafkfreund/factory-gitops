@@ -70,3 +70,26 @@ def test_extracting_nothing_is_a_failure_not_a_pass(tmp_path: pathlib.Path) -> N
     )
     assert out.returncode == 1, f"expected exit 1, got {out.returncode}: {out.stdout}"
     assert "refusing" in out.stderr
+
+
+if __name__ == "__main__":
+    # Every other test here is invoked as `python3 .github/scripts/test_X.py`
+    # from a workflow. This file had no driver, so running it that way imported
+    # the module, defined four functions and exited 0 having executed nothing --
+    # a pass indistinguishable from four passing tests. It was also wired into no
+    # workflow at all, so nobody found out. Both halves are Factory#844's shape,
+    # on the one test guarding whether CodeQL has anything to scan.
+    #
+    # The tests take pytest's `tmp_path`, so the driver supplies a real one
+    # rather than the bare `test()` call the sibling files use.
+    import tempfile
+
+    tests = [v for n, v in sorted(globals().items()) if n.startswith("test_")]
+    if not tests:
+        print("no tests found -- this run examined ZERO items", file=sys.stderr)
+        sys.exit(2)
+    for test in tests:
+        with tempfile.TemporaryDirectory() as td:
+            test(pathlib.Path(td))
+        print("ok   %s" % test.__name__)
+    print("\n%d passed" % len(tests))

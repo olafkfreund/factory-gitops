@@ -27,6 +27,24 @@ spec:
           value: http://fides-server.fides.svc.cluster.local:8080
         - name: fides.environmentId
           value: 88d2eeb1-5bc4-4e05-89b0-8b4f09fbb703
+        # Report ONLY the fides namespace.
+        #
+        # Unscoped, this snapshotted all 78 pods in the cluster — argocd,
+        # gitlab, keycloak, minio, kyverno — and every third-party image
+        # counted as an unregistered "shadow change". The environment reported
+        # compliant:false on 1529 consecutive runs and could never report
+        # anything else, which is as useless as one that is always green.
+        #
+        # Those images are not ours and never get Fides provenance, and the
+        # allowlist is keyed by DIGEST, so allowlisting them would break on
+        # every upstream image update. Scoping to what this org actually
+        # builds and governs is the maintainable line.
+        #
+        # permissionScope stays "cluster": the chart's "namespace" scope makes
+        # a Role in the RELEASE namespace (fides-reporter), which is not where
+        # these workloads run. The ClusterRole reads, the CLI filters.
+        - name: fides.namespace
+          value: fides
         - name: cronSchedule
           value: "*/10 * * * *"
   destination:

@@ -39,8 +39,6 @@ data:
         service: http://argocd-server.argocd.svc.cluster.local:80
       - hostname: skillai.freundcloud.org.uk
         service: http://skillai-app.factory.svc.cluster.local:3000
-      - hostname: rolehunter.freundcloud.org.uk
-        service: http://rolehunter-app.factory.svc.cluster.local:3000
       # Odin sits behind oauth2-proxy (Keycloak SSO). The proxy lives in the
       # factory ns alongside Odin; see apps/odin-auth/ for the deployment.
       # Keycloak realm: factory, client: odin-dashboard.

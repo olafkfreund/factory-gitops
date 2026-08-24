@@ -78,6 +78,24 @@ spec:
             - { name: CFACTORY_TFACTORY_API_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }
             - { name: CFACTORY_SUBSCRIBE_UPSTREAMS, value: "true" }
             - { name: CFACTORY_LIVE_PROGRESS, value: "true" }
+            # CFactory#334 / #251 part b. Without this, `oidc_actor()` returns
+            # None on every request and the audit trail can never name a human:
+            # measured 5,960 rows, 0 of them `user:<email>`. The IdP already
+            # fronts the cockpit (oauth2-proxy-cfactory-alpha), and the ID token
+            # already reaches the backend -- oauth2-proxy injects it as
+            # `Authorization: Bearer <id_token>` and the frontend's nginx copies
+            # that to `X-Forwarded-Id-Token`, which is the header the backend
+            # reads. This value was the only missing hop.
+            #
+            # oidcAudience deliberately left unset: that accepts any token this
+            # issuer signed, which is right for a single-realm deployment.
+            #
+            # Fail-safe by construction: `oidc_actor` returns None on ANY failure
+            # (unreachable JWKS, bad signature, wrong issuer) and falls back to
+            # the key-derived actor, so a wrong value here degrades to today's
+            # behaviour rather than locking anyone out. That is also why it is
+            # NOT self-verifying -- see the PR for the post-merge check.
+            - { name: CFACTORY_OIDC_ISSUER, value: "https://keycloak.freundcloud.org.uk/realms/factory" }
             # RFC-0019 Phase 3: the AIFactory project a planning card is built
             # into when it is promoted to `ready`. AIFactory's
             # /api/tasks/from-issue needs a project_id and a card carries none

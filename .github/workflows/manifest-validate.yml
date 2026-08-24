@@ -34,8 +34,9 @@ jobs:
   validate:
     name: kustomize build + schema
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install kustomize, kubeconform, yq and the Kyverno CLI
         run: |
@@ -122,6 +123,7 @@ jobs:
               .github/dependabot.yml) return 0 ;;   # Dependabot config, not Kubernetes
               .github/codeql/*)    return 0 ;;   # CodeQL config, not Kubernetes
               mkdocs.yml)          return 0 ;;   # MkDocs site config
+              .pre-commit-config.yaml) return 0 ;;   # pre-commit hook config, not Kubernetes
               *)                   return 1 ;;
             esac
           }
@@ -1015,6 +1017,13 @@ jobs:
       # Re-check the panic when the cluster moves off v1.18.2, and drop this
       # step then rather than carrying it forever.
       #
+      # RE-MEASURED AGAIN 2026-08-19 (#175): also panics on v1.19.0-rc.4, the
+      # newest release as of this check -- same trace, `validate.go:138` (the
+      # line number shifted by one; the nil-deref is the same bug). No stable
+      # v1.19.0 has shipped yet, only release candidates. Filed upstream as
+      # kyverno/kyverno#15833 (opened against v1.17.1, still open, still
+      # unfixed two minors later) -- that is the issue to watch, not a new one.
+      #
       # THE STRIP-TOOK-EFFECT ASSERTION BELOW IS MUTATION-CHECKED, #175. With
       # the `yq -i del(...)` line removed and nothing else changed:
       #
@@ -1029,10 +1038,12 @@ jobs:
       # has been applied to the cluster and its generated webhook read back.
       #
       # NOT FIXED BY BUMPING THE CLI. The pin above is to v1.18.2 to MATCH the
-      # admission controller, which is the entire point of those steps; the only
-      # newer release is a v1.19.0-rc.1 pre-release. Trading "agrees with the
-      # webhook that will judge this for real" for "does not crash" is the wrong
-      # trade, and it would be a silent downgrade of both gates.
+      # admission controller, which is the entire point of those steps, and no
+      # newer release fixes the panic anyway (re-measured against v1.19.0-rc.4,
+      # #175) -- there is no version to trade up to. Bumping would also be
+      # trading "agrees with the webhook that will judge this for real" for
+      # "does not crash", which is the wrong trade even if a fix existed: it
+      # would be a silent downgrade of both gates.
       #
       # WHAT COVERAGE THIS COSTS, STATED PLAINLY: nothing the CLI could measure.
       # The CLI models rule evaluation against a resource; it does not generate
@@ -1560,8 +1571,9 @@ jobs:
   secrets:
     name: no literal secrets in manifests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Scan manifests for credentials committed as literal values
         run: |
