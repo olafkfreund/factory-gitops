@@ -1,6 +1,16 @@
-# Legacy RWO data PVC — kept for rollback only; the live data volume is now
-# tfactory-data-rwx (below). local-path RWO pinned this to one node, so a roll
-# onto the other node couldn't mount it and workspace specs were lost (#781).
+# THE LIVE data PVC again as of 2026-08-24 — the rollback this comment was
+# written for. The NFS export backing tfactory-data-rwx cannot serve git:
+# `git init` on the mount fails `Invalid path ...: Remote I/O error` while plain
+# mkdir/write/read on the same mount succeed, and the same git command works on
+# the pod's ephemeral disk, so it is the export and not git, the image or
+# permissions. Every verify stage failed `source_checkout_failed` because the
+# clone could not create `.git/objects/pack`.
+#
+# The #781 hazard this was migrated away from -- local-path RWO pinning the
+# volume to one node, so a cross-node roll stranded specs -- does not apply
+# today: the cluster is a single node running a single tfactory replica. If a
+# second node returns, this has to move back to RWX, which means fixing the NFS
+# export first rather than re-pointing at it.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: { name: tfactory-data, namespace: factory, labels: { app: tfactory } }
@@ -9,7 +19,10 @@ spec:
   storageClassName: local-path
   resources: { requests: { storage: 5Gi } }
 ---
-# Live workspace data on RWX NFS (#781) — any node's control-plane pod OR verify
+# PARKED 2026-08-24: kept so the data survives and so re-pointing here is one
+# line once the export is fixed. Was the live volume until its NFS backing
+# stopped serving git (see above).
+# Workspace data on RWX NFS (#781) — any node's control-plane pod OR verify
 # Job can mount it, so a cross-node roll no longer strands specs. Migrated from
 # tfactory-data 2026-07-23 (spec state copied; git clones re-materialize via the
 # #539 self-heal). Provisioned by apps/nfs-provisioner.
@@ -485,7 +498,7 @@ spec:
             # that does not travel reads False and re-mounts the PVC (verify_dispatch
             # propagates it; that half-applied shape is how AIFactory#840 broke its
             # gate lane). Do not reintroduce the PVC without RWX storage.
-            - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data-rwx" }
+            - { name: TFACTORY_WORKSPACES_PVC, value: "tfactory-data" }
             # #603 gap 2: names the SA the deploy Job runs as for kubectl
             # --dry-run=server (VAL-2). Set => the kubectl rung runs; unset =>
             # honest not_run. RBAC = the tfactory-deploy-dryrun SA/Role above.
@@ -745,7 +758,7 @@ spec:
           livenessProbe:  { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 30, periodSeconds: 20 }
           resources: { requests: { cpu: 100m, memory: 384Mi }, limits: { memory: 2Gi } }
       volumes:
-        - { name: data,      persistentVolumeClaim: { claimName: tfactory-data-rwx } }
+        - { name: data,      persistentVolumeClaim: { claimName: tfactory-data } }
         - { name: cc-claude, emptyDir: {} }
         - { name: cc-codex,  emptyDir: {} }
         - { name: cc-gemini, emptyDir: {} }
