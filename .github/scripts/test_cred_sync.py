@@ -86,7 +86,18 @@ def run(seed_text, dest_text):
 CASES = (
     ("unreadable dest, valid seed", creds(VALID), BROKEN, False, "unreadable"),
     ("unreadable dest, expired seed", creds(EXPIRED), BROKEN, False, "already past"),
-    ("dest expiresAt:0, valid seed", creds(VALID), creds(0), False, "sanity bound"),
+    # Deliberately flipped from refuse to adopt. When #168 wrote this, 0 was
+    # ambiguous: exp() manufactured it on read failure, so refusing was the only
+    # safe call. exp() now returns None for unreadable/unparseable/absent-key, so
+    # a literal 0 can only come from a real `expiresAt: 0` -- a CLEARED token.
+    # Refusing there wedges the pod forever: cred-sync will not repair a dead
+    # credential from a valid seed, and every run dies at the planner with
+    # "No OAuth token found" (observed 2026-08-27, TFactory spec 191).
+    ("dest expiresAt:0, valid seed", creds(VALID), creds(0), True, "adopting seed"),
+    # The bound itself still holds for a dest carrying a REAL timestamp, which is
+    # the case Factory#628 was about.
+    ("implausible seed, live dest", creds(NOW + 200 * 86400000), creds(VALID), False,
+     "sanity bound"),
     ("expired seed, valid dest", creds(EXPIRED), creds(VALID), False, "refusing to adopt"),
     ("unreadable seed, valid dest", BROKEN, creds(VALID), False, "seed unreadable"),
     ("older seed, fresher dest", creds(OLDER), creds(VALID), False, ""),
