@@ -481,7 +481,7 @@ spec:
             # answer. nix-runner-image.yml rewrites both lines on every publish
             # and FAILS if either is absent, rather than sed-ing a silent no-op
             # (the #719 failure mode). Do not hand-edit.
-            - { name: TFACTORY_VAL3_K8S_JOB_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:sha-51ad322@sha256:738aaa318ef92463edcc6469b524c1bff7b415d447da9141c62b207737b4d272" }
+            - { name: TFACTORY_VAL3_K8S_JOB_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:sha-c827deb@sha256:b0de76a69b9ad13123bf874c900a1449f7c96c7e747bf8818676110ffa87f097" }
             # RFC-0005 Tier A / RFC-0016 #469: the Nix-lane k8s-Job sandbox
             # co-mounts the worktree from this PVC and runs the per-task flake in
             # the thin Nix image. nixjob is now the DEFAULT verify execution path
@@ -503,7 +503,7 @@ spec:
             # --dry-run=server (VAL-2). Set => the kubectl rung runs; unset =>
             # honest not_run. RBAC = the tfactory-deploy-dryrun SA/Role above.
             - { name: TFACTORY_DEPLOY_DRYRUN_SA, value: "tfactory-deploy-dryrun" }
-            - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:sha-51ad322@sha256:738aaa318ef92463edcc6469b524c1bff7b415d447da9141c62b207737b4d272" }
+            - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:sha-c827deb@sha256:b0de76a69b9ad13123bf874c900a1449f7c96c7e747bf8818676110ffa87f097" }
             - { name: TFACTORY_NIX_IN_IMAGE, value: "true" }
             # TFACTORY_IMAGE pins the TFactory backend image the verify Job runs
             # on (the image that now ships the `agents` package on PYTHONPATH —
