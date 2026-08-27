@@ -323,7 +323,17 @@ spec:
                       return False, f"seed expires {ts(seed)}, already past (now {ts(now)}), refusing to adopt"
                   if dest is None and dest_exists:
                       return False, "dest exists but is unreadable, refusing to overwrite it"
-                  if dest is not None and seed - dest > MAX_SKEW_MS:
+                  # `dest > 0`: a literal 0 expiry is a CLEARED credential, not a read
+                  # failure. exp() returns None for unreadable/unparseable/absent-key --
+                  # that was the whole of Factory#628 -- so 0 can now only come from a
+                  # real `expiresAt: 0` in valid JSON, which is what the Claude SDK
+                  # leaves behind when it clears an access token.
+                  #
+                  # Without this the bound wedges the pod permanently: dest reads 0, the
+                  # delta is ~56 years, cred-sync refuses forever, and every run dies at
+                  # the planner with "No OAuth token found" while a valid seed sits in
+                  # the Secret (observed 2026-08-27, TFactory spec 191).
+                  if dest is not None and dest > 0 and seed - dest > MAX_SKEW_MS:
                       return False, (f"seed expires {ts(seed)}, dest expires {ts(dest)}, delta "
                                      f"{(seed - dest) / 3600000:.1f}h exceeds the sanity bound, refusing")
                   if dest is not None and seed <= dest:
