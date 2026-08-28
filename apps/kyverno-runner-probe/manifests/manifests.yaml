@@ -335,6 +335,7 @@ data:
     ghcr.io/olafkfreund/factory-runner-cypress:latest
     ghcr.io/olafkfreund/factory-runner-playwright:latest
     ghcr.io/olafkfreund/factory-runner-cloud:latest
+    ghcr.io/olafkfreund/factory-runner-nix:latest
     ghcr.io/olafkfreund/odin:sha-2749b26
     """
 
