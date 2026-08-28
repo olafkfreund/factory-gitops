@@ -6,4 +6,4 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/tfactory
   newName: ghcr.io/olafkfreund/tfactory
-  newTag: sha-bcdc339
+  newTag: sha-3f2f9f6
