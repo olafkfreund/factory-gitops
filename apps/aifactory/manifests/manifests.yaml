@@ -390,7 +390,7 @@ spec:
             # RWO claims stranding on different nodes is what deadlocked the gate.
             - { name: AIFACTORY_SANDBOX_GATES, value: "true" }
             - { name: AIFACTORY_SANDBOX_BACKEND, value: "nixjob" }
-            - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-nix:latest" }
+            - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/factory-runner-nix:latest" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
             # ── RFC-0011 label-driven intake poller (#636) — the issue->build
             # handover. INERT until an issue carries a `factory:*` label: the loop
