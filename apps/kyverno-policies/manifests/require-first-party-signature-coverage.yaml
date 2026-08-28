@@ -241,7 +241,8 @@ spec:
         # `ghcr.io/olafkfreund/tfactory:*` does not match a digest reference
         # `ghcr.io/olafkfreund/tfactory@sha256:...`, so a digest-pinned
         # first-party image is genuinely uncovered today and this rule reports
-        # it. `tfactory-runner-` has no `:` because the glob it mirrors has
+        # it. `tfactory-runner-` and `factory-runner-` have no `:` because the
+# globs they mirror have
         # none either -- and that same missing `:` is why `cfactory:*` does NOT
         # match `cfactory-frontend:*` and both must be listed over there.
         - name: uncovered
@@ -249,7 +250,7 @@ spec:
             jmesPath: >-
               request.object.spec.[containers, initContainers, ephemeralContainers][].image
               | [?regex_match('^ghcr\.io/olafkfreund/', @)]
-              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|odin:|skillai:|skillai-migrator:|tfactory-runner-|fides-server:|fides-k8s-reporter:)', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|odin:|skillai:|skillai-migrator:|tfactory-runner-|factory-runner-|fides-server:|fides-k8s-reporter:)', @)]
             # A Pod with no containers matching cannot produce a null here.
             default: []
       preconditions:

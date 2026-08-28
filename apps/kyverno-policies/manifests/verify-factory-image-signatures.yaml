@@ -475,6 +475,55 @@ spec:
                     # rejected outright and ArgoCD cannot apply the file.
                     rekor:
                       url: "https://rekor.sigstore.dev"
+    # The same six lanes, built once in olafkfreund/factory-runners instead of
+    # separately in TFactory and PFactory. The rule above stays until every
+    # consumer has moved: both image sets exist during the switch-over and an
+    # image nothing names is DENIED by require-first-party-signature-coverage,
+    # so removing it early would take the running lanes down.
+    #
+    # THE NAME IS NOT A PREFIX OF THE OLD ONE, WHICH IS THE WHOLE POINT OF A
+    # SEPARATE RULE. `tfactory-runner-*` does not match `factory-runner-vitest`
+    # -- the leading `t` stops it -- so these images arrived matched by no rule
+    # at all: not a `fail`, nothing. That is the exact failure #181 was written
+    # about, reached from the other direction (a new image rather than a
+    # narrowed glob), and it is why the mirror in the coverage policy and the
+    # probe's image list are edited in this same commit.
+    #
+    # ORDER MATTERS AND WAS FOLLOWED, as for skillai below. All six images were
+    # built, signed and published first (factory-runners run 33153418542), then
+    # the signature was confirmed against the LIVE registry with the anchored
+    # identity below, and the legacy `.sig` tag location was confirmed with
+    # .github/scripts/assert-signature-location.sh, before this rule was
+    # written.
+    #
+    # ANONYMOUS READABILITY WAS CHECKED SEPARATELY AND IS NOT IMPLIED BY THAT
+    # VERIFICATION. A local `cosign verify` passes on a PRIVATE package because
+    # the operator is logged in; Kyverno is not. All six packages were 403 to an
+    # anonymous manifest fetch when first published and were made public before
+    # this rule landed -- the same defect that made tfactory-runner-nix and
+    # tfactory-runner-portal-ui report `fail` for weeks. Check visibility with
+    # an UNAUTHENTICATED fetch, never with the cosign that just signed it.
+    - name: verify-factory-runner-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [factory]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/olafkfreund/factory-runner-*"
+          verifyDigest: false
+          mutateDigest: false
+          required: true
+          useCache: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/olafkfreund/factory-runners/\\.github/workflows/runner-images\\.yml@refs/heads/main$"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
     # Factory#564 (2026-08-05). `skillai` ran in this namespace matched by no
     # rule at all, so it produced no result -- and it was simultaneously the
     # known-UNSIGNED control used in the #522 deny experiment. It is now signed
