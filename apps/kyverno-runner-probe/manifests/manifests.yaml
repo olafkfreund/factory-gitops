@@ -329,6 +329,12 @@ data:
     ghcr.io/olafkfreund/tfactory-runner-cloud:latest
     ghcr.io/olafkfreund/tfactory-runner-nix:latest
     ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-bbd4400
+    ghcr.io/olafkfreund/factory-runner-pytest:latest
+    ghcr.io/olafkfreund/factory-runner-jest:latest
+    ghcr.io/olafkfreund/factory-runner-vitest:latest
+    ghcr.io/olafkfreund/factory-runner-cypress:latest
+    ghcr.io/olafkfreund/factory-runner-playwright:latest
+    ghcr.io/olafkfreund/factory-runner-cloud:latest
     ghcr.io/olafkfreund/odin:sha-2749b26
     """
 
