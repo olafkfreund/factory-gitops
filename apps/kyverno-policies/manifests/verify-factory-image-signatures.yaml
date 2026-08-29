@@ -382,12 +382,16 @@ spec:
     # images, which is the worse half: those are the sandbox in which generated
     # code is built and executed.
     #
-    #   AIFACTORY_SANDBOX_IMAGE       tfactory-runner-nix
-    #   TFACTORY_VAL3_K8S_JOB_IMAGE   tfactory-runner-nix
-    #   TFACTORY_NIX_RUNNER_IMAGE     tfactory-runner-nix
+    #   AIFACTORY_SANDBOX_IMAGE       factory-runner-nix
+    #   TFACTORY_VAL3_K8S_JOB_IMAGE   factory-runner-nix
+    #   TFACTORY_NIX_RUNNER_IMAGE     factory-runner-nix
     #   PORTAL_UI_IMAGE               tfactory-runner-portal-ui
     #   lane dispatch                 tfactory-runner-{pytest,jest,playwright,
     #                                 vitest,cypress,java,selenium,cucumber,cloud}
+    #
+    # The nix lane's image was renamed in the factory-runners cutover, so the
+    # three nix vars above are now covered by verify-factory-runner-signature
+    # below, NOT by the `tfactory-runner-*` rule this block otherwise describes.
     #
     # TFactory#947/#949 (phase 1) added cosign signing to all three publishing
     # workflows. One rule covers all eleven: unlike `cfactory` /

@@ -270,13 +270,13 @@ data:
          "workflow": "portal-ui-runner-image.yml",
          "image": "ghcr.io/olafkfreund/tfactory-runner-portal-ui",
          "pinned_by": ["tfactory", "PORTAL_UI_IMAGE"]},
-        {"lane": "nix-verify", "repo": "olafkfreund/TFactory",
-         "workflow": "nix-runner-image.yml",
-         "image": "ghcr.io/olafkfreund/tfactory-runner-nix",
+        {"lane": "nix-verify", "repo": "olafkfreund/factory-runners",
+         "workflow": "runner-images.yml",
+         "image": "ghcr.io/olafkfreund/factory-runner-nix",
          "pinned_by": ["tfactory", "TFACTORY_NIX_RUNNER_IMAGE"]},
-        {"lane": "nix-val3", "repo": "olafkfreund/TFactory",
-         "workflow": "nix-runner-image.yml",
-         "image": "ghcr.io/olafkfreund/tfactory-runner-nix",
+        {"lane": "nix-val3", "repo": "olafkfreund/factory-runners",
+         "workflow": "runner-images.yml",
+         "image": "ghcr.io/olafkfreund/factory-runner-nix",
          "pinned_by": ["tfactory", "TFACTORY_VAL3_K8S_JOB_IMAGE"]},
     ]
 
@@ -1061,7 +1061,7 @@ data:
                 assess(t, head, head_age, runs, deps, change, now, tol, crit))
 
         # Job runner lanes (#89). One repo_state call per DISTINCT workflow, not
-        # per lane: the two nix entries share nix-runner-image.yml, and asking
+        # per lane: the two nix entries share runner-images.yml, and asking
         # GitHub the same question twice on every run is a rate limit spent for
         # nothing.
         seen: dict[tuple, list | None] = {}
