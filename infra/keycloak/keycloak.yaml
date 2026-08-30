@@ -74,6 +74,14 @@ spec:
             - { name: KC_HTTP_ENABLED, value: "true" }
             - { name: KC_PROXY_HEADERS, value: "xforwarded" }
             - { name: KC_HOSTNAME_STRICT, value: "false" }
+            # Cap the heap against the cgroup. Without this the JVM was killed
+            # repeatedly (OOMKilled, exit 137, 18 kills in one boot on p620):
+            # nothing bounded it, so heap grew toward the limit and the non-heap
+            # cost -- metaspace, code cache, direct buffers, GC overhead, and the
+            # `start-dev` Quarkus augmentation below -- pushed the container past
+            # the cgroup ceiling. 65% leaves that headroom rather than raising
+            # the limit and moving the wall.
+            - { name: JAVA_OPTS_APPEND, value: "-XX:MaxRAMPercentage=65 -XX:InitialRAMPercentage=40" }
           ports: [{ containerPort: 8080 }]
           volumeMounts: [{ name: data, mountPath: /opt/keycloak/data }]
           # startupProbe gates liveness/readiness during the slow Quarkus
@@ -84,6 +92,10 @@ spec:
           startupProbe:   { httpGet: { path: /realms/master, port: 8080 }, periodSeconds: 10, failureThreshold: 60, timeoutSeconds: 3 }
           readinessProbe: { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 25, periodSeconds: 10, failureThreshold: 30 }
           livenessProbe:  { httpGet: { path: /realms/master, port: 8080 }, initialDelaySeconds: 90, periodSeconds: 30 }
-          resources: { requests: { cpu: 250m, memory: 1Gi }, limits: { memory: 2560Mi } }
+          # 4Gi, not 2560Mi: the startup augmentation is the peak, and 65% of
+          # 2560Mi left the heap too small to finish it under load. requests
+          # raised to match the real steady-state floor so the scheduler stops
+          # treating this as a 1Gi pod.
+          resources: { requests: { cpu: 250m, memory: 1536Mi }, limits: { memory: 4Gi } }
       volumes:
         - { name: data, persistentVolumeClaim: { claimName: keycloak-data } }
