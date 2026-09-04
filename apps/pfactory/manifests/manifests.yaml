@@ -345,6 +345,15 @@ spec:
             # Persist plan sessions to the PVC (mounted at ~/.pfactory) so they
             # survive pod restarts/redeploys (the store was in-memory only).
             - { name: PFACTORY_PLAN_PERSIST, value: "1" }
+            # Docs emit (PFactory#700): on approval, render the plan doc plus a
+            # <slug>.run.json run signature and write them under the same PVC
+            # (~/.pfactory/plan-docs), so an approved plan leaves a durable,
+            # attributable artefact instead of living only in the session store.
+            # Default is OFF in code; the whole stage is best-effort and cannot
+            # fail an emit. Writing to a git repo additionally needs
+            # PFACTORY_DOCS_GIT_WRITE + a Backstage target, which is NOT enabled
+            # here — this turns on the local repo/directory target only.
+            - { name: PFACTORY_DOCS_EMIT, value: "1" }
             # Execution model for the per-task build (carried into the signed
             # contract's phase_models). Claude, not gemini: the gemini-cli QA
             # subprocess repeatedly hit its 300s timeout and escalated builds to
