@@ -652,9 +652,6 @@ spec:
             # matrix (tests/test_smoke.py::u1, VAL-1, passed). #481 CLI-creds seed
             # (below) adds file-auth provider parity. TFactory #466.
             - { name: TFACTORY_VERIFY_EXEC, value: "kubejob" }
-            # TFactory#1160 (PR A, #1299): pack the verify workspace to MinIO instead
-            # of co-mounting the RWO PVC. Enabled for the step-3 observation only.
-            - { name: TFACTORY_PACK_WORKSPACE, value: "true" }
             # #481: file-auth CLI creds for the dispatched verify Job — seeds the
             # factory-cli-creds secret into the Job pod via the seed-creds
             # initContainer (verify_dispatch._inject_verify_seed_creds). INERT
