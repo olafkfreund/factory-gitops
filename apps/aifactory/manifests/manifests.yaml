@@ -443,7 +443,9 @@ spec:
             # AIFACTORY_MERGER_SWEEP_DRY_RUN=false. In-process for the reaper's
             # reason: the spec tree is on a ReadWriteOnce PVC.
             - { name: AIFACTORY_MERGER_SWEEP, value: "true" }
-            - { name: AIFACTORY_MERGER_SWEEP_DRY_RUN, value: "true" }
+            # Writes enabled 2026-09-18 after the first report-only tick matched
+            # the expected table for all 19 tasks, on the owner's go-ahead.
+            - { name: AIFACTORY_MERGER_SWEEP_DRY_RUN, value: "false" }
             - { name: AIFACTORY_INTAKE_INTERVAL_S, value: "30" }
             - { name: AIFACTORY_URL, value: "http://localhost:3101" }
             # The poller calls its OWN /api/tasks/from-issue and authenticates
