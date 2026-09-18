@@ -435,6 +435,15 @@ spec:
             # reads an empty directory, reports zero orphans and exits 0.
             - { name: AIFACTORY_STALE_REAPER, value: "true" }
             - { name: REAPER_DRY_RUN, value: "true" }
+            # Factory#2586: the merger backstop sweep. The primary trigger is the
+            # build-end call; this catches failed builds with real work and
+            # anything that finished before 3.6.82. Enabling the loop and
+            # enabling writes are two decisions: report-only first, compare one
+            # tick's report against the expected table, and only then set
+            # AIFACTORY_MERGER_SWEEP_DRY_RUN=false. In-process for the reaper's
+            # reason: the spec tree is on a ReadWriteOnce PVC.
+            - { name: AIFACTORY_MERGER_SWEEP, value: "true" }
+            - { name: AIFACTORY_MERGER_SWEEP_DRY_RUN, value: "true" }
             - { name: AIFACTORY_INTAKE_INTERVAL_S, value: "30" }
             - { name: AIFACTORY_URL, value: "http://localhost:3101" }
             # The poller calls its OWN /api/tasks/from-issue and authenticates
