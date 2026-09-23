@@ -14,7 +14,9 @@ spec:
   scaleTargetRef:
     name: pfactory
   minReplicaCount: 1
-  maxReplicaCount: 4
+  # Pinned to 1 (PFactory#755): plan sessions are still cached per process, so
+  # >1 replica splits writes across pods. Raise only once #755 is fixed.
+  maxReplicaCount: 1
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
