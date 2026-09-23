@@ -81,6 +81,10 @@ metadata:
   namespace: factory
   labels: { app: nfs-provisioner }
 spec:
+  # Pinned: the nfs StorageClass writes this address into each PV's
+  # immutable nfs.server, so a random IP on a recreated cluster would strand
+  # every restored nfs PV (nixos_config#1497). Must stay the live value.
+  clusterIP: 10.43.224.175
   selector: { app: nfs-provisioner }
   ports:
     - { name: nfs, port: 2049 }
