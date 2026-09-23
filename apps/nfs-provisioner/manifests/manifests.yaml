@@ -83,7 +83,9 @@ metadata:
 spec:
   # Pinned: the nfs StorageClass writes this address into each PV's
   # immutable nfs.server, so a random IP on a recreated cluster would strand
-  # every restored nfs PV (nixos_config#1497). Must stay the live value.
+  # every restored nfs PV. See "Keeping it: PV snapshot + pre-bound restore"
+  # in nixos_config spec/2026-09-23-1497-k3d-node-resolv-conf.md. Must stay
+  # the live value.
   clusterIP: 10.43.224.175
   selector: { app: nfs-provisioner }
   ports:
