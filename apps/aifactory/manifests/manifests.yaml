@@ -299,6 +299,31 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3101" }
+            # Global admission cap on concurrently RUNNING builds (AIFactory#1425).
+            # Unset, the code default is 5 (apps/web-server/server/config.py); this
+            # is the first time it is pinned here.
+            #
+            # 12, derived not guessed. Disk is the binding resource, not CPU or
+            # memory: this node allocates 128 CPU and 251 GiB at ~4% requested,
+            # while a build Job takes cpu=2/mem=4Gi. The node advertises 933.7 GB
+            # of allocatable ephemeral-storage and really has ~185 GB free, because
+            # its filesystem is the host root.
+            #
+            #   usable = 179 - 49.1 (evictionHard nodefs.available 5%)
+            #                - 30   (2x the observed +/-15 GB host churn)   = 99.9 GB
+            #   cap    = 99.9 / 4.29 GB (the 4Gi per-Job limit)             = 23
+            #
+            # Halved to 12: in-build /work growth is the one term nobody measured.
+            # Raise toward 23 once it is.
+            #
+            # ORDERING: this REQUIRED the ephemeral-storage limit from AIFactory
+            # #1425 to be deployed first — raising the cap while the scheduler
+            # cannot see the resource that binds is precisely the failure the
+            # issue exists to prevent. Satisfied: v3.7.0 (sha-8d460de) is live and
+            # its build_job_manifest emits
+            # limits={cpu: 2, memory: 4Gi, ephemeral-storage: 4Gi}, verified in
+            # the running pod before this landed.
+            - { name: APP_MAX_CONCURRENT_TASKS, value: "12" }
             # RFC-0016 #220/#673: durable shared state in Postgres (aifactory DB).
             # Replaces pod-local SQLite (~/.aifactory/data.db); init_db() runs
             # `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY default true),
