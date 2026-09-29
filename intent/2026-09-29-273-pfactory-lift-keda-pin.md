@@ -62,6 +62,35 @@ While the pin stays:
 - Verification must check each pod separately (`port-forward pod/<name>`),
   not only through the Service.
 
+## Blocked (2026-09-29, owner decision)
+
+Before the spec, an audit of per-process state in PFactory found that the
+shared session store fixes only part of #755's class of bug. With 2 replicas
+these would still be wrong in production:
+
+- olafkfreund/PFactory#804: WebSocket, log and progress events reach only
+  clients on the emitting pod.
+- olafkfreund/PFactory#805: running-task registries (agent runs, insights,
+  changelog, PR review) are per pod, so status, stop and the duplicate-run
+  guard break.
+- olafkfreund/PFactory#806: the audit hash chain forks under concurrent
+  writers (no FOR UPDATE on the head).
+- olafkfreund/PFactory#807: email OAuth connect state and the GitHub device
+  flow are held in memory.
+- olafkfreund/PFactory#808: ingested-but-never-processed sessions sit in
+  `queued` forever and inflate the KEDA metric.
+- Related, already open: olafkfreund/PFactory#795 (the post-migration store
+  attach has one retry).
+
+The following are already fine in production (the gitops manifest differs
+from the chart): `~/.pfactory` is on the PVC, `APP_API_TOKEN` comes from the
+Secret, the OIDC session cookie is signed with the shared secret, and MCP
+remote SSE is off.
+
+The owner chose to pause: `maxReplicaCount` stays 1, and the spec is written
+once #804-#807 have shipped. #808 should ship first, or the stale rows be
+cleaned. The approved answers to the open questions below still stand.
+
 ## Open questions
 
 Resolved 2026-09-29 (approved): 1 = 2 first, then 4 after a week without anomalies; 2 = yes, set PFACTORY_REQUIRE_SHARED_STORE=1; 3 = (a) a temporary minReplicaCount: 2, as its own commit and revert.
