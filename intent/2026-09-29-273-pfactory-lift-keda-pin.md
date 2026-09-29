@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 273
 author: Olaf Krasicki-Freund
 ---
@@ -63,6 +63,8 @@ While the pin stays:
   not only through the Service.
 
 ## Open questions
+
+Resolved 2026-09-29 (approved): 1 = 2 first, then 4 after a week without anomalies; 2 = yes, set PFACTORY_REQUIRE_SHARED_STORE=1; 3 = (a) a temporary minReplicaCount: 2, as its own commit and revert.
 
 1. **Ceiling:** go back to `maxReplicaCount: 4` (the pre-#268 value), or step
    up to 2 first? **Recommended: 2 first, then 4** after a week without
