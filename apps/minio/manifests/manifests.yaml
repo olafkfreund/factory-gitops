@@ -89,7 +89,7 @@ spec:
           # return 401), so the pinned quay digest stopped pulling once a k3d
           # recreate wiped the node cache (nixos_config Issue #2156). Chainguard
           # builds the same server; pinned by digest (its free tier is :latest only).
-          image: cgr.dev/chainguard/minio@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034
+          image: cgr.dev/chainguard/minio:latest@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034
           # readOnlyRootFilesystem is MEASURED. This exact digest
           # (RELEASE.2026-09-22T19-25-18Z) run read-only as uid 1000 with
           # --cap-drop ALL and no-new-privileges against a copy of the
