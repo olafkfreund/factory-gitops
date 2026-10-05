@@ -85,9 +85,16 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
-          # readOnlyRootFilesystem is MEASURED. This exact tag run read-only as
-          # uid 1000 with --cap-drop ALL and no-new-privileges, /data writable:
+          # MinIO withdrew its public community images (quay.io and Docker Hub
+          # return 401), so the pinned quay digest stopped pulling once a k3d
+          # recreate wiped the node cache (nixos_config Issue #2156). Chainguard
+          # builds the same server; pinned by digest (its free tier is :latest only).
+          image: cgr.dev/chainguard/minio:latest@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034
+          # readOnlyRootFilesystem is MEASURED. This exact digest
+          # (RELEASE.2026-09-22T19-25-18Z) run read-only as uid 1000 with
+          # --cap-drop ALL and no-new-privileges against a copy of the
+          # 2025-04-08 data, /data writable; it also read and decrypted an
+          # existing SSE-S3 object, so the KMS key carries over:
           #   API: http://.../ WebUI: http://...
           #   GET /minio/health/live  -> 200
           #   GET /minio/health/ready -> 200
@@ -187,7 +194,8 @@ spec:
       enableServiceLinks: false
       containers:
         - name: mc
-          image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z@sha256:69fb6e6ca209008ae3cacf9f63c2524f68a1322dc921c8992ba2cc99c5bef3c6
+          # -dev variant: these scripts need /bin/sh (quay.io/minio/mc is gone, 401).
+          image: cgr.dev/chainguard/minio-client:latest-dev@sha256:b056b795d31828015aea061e3168267b0ba80590ba2d8f869e72ff77153a68e8
           command: ["/bin/sh", "-c"]
           args:
             - |
