@@ -669,7 +669,7 @@ spec:
             # short-SHA here (sha-205d6f19-nix) 404s — the pushed tag is 7-char.
             # Corrected to the actual published tag. Validated live: pulls + runs
             # nix 2.30.1 (121 /nix/store entries) on a 2nd k3d node, no nix PVC.
-            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-8d460de-nix" }
+            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-8bf890c-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
             # RFC-0014 operator runtime allowlist (AIFactory#1607). Naming a
