@@ -672,6 +672,13 @@ data:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+    def event_time(record: dict) -> datetime | None:
+        victims = record.get("victims")
+        if victims and all(v.get("finished_at") for v in victims):
+            return max(_parse_ts(v["finished_at"]) for v in victims)
+        return None
+
+
     def _dur(seconds: float) -> str:
         """Human duration. Hours-with-one-decimal alone renders short windows as
         the useless '0.1h old (> 0.1h tolerance)' — an alert a reader learns
@@ -1619,7 +1626,7 @@ data:
 
     def notify_action(record: dict, issue: dict | None, now: datetime,
                       renotify_hours: float) -> str | None:
-        """Pure. (health record, its open issue or None) -> what to do about it.
+        """Pure. (health record, its issue or None) -> what to do about it.
 
         None means STAY SILENT, and most calls return None by design. Both halves
         of this matter equally:
@@ -1635,6 +1642,14 @@ data:
         that are actually wrong rather than a graveyard nobody trusts.
         """
         sev = severity_of(record)
+        if issue and issue.get("state") == "closed":
+            ev = event_time(record)
+            if ev is None:
+                issue = None
+            else:
+                closed_at = issue.get("closed_at")
+                return ("reopen" if sev is not None and closed_at
+                        and ev > _parse_ts(closed_at) else None)
         if sev is None:
             return "close" if issue else None
         if issue is None:
@@ -1871,16 +1886,19 @@ data:
                     raise
 
 
-    def open_watchdog_issues(token: str, repo: str) -> dict:
-        """marker -> issue, for every open issue this watchdog raised."""
+    def watchdog_issues(token: str, repo: str) -> dict:
+        """marker -> issue, for this watchdog's recent open and closed issues."""
+        # shortcut: only the 100 most recently updated issues are read; an older closed issue just means a new issue, as before
         issues = gh(token, "GET",
-                    f"/repos/{repo}/issues?state=open&labels={ISSUE_LABEL}&per_page=100") or []
+                    f"/repos/{repo}/issues?state=all&sort=updated&labels={ISSUE_LABEL}&per_page=100") or []
         out = {}
         for i in issues:
             for line in (i.get("body") or "").splitlines():
                 line = line.strip()
                 if line.startswith("<!-- job-watchdog:"):
-                    out[line] = i
+                    if line not in out or (out[line].get("state") == "closed"
+                                           and i.get("state") != "closed"):
+                        out[line] = i
                     break
         return out
 
@@ -1889,7 +1907,9 @@ data:
                renotify_hours: float) -> int:
         """Route findings to a human. Returns the number of notifications sent."""
         ensure_labels(token, repo)
-        existing = open_watchdog_issues(token, repo)
+        existing = watchdog_issues(token, repo)
+        open_existing = {key: issue for key, issue in existing.items()
+                         if issue.get("state") != "closed"}
         sent = 0
         for r in records:
             key = MARKER.format(ns=r["namespace"], name=r["cronjob"])
@@ -1906,6 +1926,15 @@ data:
                     "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
                 })
                 eprint(f"NOTIFIED  {name} [{sev}] -> opened {repo}#{new['number']}")
+            elif action == "reopen":
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}", {
+                    "state": "open",
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
+                })
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": "Reopened: a new event after this was closed.\n\n"
+                            + issue_body(r, sev)})
+                eprint(f"NOTIFIED  {name} [{sev}] -> reopened {repo}#{issue['number']}")
             elif action == "escalate":
                 was = issue_severity(issue)
                 gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}", {
@@ -1923,6 +1952,8 @@ data:
                             + issue_body(r, sev)})
                 eprint(f"NOTIFIED  {name} [still {sev}] -> {repo}#{issue['number']}")
             elif action == "close":
+                if issue.get("state") == "closed":
+                    continue
                 # A subject can report healthy with NO "last success" at all — a
                 # reaped orphan, a Job that is simply no longer stuck. `_dur`
                 # raises on None, and it would raise in the middle of delivering
@@ -1953,7 +1984,7 @@ data:
         # comment first. The watchdog cannot tell a deliberate retirement from an
         # accidental deletion, so it says what it saw and lets a human judge.
         seen = {MARKER.format(ns=r["namespace"], name=r["cronjob"]) for r in records}
-        for key, issue in existing.items():
+        for key, issue in open_existing.items():
             if key in seen:
                 continue
             gone = key.split(":", 1)[1].rsplit(" ", 1)[0]
@@ -2372,6 +2403,10 @@ data:
         # Recovery closes the issue, so the open list stays things that are
         # actually broken rather than a graveyard everyone learns to scroll past.
         assert notify_action(healthy_rec, iss("critical", "2026-07-26T11:00:00Z"), now, 24) == "close"
+        closed_cron = {**iss("critical", "2026-07-26T11:00:00Z"),
+                       "state": "closed", "closed_at": "2026-07-26T11:30:00Z"}
+        assert notify_action(never, closed_cron, now, 24) == "open"
+        assert notify_action(healthy_rec, closed_cron, now, 24) is None
 
         # notify_action being right is not enough: a correct decision that the
         # caller ignores is still an issue filed every 30 minutes. A mutation
@@ -2423,8 +2458,13 @@ data:
                 "labels": [{"name": ISSUE_LABEL},
                            {"name": SEVERITY_LABELS["critical"]}],
             })
-            assert list(open_watchdog_issues("t", "o/r")) == [
+            stub_issues.insert(0, {**stub_issues[0], "number": 98,
+                                   "state": "closed", "closed_at": "2026-07-26T11:40:00Z"})
+            assert list(watchdog_issues("t", "o/r")) == [
                 MARKER.format(ns="factory", name="postgres-backup")]
+            assert watchdog_issues("t", "o/r")[MARKER.format(
+                ns="factory", name="postgres-backup")]["number"] == 99
+            stub_issues.pop(0)
             calls.clear()
             assert notify("t", "o/r", [never], now, 24) == 0, "must not duplicate"
             assert not writes(), writes()
@@ -2907,6 +2947,27 @@ data:
         assert "absence of recurrence" in kill_body
         assert issue_title(lost, "critical").startswith(
             "[critical] kill/node/k3d-agent-0-0/runtime_lost lost containers")
+        closed_kill = {"number": 10, "state": "closed",
+                       "closed_at": "2026-08-06T14:45:00Z",
+                       "body": kill_body, "labels": [{"name": ISSUE_LABEL}]}
+        assert notify_action(lost, closed_kill, incident, 24) is None
+        new_kill = {**lost, "victims": [*lost["victims"],
+                    {**lost["victims"][0], "finished_at": "2026-08-06T14:46:00Z"}]}
+        assert event_time(new_kill) > event_time(lost)
+        assert notify_action(new_kill, closed_kill, incident, 24) == "reopen"
+        calls.clear()
+        stub_issues[:] = [closed_kill]
+        globals()["gh"] = fake_gh
+        try:
+            assert notify("t", "o/r", [new_kill], incident, 24) == 1
+            assert writes() == [("PATCH", "/repos/o/r/issues/10"),
+                                ("POST", "/repos/o/r/issues/10/comments")], writes()
+            calls.clear()
+            assert notify("t", "o/r", [], incident, 24) == 0
+            assert not writes(), "closed issue must not be swept as an orphan"
+        finally:
+            globals()["gh"] = real_gh
+            stub_issues.clear()
         # Every code that can notify must have a title phrase, or issue_title
         # raises mid-incident and the notification is lost at the worst moment.
         for c in NOTIFY_CODES | {"terminations_unreadable"}:
