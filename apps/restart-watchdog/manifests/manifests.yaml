@@ -507,9 +507,12 @@ data:
 
     def watchdog_issues(token, repo):
         """marker -> issue, for every issue this watchdog raised (open wins)."""
-        # shortcut: only the 100 most recently updated issues are read; an older closed issue just means a new issue, as before
-        issues = gh(token, "GET",
-                    f"/repos/{repo}/issues?state=all&sort=updated&labels={ISSUE_LABEL}&per_page=100") or []
+        # Open issues are read exactly as before; closed ones in a second call, so they never crowd an open one out.
+        # shortcut: only the 100 most recently updated closed issues are read; an older one just means a new issue, as before
+        issues = (gh(token, "GET",
+                     f"/repos/{repo}/issues?state=open&labels={ISSUE_LABEL}&per_page=100") or []) + (
+                  gh(token, "GET",
+                     f"/repos/{repo}/issues?state=closed&sort=updated&labels={ISSUE_LABEL}&per_page=100") or [])
         out = {}
         for i in issues:
             for line in (i.get("body") or "").splitlines():

@@ -8,8 +8,11 @@ spec: spec/2026-10-14-280-watchdog-closed-refile.md
 
 ## Approved decisions (carried from the spec)
 
-- Each watchdog lists **all** its issues (`state=all&sort=updated&per_page=100`)
-  and maps marker → issue. An **open issue wins** over a closed one with the
+- Each watchdog lists its open issues exactly as before (`state=open`), then its
+  closed ones in a second call (`state=closed&sort=updated&per_page=100`), and
+  maps marker → issue. (Deviation from the original single `state=all` call,
+  made after the Opus review: closed issues took slots in the 100-issue window,
+  so a quiet open issue could fall out and get a duplicate.) An **open issue wins** over a closed one with the
   same marker. Among closed issues, the most recently updated wins.
 - A finding's **event time** decides what a closed issue means:
   - event time missing, or not after the issue's `closed_at` → **silent** (`None`);
@@ -110,3 +113,10 @@ Baseline (main, 2026-10-14): both self-tests print `selftest OK`.
 Revert the squash-merge commit on main. Argo CD syncs the old ConfigMaps, and
 the next CronJob run uses the old script. Any issue the new code reopened stays
 open, which is harmless; close it by hand.
+
+## Execution
+
+Step 1 by agy, step 2 by Codex. Step 3: the review found that the single
+`state=all` lookup let closed issues crowd an open one out of the 100-issue
+window. The session split it into an open call and a closed call in both files
+(see Approved decisions).
