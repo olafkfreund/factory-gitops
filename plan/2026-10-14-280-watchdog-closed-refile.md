@@ -56,8 +56,9 @@ Steps 1 and 2 touch different files and can run in parallel.
    → verify by:
    `python3 .github/scripts/extract_embedded_script.py apps/restart-watchdog/manifests/manifests.yaml watchdog.py /tmp/rw.py && python3 /tmp/rw.py selftest` → `selftest OK`.
    Traps: the script is YAML-embedded, so keep the ConfigMap's indentation
-   exact (4 spaces of YAML block indent before Python). `_parse_ts` raises on
-   `None` (`:237`), so guard before calling it. No new imports beyond the stdlib
+   exact (4 spaces of YAML block indent before Python). (Correction during implementation: this
+   file's `_parse_ts` (`:237`) returns `None` for empty input, so it needs no
+   guard. Only job-watchdog's `_parse_ts` raises.) No new imports beyond the stdlib
    ones already present.
 
 2. **job-watchdog** (`apps/job-watchdog/manifests/manifests.yaml`, embedded
