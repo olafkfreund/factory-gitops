@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 280
 spec: spec/2026-10-14-280-watchdog-closed-refile.md
 ---
