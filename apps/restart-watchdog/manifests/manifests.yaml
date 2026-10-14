@@ -310,6 +310,7 @@ data:
                 "restarts": restarts,
                 "reason": term.get("reason") or waiting.get("reason") or "unknown",
                 "exit_code": term.get("exitCode"),
+                "last_terminated_at": term.get("finishedAt"),
                 "last_terminated_age_seconds": since,
                 "container_lifetime_seconds": ran_for,
                 "pod_age_seconds": pod_age,
@@ -504,16 +505,22 @@ data:
                     raise
 
 
-    def open_issues(token, repo):
-        """marker -> issue, for every open issue this watchdog raised."""
-        issues = gh(token, "GET",
-                    f"/repos/{repo}/issues?state=open&labels={ISSUE_LABEL}&per_page=100") or []
+    def watchdog_issues(token, repo):
+        """marker -> issue, for every issue this watchdog raised (open wins)."""
+        # Open issues are read exactly as before; closed ones in a second call, so they never crowd an open one out.
+        # shortcut: only the 100 most recently updated closed issues are read; an older one just means a new issue, as before
+        issues = (gh(token, "GET",
+                     f"/repos/{repo}/issues?state=open&labels={ISSUE_LABEL}&per_page=100") or []) + (
+                  gh(token, "GET",
+                     f"/repos/{repo}/issues?state=closed&sort=updated&labels={ISSUE_LABEL}&per_page=100") or [])
         out = {}
         for i in issues:
             for line in (i.get("body") or "").splitlines():
                 line = line.strip()
                 if line.startswith("<!-- restart-watchdog:"):
-                    out[line] = i
+                    prev = out.get(line)
+                    if prev is None or (prev.get("state") == "closed" and i.get("state") != "closed"):
+                        out[line] = i
                     break
         return out
 
@@ -527,10 +534,14 @@ data:
 
 
     def notify_action(record, issue, now, renotify_hours):
-        """open | escalate | renotify | None. Pure, so the muting rules are testable."""
+        """open | reopen | escalate | renotify | None. Pure, so the muting rules are testable."""
         sev = severity_of(record)
         if issue is None:
             return "open"
+        if issue.get("state") == "closed":
+            event = _parse_ts(record.get("last_terminated_at"))
+            closed = _parse_ts(issue.get("closed_at"))
+            return "reopen" if (event and closed and event > closed) else None
         if issue_severity(issue) != sev:
             return "escalate"
         updated = _parse_ts(issue.get("updated_at"))
@@ -541,7 +552,7 @@ data:
 
     def notify(token, repo, records, live_keys, now, renotify_hours):
         ensure_labels(token, repo)
-        existing = open_issues(token, repo)
+        existing = watchdog_issues(token, repo)
         sent = 0
         for r in records:
             marker = MARKER.format(key=key_of(r))
@@ -556,6 +567,13 @@ data:
                     "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]],
                 })
                 eprint(f"NOTIFIED  {key_of(r)} [{sev}] -> opened {repo}#{new['number']}")
+            elif action == "reopen":
+                gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
+                   {"state": "open", "title": issue_title(r),
+                    "labels": [ISSUE_LABEL, SEVERITY_LABELS[sev]]})
+                gh(token, "POST", f"/repos/{repo}/issues/{issue['number']}/comments",
+                   {"body": "Reopened: a new event after this was closed.\n\n" + issue_body(r)})
+                eprint(f"NOTIFIED  {key_of(r)} [{sev}] -> reopened {repo}#{issue['number']}")
             elif action == "escalate":
                 was = issue_severity(issue)
                 gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
@@ -577,7 +595,7 @@ data:
         # it -- so the two never get the same wording.
         firing = {MARKER.format(key=key_of(r)) for r in records}
         for marker, issue in existing.items():
-            if marker in firing:
+            if issue.get("state") == "closed" or marker in firing:
                 continue
             key = marker.split(":", 1)[1].rsplit("-->", 1)[0].strip()
             if key in live_keys:
@@ -766,6 +784,46 @@ data:
         assert notify_action(rec, iss, now, 0.5) == "renotify"
         # A warning that becomes a crashloop escalates instead of staying quiet.
         assert notify_action(loop[0], iss, now, 24) == "escalate"
+
+        # Closed-issue handling (#280):
+        # (a) closed after the event (closed before no new event) -> None
+        closed_after = {"state": "closed", "closed_at": "2026-08-07T11:00:00Z",
+                        "labels": [{"name": SEVERITY_LABELS["warning"]}]}
+        assert notify_action(rec, closed_after, now, 24) is None
+        # (b) event after closed_at -> "reopen"
+        closed_before = {"state": "closed", "closed_at": "2026-08-07T10:00:00Z",
+                         "labels": [{"name": SEVERITY_LABELS["warning"]}]}
+        assert notify_action(rec, closed_before, now, 24) == "reopen"
+        # (c) closed issue but the record has no last_terminated_at -> None
+        no_term = dict(rec, last_terminated_at=None)
+        assert notify_action(no_term, closed_before, now, 24) is None
+        # (d) watchdog_issues prefers open over closed for the same marker
+        # (e) recovery loop does not touch a closed issue
+        orig_gh = globals()["gh"]
+        calls = []
+        fake_issues = [
+            {"number": 2, "state": "closed", "closed_at": "2026-08-07T11:30:00Z",
+             "body": marker, "labels": [{"name": SEVERITY_LABELS["warning"]}]},
+            {"number": 1, "state": "open", "updated_at": "2026-08-07T11:00:00Z",
+             "body": marker, "labels": [{"name": SEVERITY_LABELS["warning"]}]},
+            {"number": 3, "state": "closed", "closed_at": "2026-08-07T11:30:00Z",
+             "body": MARKER.format(key="kyverno/other/controller"),
+             "labels": [{"name": SEVERITY_LABELS["warning"]}]},
+        ]
+        try:
+            def stub_gh(_tok, method, path, body=None):
+                calls.append((method, path, body))
+                return fake_issues if method == "GET" else {"number": 99}
+            globals()["gh"] = stub_gh
+            found_issues = watchdog_issues("tok", "o/r")
+            assert found_issues[marker]["number"] == 1, found_issues
+            assert found_issues[MARKER.format(key="kyverno/other/controller")]["number"] == 3
+            calls.clear()
+            fake_issues[:] = [fake_issues[2]]  # only the closed issue #3 remains
+            notify("tok", "o/r", [], {"kyverno/other/controller"}, now, 24)
+            assert not [c for c in calls if c[0] == "PATCH"], calls
+        finally:
+            globals()["gh"] = orig_gh
 
         print("selftest OK")
         return 0
