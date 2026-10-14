@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 280
 author: olafkfreund
 ---
@@ -59,3 +59,12 @@ like two.
    issue (one thread per workload) or file a new one?
 3. Scope: fix restart-watchdog and job-watchdog only, or also check fleet-match
    and endpoint-guard in this task?
+
+## Decisions at approval
+
+1. The same event means the same termination `finishedAt` (or the same
+   node-kill time for job-watchdog), recorded in the issue body.
+2. When a new event follows a human close, the watchdog reopens the old issue,
+   so each workload keeps one thread.
+3. Scope: restart-watchdog and job-watchdog. A follow-up issue checks
+   fleet-match and endpoint-guard.
