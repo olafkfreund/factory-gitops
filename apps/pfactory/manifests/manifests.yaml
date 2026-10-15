@@ -422,7 +422,7 @@ spec:
           # so a slow reply means BUSY, not wedged. timeoutSeconds: 5 tolerates
           # that; liveness failureThreshold: 6 means a restart needs ~120s of
           # continuous unresponsiveness — genuinely wedged, not merely loaded.
-          readinessProbe: { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6 }
+          readinessProbe: { httpGet: { path: /api/ready, port: 3114 }, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 30, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6 }
           resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 8Gi } }
       volumes:
