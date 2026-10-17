@@ -336,6 +336,9 @@ spec:
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
+            # At-rest key for credentials in the JSON settings/profile stores (AIFactory#1799).
+            # Unset = plaintext with a warning; existing plaintext values are re-sealed on next save.
+            - { name: KMS_FERNET_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: KMS_FERNET_KEY } } }
             - { name: PATH, value: "/home/nonroot/.npm-global/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             # Factory#520. This is what makes readOnlyRootFilesystem possible at
             # all. The claude CLI writes ~/.claude.json at the HOME ROOT — a
