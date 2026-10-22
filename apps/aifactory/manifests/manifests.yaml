@@ -418,6 +418,7 @@ spec:
             # RWO claims stranding on different nodes is what deadlocked the gate.
             - { name: AIFACTORY_SANDBOX_GATES, value: "true" }
             - { name: AIFACTORY_SANDBOX_BACKEND, value: "nixjob" }
+            # AIFactory#1737: the gate-image-prepull DaemonSet copies this value (kustomization.yaml replacements); renaming this var breaks the build on purpose.
             - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/factory-runner-nix:sha-47900d1@sha256:e2e42c08f5fb8cc7b0d4e3a11efe9639f0b15f02668d80ae797d461b67746eb9" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
             # ── RFC-0011 label-driven intake poller (#636) — the issue->build
@@ -672,6 +673,7 @@ spec:
             # short-SHA here (sha-205d6f19-nix) 404s — the pushed tag is 7-char.
             # Corrected to the actual published tag. Validated live: pulls + runs
             # nix 2.30.1 (121 /nix/store entries) on a 2nd k3d node, no nix PVC.
+            # AIFactory#1737: the gate-image-prepull DaemonSet copies this value (kustomization.yaml replacements); renaming this var breaks the build on purpose.
             - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-6231576-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
@@ -818,3 +820,60 @@ subjects:
 # trimmed (Factory#253). It nightly `nix store gc`'d a warm store that nothing
 # writes to any more — garbage-collecting garbage. Per-Job /nix now comes from
 # the image and dies with the Job, so there is nothing to cap.
+---
+# AIFactory#1737. Keeps the gate image (AIFACTORY_SANDBOX_IMAGE) and the build
+# image (AIFACTORY_BUILD_IMAGE) pulled on every node. A gate Job's 600s
+# activeDeadlineSeconds also pays for its image pull, and a cold ~2.25 GB pull
+# of factory-runner-nix ate into it. Each initContainer only forces the pull;
+# the pause container keeps the pod alive so kubelet image GC treats both
+# images as in use.
+#
+# The two initContainer images are NOT written here: kustomization.yaml's
+# `replacements` copy them from the Deployment env values above, so a pin bump
+# there moves this DaemonSet too. Copying the strings would also be wrong, not
+# just duplicated: the `images:` transformer retags every
+# ghcr.io/olafkfreund/aifactory image field to newTag, so a literal
+# `aifactory:sha-...-nix` here would render without `-nix`. replacements run
+# after `images`, so the rendered refs are the env strings exactly.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: gate-image-prepull, namespace: factory, labels: { app: gate-image-prepull } }
+spec:
+  selector: { matchLabels: { app: gate-image-prepull } }
+  template:
+    metadata: { labels: { app: gate-image-prepull } }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets: [{ name: ghcr-pull }]
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        # Both images carry sh (AIFactory kube_sandbox / build_backend run `sh -c` in them).
+        - name: sandbox-image
+          image: set-by-kustomize-replacements
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "true"]
+          securityContext: &prepull-sc
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources: &prepull-res
+            requests: { cpu: 1m, memory: 4Mi }
+            limits: { cpu: 10m, memory: 16Mi }
+        - name: build-image
+          image: set-by-kustomize-replacements
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "true"]
+          securityContext: *prepull-sc
+          resources: *prepull-res
+      containers:
+        # The k3s sandbox (pause) image, already on every node; same digest k3s caches.
+        - name: pause
+          image: rancher/mirrored-pause:3.6@sha256:74c4244427b7312c5b901fe0f67cbc53683d06f4f24c6faee65d4182bf0fa893
+          imagePullPolicy: IfNotPresent
+          securityContext: *prepull-sc
+          resources: *prepull-res
