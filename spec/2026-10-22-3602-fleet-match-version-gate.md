@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 3602
 intent: intent/2026-10-22-3602-fleet-match-version-gate.md
 ---
