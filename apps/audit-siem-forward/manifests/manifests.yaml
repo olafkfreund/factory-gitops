@@ -49,6 +49,13 @@ data:
     security telemetry. Exit 6 means the audit page hides ids after the high-water
     mark; nothing is forwarded until the gap is resolved.
 
+    PAGING (#265): each run reads /api/audit?after_id=<hwm>&limit=500 page by
+    page until a short page (at most MAX_PAGES per run), forwarding each page
+    and advancing the hwm only after a successful ingest. A CFactory without
+    after_id ignores the params and returns its newest 100 rows newest first;
+    that reply is detected (not strictly ascending above the hwm) and handled
+    by the single-read path above, gap alert included.
+
     Env:
       CFACTORY_URL   audit source base url (default in-cluster service)
       API_KEY        optional bearer for /api/* when the keystore is enforced
@@ -69,6 +76,10 @@ data:
 
     # CFactory AuditStore.list(limit=100): /api/audit never returns more (#265).
     PAGE = 100
+    # CFactory#491: /api/audit?after_id=N&limit=1..500, rows id > N ascending.
+    LIMIT = 500
+    # Bounded run; the next run resumes from the sink's real max id.
+    MAX_PAGES = 20
 
 
     def eprint(*a):
@@ -91,6 +102,12 @@ data:
             if oldest > hwm + 1:
                 return hwm + 1, oldest - 1
         return None
+
+
+    def is_paged(entries: list[dict], after_id: int) -> bool:
+        """True when the reply honoured after_id: ids strictly ascending, all > it."""
+        ids = [int(e["id"]) for e in entries]
+        return all(b > a for a, b in zip([after_id] + ids, ids))
 
 
     def select_new(entries: list[dict], hwm: int) -> list[dict]:
@@ -121,11 +138,13 @@ data:
             return json.load(r)
 
 
-    def read_audit(base: str, api_key: str | None) -> list[dict]:
+    def read_audit(base: str, api_key: str | None, after_id: int) -> list[dict]:
         headers = {}
         if api_key:
             headers["authorization"] = f"Bearer {api_key}"
-        payload = _get_json(f"{base}/api/audit", headers=headers)
+        payload = _get_json(
+            f"{base}/api/audit?after_id={after_id}&limit={LIMIT}", headers=headers
+        )
         entries = payload.get("entries")
         if not isinstance(entries, list):
             raise RuntimeError(f"/api/audit gave no entries list: keys={sorted(payload)}")
@@ -182,6 +201,46 @@ data:
             raise RuntimeError(f"OpenObserve rejected {failed} record(s): {res}")
 
 
+    def pump(fetch, send, hwm: int) -> int:
+        """Read pages after hwm and forward them in id order; returns the exit code."""
+        sent = 0
+        first = hwm
+        for _ in range(MAX_PAGES):
+            try:
+                entries = fetch(hwm)
+            except Exception as e:  # noqa: BLE001 — unreachable source is a real alert
+                eprint(f"ALERT: cannot read /api/audit: {e!r}")
+                return 3
+            paged = is_paged(entries, hwm)
+            if not paged:
+                # Old CFactory: newest PAGE rows, newest first. Single-read path.
+                gap = find_gap(entries, hwm)
+                if gap:
+                    eprint(
+                        f"ALERT: gap ids {gap[0]}..{gap[1]} not visible via /api/audit "
+                        f"(hwm={hwm}, page oldest={gap[1] + 1})"
+                    )
+                    return 6
+            new = select_new(entries, hwm)
+            if new:
+                try:
+                    send(new)
+                except Exception as e:  # noqa: BLE001 — failed ingest must not be silent
+                    eprint(f"ALERT: OpenObserve ingest failed after id {hwm}: {e!r}")
+                    return 5
+                sent += len(new)
+                hwm = int(new[-1]["id"])
+            if not paged or len(entries) < LIMIT:
+                break
+        else:
+            eprint(f"WARN: page cap {MAX_PAGES}x{LIMIT} reached at id {hwm}; next run continues")
+        if sent:
+            eprint(f"OK: forwarded {sent} record(s) (id {first + 1}..{hwm}, prev hwm={first})")
+        else:
+            eprint(f"OK: nothing to forward (hwm id={hwm})")
+        return 0
+
+
     def main() -> int:
         cf = os.environ.get(
             "CFACTORY_URL", "http://cfactory.factory.svc.cluster.local:3111"
@@ -199,41 +258,17 @@ data:
         basic = base64.b64encode(f"{user}:{pw}".encode()).decode()
 
         try:
-            entries = read_audit(cf, os.environ.get("API_KEY"))
-        except Exception as e:  # noqa: BLE001 — unreachable source is a real alert
-            eprint(f"ALERT: cannot read /api/audit: {e!r}")
-            return 3
-
-        try:
             hwm = high_water_mark(oo, org, stream, basic)
         except Exception as e:  # noqa: BLE001
             eprint(f"ALERT: cannot query OpenObserve high-water mark: {e!r}")
             return 4
 
-        gap = find_gap(entries, hwm)
-        if gap:
-            eprint(
-                f"ALERT: gap ids {gap[0]}..{gap[1]} not visible via /api/audit "
-                f"(hwm={hwm}, page oldest={gap[1] + 1})"
-            )
-            return 6
-
-        new = select_new(entries, hwm)
-        if not new:
-            eprint(f"OK: nothing to forward (hwm id={hwm}, {len(entries)} entries total)")
-            return 0
-
-        try:
-            forward(oo, org, stream, basic, new)
-        except Exception as e:  # noqa: BLE001 — failed ingest must not be silent
-            eprint(f"ALERT: OpenObserve ingest failed: {e!r}")
-            return 5
-
-        eprint(
-            f"OK: forwarded {len(new)} record(s) to stream '{stream}' "
-            f"(id {new[0]['id']}..{new[-1]['id']}, prev hwm={hwm})"
+        api_key = os.environ.get("API_KEY")
+        return pump(
+            lambda after: read_audit(cf, api_key, after),
+            lambda recs: forward(oo, org, stream, basic, recs),
+            hwm,
         )
-        return 0
 
 
     def _selftest() -> int:
@@ -260,6 +295,42 @@ data:
         assert find_gap([{"id": i} for i in range(201, 301)], 150) == (151, 200)
         assert find_gap([{"id": i} for i in range(151, 251)], 150) is None
         assert find_gap([{"id": i} for i in range(201, 204)], 0) is None
+        # Paging (#265 step 2): fake CFactory#491 and a pre-#491 CFactory.
+        rows = [{"id": i, "ts": "2026-07-24T11:00:00"} for i in range(1, 1201)]
+
+        def new_api(after):
+            return [r for r in rows if r["id"] > after][:LIMIT]
+
+        def old_api(after):  # ignores after_id/limit: newest PAGE, newest first
+            return sorted(rows, key=lambda r: -r["id"])[:PAGE]
+
+        batches = []
+        assert pump(new_api, batches.append, 0) == 0
+        assert [len(b) for b in batches] == [500, 500, 200], "pages until short page"
+        assert [r["id"] for b in batches for r in b] == list(range(1, 1201))
+        batches = []
+        assert pump(new_api, batches.append, 1200) == 0 and batches == [], "caught up"
+        assert not is_paged(old_api(0), 0) and is_paged(new_api(0), 0)
+        assert not is_paged([{"id": 5}], 5), "id <= hwm is not a paged reply"
+        batches = []
+        assert pump(old_api, batches.append, 1150) == 0, "old CFactory, no gap"
+        assert [r["id"] for b in batches for r in b] == list(range(1151, 1201))
+        batches = []
+        assert pump(old_api, batches.append, 0) == 6 and batches == [], "old CFactory gap"
+        # Page cap: stop after MAX_PAGES full pages, hwm at the last forwarded id.
+        rows = [{"id": i, "ts": "2026-07-24T11:00:00"} for i in range(1, MAX_PAGES * LIMIT + 2)]
+        batches = []
+        assert pump(new_api, batches.append, 0) == 0
+        assert len(batches) == MAX_PAGES and batches[-1][-1]["id"] == MAX_PAGES * LIMIT
+
+        # Ingest fails on page 2: exit 5, page 1 kept, nothing past it.
+        def flaky(recs):
+            if batches:
+                raise RuntimeError("ingest down")
+            batches.append(recs)
+
+        batches = []
+        assert pump(new_api, flaky, 0) == 5 and len(batches) == 1
         print("selftest OK")
         return 0
 
