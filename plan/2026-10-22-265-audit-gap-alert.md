@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 265
 spec: spec/2026-10-22-265-audit-gap-alert.md
 ---
