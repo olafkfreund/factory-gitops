@@ -7,15 +7,27 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/aifactory
   newName: ghcr.io/olafkfreund/aifactory
-  newTag: sha-6231576
+  newTag: sha-2296368
 # AIFactory#1737: the gate-image-prepull DaemonSet pulls exactly what the Jobs
 # run. Runs after `images:` above, so the -nix tag is not retagged.
 replacements:
-- source: { kind: Deployment, name: aifactory, fieldPath: "spec.template.spec.containers.[name=aifactory].env.[name=AIFACTORY_SANDBOX_IMAGE].value" }
+- source:
+    fieldPath: spec.template.spec.containers.[name=aifactory].env.[name=AIFACTORY_SANDBOX_IMAGE].value
+    kind: Deployment
+    name: aifactory
   targets:
-  - select: { kind: DaemonSet, name: gate-image-prepull }
-    fieldPaths: ["spec.template.spec.initContainers.[name=sandbox-image].image"]
-- source: { kind: Deployment, name: aifactory, fieldPath: "spec.template.spec.containers.[name=aifactory].env.[name=AIFACTORY_BUILD_IMAGE].value" }
+  - fieldPaths:
+    - spec.template.spec.initContainers.[name=sandbox-image].image
+    select:
+      kind: DaemonSet
+      name: gate-image-prepull
+- source:
+    fieldPath: spec.template.spec.containers.[name=aifactory].env.[name=AIFACTORY_BUILD_IMAGE].value
+    kind: Deployment
+    name: aifactory
   targets:
-  - select: { kind: DaemonSet, name: gate-image-prepull }
-    fieldPaths: ["spec.template.spec.initContainers.[name=build-image].image"]
+  - fieldPaths:
+    - spec.template.spec.initContainers.[name=build-image].image
+    select:
+      kind: DaemonSet
+      name: gate-image-prepull
