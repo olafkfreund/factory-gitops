@@ -15,8 +15,8 @@
 # argocd-drift (factory-gitops#152) and fleet-match (#89). The fourth is the one
 # that shows the shape of this gap rather than closing an instance of it: it was
 # never in #152's list, so "all three now run" was true and this app's ~470
-# assertions still had never executed in CI. Whoever adds the fifth embedded
-# script adds it here in the same commit.
+# assertions still had never executed in CI. audit-siem-forward is the fifth
+# (#265). Whoever adds the sixth embedded script adds it here in the same commit.
 name: job-watchdog selftest
 
 on:
@@ -97,3 +97,15 @@ jobs:
             /tmp/fleet_match_extracted.py
       - name: Selftest (fleet-match)
         run: python3 /tmp/fleet_match_extracted.py selftest
+
+      # audit-siem-forward, the FIFTH embedded selftest (#265). Its gap check is
+      # what stops the SIEM copy of the audit chain from silently losing rows
+      # when more than one /api/audit page accumulates between runs.
+      - name: Extract audit-siem-forward's forward.py from the ConfigMap
+        run: |
+          python3 .github/scripts/extract_embedded_script.py \
+            apps/audit-siem-forward/manifests/manifests.yaml \
+            forward.py \
+            /tmp/audit_siem_forward_extracted.py
+      - name: Selftest (audit-siem-forward)
+        run: python3 /tmp/audit_siem_forward_extracted.py selftest
