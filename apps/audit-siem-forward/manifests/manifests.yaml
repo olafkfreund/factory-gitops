@@ -46,7 +46,8 @@ data:
     A non-zero exit (failed Job) is the alert, matching the fleet convention
     (apps/audit-anchor-alert): if CFactory or OpenObserve is unreachable, or the
     ingest is rejected, the forward run fails loudly instead of silently dropping
-    security telemetry.
+    security telemetry. Exit 6 means the audit page hides ids after the high-water
+    mark; nothing is forwarded until the gap is resolved.
 
     Env:
       CFACTORY_URL   audit source base url (default in-cluster service)
@@ -66,6 +67,9 @@ data:
     import urllib.request
     from datetime import datetime, timezone
 
+    # CFactory AuditStore.list(limit=100): /api/audit never returns more (#265).
+    PAGE = 100
+
 
     def eprint(*a):
         print(*a, file=sys.stderr, flush=True)
@@ -78,6 +82,15 @@ data:
 
     def _micros(raw: str) -> int:
         return int(_parse_ts(raw).timestamp() * 1_000_000)
+
+
+    def find_gap(entries: list[dict], hwm: int) -> tuple[int, int] | None:
+        """Find ids hidden between the high-water mark and a full audit page."""
+        if len(entries) >= PAGE:
+            oldest = min(int(e["id"]) for e in entries)
+            if oldest > hwm + 1:
+                return hwm + 1, oldest - 1
+        return None
 
 
     def select_new(entries: list[dict], hwm: int) -> list[dict]:
@@ -197,6 +210,14 @@ data:
             eprint(f"ALERT: cannot query OpenObserve high-water mark: {e!r}")
             return 4
 
+        gap = find_gap(entries, hwm)
+        if gap:
+            eprint(
+                f"ALERT: gap ids {gap[0]}..{gap[1]} not visible via /api/audit "
+                f"(hwm={hwm}, page oldest={gap[1] + 1})"
+            )
+            return 6
+
         new = select_new(entries, hwm)
         if not new:
             eprint(f"OK: nothing to forward (hwm id={hwm}, {len(entries)} entries total)")
@@ -236,6 +257,9 @@ data:
         assert select_new(entries, 3) == [], "hwm at tip must forward nothing"
         # Unordered input is tolerated (sorted by id).
         assert [r["id"] for r in select_new(list(reversed(entries)), 0)] == [1, 2, 3]
+        assert find_gap([{"id": i} for i in range(201, 301)], 150) == (151, 200)
+        assert find_gap([{"id": i} for i in range(151, 251)], 150) is None
+        assert find_gap([{"id": i} for i in range(201, 204)], 0) is None
         print("selftest OK")
         return 0
 
