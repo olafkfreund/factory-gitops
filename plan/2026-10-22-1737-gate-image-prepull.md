@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: AIFactory#1737
 spec: spec/2026-10-22-1737-gate-image-prepull.md
 ---
