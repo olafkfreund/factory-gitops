@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 265
 intent: intent/2026-10-22-265-audit-after-id-loop.md
 ---
