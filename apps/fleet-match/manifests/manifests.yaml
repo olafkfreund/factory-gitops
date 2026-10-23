@@ -346,9 +346,11 @@ data:
         leaves a trail of `cancelled` runs, and three of AIFactory's five most
         recent runs are cancelled right now. Reading the newest run instead of the
         newest SUCCESSFUL one would compare pods against a sha that was never built.
+        A run whose build-push job was version-gated (`built` False) built nothing
+        either (Factory#3602).
         """
         for r in runs:
-            if r.get("conclusion") == "success":
+            if r.get("conclusion") == "success" and r.get("built") is not False:
                 return r
         return None
 
@@ -433,6 +435,9 @@ data:
             for_head = [r for r in runs if r["sha"] == head]
             if any(r.get("status") != "completed" for r in for_head):
                 notes.append("deploying")  # in flight: a fact from the API
+            elif any(r.get("conclusion") == "success" and r.get("built") is False
+                     for r in for_head):
+                notes.append("version_gated")
             elif for_head:
                 if head_age is None or head_age > tol:
                     ages.append(head_age or 0)
@@ -1004,6 +1009,7 @@ data:
                      "?branch=main&per_page=30")
             runs = [
                 {
+                    "id": r["id"],
                     "sha": r["head_sha"],
                     "status": r["status"],
                     "conclusion": r.get("conclusion"),
@@ -1011,6 +1017,19 @@ data:
                 }
                 for r in (raw or {}).get("workflow_runs", [])
             ]
+            for run in runs:
+                if run["conclusion"] != "success":
+                    continue
+                try:
+                    jobs = gh(token, "GET", f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")
+                    run["built"] = not any(
+                        j["name"] == "build-push" and j.get("conclusion") != "success"
+                        for j in jobs["jobs"])
+                    if run["built"]:
+                        break
+                except Exception as e:  # noqa: BLE001
+                    eprint(f"warn: cannot read deploy jobs of {repo} run {run['id']}: {e!r}")
+                    break  # unknown counts as built, as before #3602
         except Exception as e:  # noqa: BLE001
             eprint(f"warn: cannot read deploy runs of {repo}: {e!r}")
             runs = None
@@ -1306,6 +1325,14 @@ data:
                     run(PREV, age=600)]
         assert latest_success(littered)["sha"] == PREV
         assert latest_success([run(HEAD, conclusion="cancelled")]) is None
+        gated = run(HEAD, age=8000)
+        gated["built"] = False
+        gated_runs = [gated, run(PREV, age=99999)]
+        assert latest_success(gated_runs)["sha"] == PREV
+        version_gated = assess(T, HEAD, 9000, gated_runs,
+                               [dep(spec="sha-0bfadd9", running=("sha-0bfadd9",))],
+                               "relevant", now, 900, 3600)
+        assert version_gated["status"] == "version_gated" and version_gated["codes"] == [], version_gated
 
         # ---- UNEVALUABLE IS A FINDING, NEVER A SKIP ------------------------
         blind = assess(T, None, None, None, [dep()], None, now, 900, 3600)

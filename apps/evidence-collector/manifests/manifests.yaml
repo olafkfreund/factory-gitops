@@ -335,7 +335,8 @@ spec:
           # Step 2: S3 work — capture backup markers, then upload the dated snapshot.
           containers:
             - name: upload
-              image: quay.io/minio/mc:RELEASE.2025-04-03T17-07-56Z@sha256:69fb6e6ca209008ae3cacf9f63c2524f68a1322dc921c8992ba2cc99c5bef3c6
+              # -dev variant: these scripts need /bin/sh (quay.io/minio/mc is gone, 401).
+              image: cgr.dev/chainguard/minio-client:latest-dev@sha256:b056b795d31828015aea061e3168267b0ba80590ba2d8f869e72ff77153a68e8
               command: ["/bin/sh", "-c"]
               args:
                 - |

@@ -299,6 +299,31 @@ spec:
           env:
             - { name: APP_HOST, value: "0.0.0.0" }
             - { name: APP_PORT, value: "3101" }
+            # Global admission cap on concurrently RUNNING builds (AIFactory#1425).
+            # Unset, the code default is 5 (apps/web-server/server/config.py); this
+            # is the first time it is pinned here.
+            #
+            # 12, derived not guessed. Disk is the binding resource, not CPU or
+            # memory: this node allocates 128 CPU and 251 GiB at ~4% requested,
+            # while a build Job takes cpu=2/mem=4Gi. The node advertises 933.7 GB
+            # of allocatable ephemeral-storage and really has ~185 GB free, because
+            # its filesystem is the host root.
+            #
+            #   usable = 179 - 49.1 (evictionHard nodefs.available 5%)
+            #                - 30   (2x the observed +/-15 GB host churn)   = 99.9 GB
+            #   cap    = 99.9 / 4.29 GB (the 4Gi per-Job limit)             = 23
+            #
+            # Halved to 12: in-build /work growth is the one term nobody measured.
+            # Raise toward 23 once it is.
+            #
+            # ORDERING: this REQUIRED the ephemeral-storage limit from AIFactory
+            # #1425 to be deployed first — raising the cap while the scheduler
+            # cannot see the resource that binds is precisely the failure the
+            # issue exists to prevent. Satisfied: v3.7.0 (sha-8d460de) is live and
+            # its build_job_manifest emits
+            # limits={cpu: 2, memory: 4Gi, ephemeral-storage: 4Gi}, verified in
+            # the running pod before this landed.
+            - { name: APP_MAX_CONCURRENT_TASKS, value: "12" }
             # RFC-0016 #220/#673: durable shared state in Postgres (aifactory DB).
             # Replaces pod-local SQLite (~/.aifactory/data.db); init_db() runs
             # `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY default true),
@@ -311,6 +336,9 @@ spec:
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
+            # At-rest key for credentials in the JSON settings/profile stores (AIFactory#1799).
+            # Unset = plaintext with a warning; existing plaintext values are re-sealed on next save.
+            - { name: KMS_FERNET_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: KMS_FERNET_KEY } } }
             - { name: PATH, value: "/home/nonroot/.npm-global/bin:/home/projects/MagesticAI/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
             # Factory#520. This is what makes readOnlyRootFilesystem possible at
             # all. The claude CLI writes ~/.claude.json at the HOME ROOT — a
@@ -390,6 +418,7 @@ spec:
             # RWO claims stranding on different nodes is what deadlocked the gate.
             - { name: AIFACTORY_SANDBOX_GATES, value: "true" }
             - { name: AIFACTORY_SANDBOX_BACKEND, value: "nixjob" }
+            # AIFactory#1737: the gate-image-prepull DaemonSet copies this value (kustomization.yaml replacements); renaming this var breaks the build on purpose.
             - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/factory-runner-nix:sha-47900d1@sha256:e2e42c08f5fb8cc7b0d4e3a11efe9639f0b15f02668d80ae797d461b67746eb9" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
             # ── RFC-0011 label-driven intake poller (#636) — the issue->build
@@ -644,9 +673,29 @@ spec:
             # short-SHA here (sha-205d6f19-nix) 404s — the pushed tag is 7-char.
             # Corrected to the actual published tag. Validated live: pulls + runs
             # nix 2.30.1 (121 /nix/store entries) on a 2nd k3d node, no nix PVC.
-            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-cc8ea52-nix" }
+            # AIFactory#1737: the gate-image-prepull DaemonSet copies this value (kustomization.yaml replacements); renaming this var breaks the build on purpose.
+            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-2296368-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
+            # RFC-0014 operator runtime allowlist (AIFactory#1607). Naming a
+            # runtime here PERMITS a contract or model string to select it; it is
+            # not a default. `claude` is always enabled and is deliberately not
+            # listed. Enforced at providers/factory.py from AIFactory v3.6.86 on —
+            # INERT on any earlier image, which is why this may land BEFORE the
+            # code and should not wait for it: there is then no window in which
+            # enforcement is live but the allowlist is empty, which would refuse
+            # the QA failover chain.
+            #
+            # Why each: codex and antigravity are in the web UI model picker AND
+            # in the default QA failover chain (provider_failover _DEFAULT_CHAIN),
+            # so omitting them would turn a graceful degradation into a hard
+            # failure. openai-compatible is the only runtime with complete
+            # endpoint credentials deployed here (OPENAI_COMPATIBLE_BASE_URL).
+            # copilot per AIFactory#790 — its CLI, provider and credential are all
+            # already present. Deliberately omitted: ollama, ollama-cloud and
+            # opencode, which have no endpoint or binary on this deployment and
+            # are already non-functional; gating them costs nothing and says so.
+            - { name: AIFACTORY_RUNTIMES, value: "codex,antigravity,openai-compatible,copilot" }
             - { name: OPENAI_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_API_KEY } } }
             # Ollama Cloud via the OpenAI-compatible provider — a task model
             # string like "openai-compatible:qwen3-coder:480b" routes here.
@@ -771,3 +820,60 @@ subjects:
 # trimmed (Factory#253). It nightly `nix store gc`'d a warm store that nothing
 # writes to any more — garbage-collecting garbage. Per-Job /nix now comes from
 # the image and dies with the Job, so there is nothing to cap.
+---
+# AIFactory#1737. Keeps the gate image (AIFACTORY_SANDBOX_IMAGE) and the build
+# image (AIFACTORY_BUILD_IMAGE) pulled on every node. A gate Job's 600s
+# activeDeadlineSeconds also pays for its image pull, and a cold ~2.25 GB pull
+# of factory-runner-nix ate into it. Each initContainer only forces the pull;
+# the pause container keeps the pod alive so kubelet image GC treats both
+# images as in use.
+#
+# The two initContainer images are NOT written here: kustomization.yaml's
+# `replacements` copy them from the Deployment env values above, so a pin bump
+# there moves this DaemonSet too. Copying the strings would also be wrong, not
+# just duplicated: the `images:` transformer retags every
+# ghcr.io/olafkfreund/aifactory image field to newTag, so a literal
+# `aifactory:sha-...-nix` here would render without `-nix`. replacements run
+# after `images`, so the rendered refs are the env strings exactly.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: gate-image-prepull, namespace: factory, labels: { app: gate-image-prepull } }
+spec:
+  selector: { matchLabels: { app: gate-image-prepull } }
+  template:
+    metadata: { labels: { app: gate-image-prepull } }
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      imagePullSecrets: [{ name: ghcr-pull }]
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        # Both images carry sh (AIFactory kube_sandbox / build_backend run `sh -c` in them).
+        - name: sandbox-image
+          image: set-by-kustomize-replacements
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "true"]
+          securityContext: &prepull-sc
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources: &prepull-res
+            requests: { cpu: 1m, memory: 4Mi }
+            limits: { cpu: 10m, memory: 16Mi }
+        - name: build-image
+          image: set-by-kustomize-replacements
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "true"]
+          securityContext: *prepull-sc
+          resources: *prepull-res
+      containers:
+        # The k3s sandbox (pause) image, already on every node; same digest k3s caches.
+        - name: pause
+          image: rancher/mirrored-pause:3.6@sha256:74c4244427b7312c5b901fe0f67cbc53683d06f4f24c6faee65d4182bf0fa893
+          imagePullPolicy: IfNotPresent
+          securityContext: *prepull-sc
+          resources: *prepull-res
