@@ -14,7 +14,8 @@ metadata:
 spec:
   scaleTargetRef:
     name: pfactory
-  minReplicaCount: 1
+  # TEMPORARY (#273 verification): forces a second pod; reverted right after.
+  minReplicaCount: 2
   # 2 first (#273); 4 only after a week at 2 with no anomalies. Must equal
   # PFACTORY_REPLICA_COUNT in apps/pfactory/manifests/manifests.yaml.
   maxReplicaCount: 2
