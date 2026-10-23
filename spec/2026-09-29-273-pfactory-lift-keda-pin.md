@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 273
 intent: intent/2026-09-29-273-pfactory-lift-keda-pin.md
 ---
