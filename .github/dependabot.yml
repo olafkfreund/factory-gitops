@@ -19,3 +19,8 @@ updates:
     labels:
       - "dependencies"
       - "security"
+    # One PR for all action bumps: codeql-action's init and analyze must move
+    # together, or CodeQL fails on a config/runtime version mismatch (#286/#287).
+    groups:
+      github-actions:
+        patterns: ["*"]
