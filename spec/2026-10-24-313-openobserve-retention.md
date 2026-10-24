@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 313
 intent: intent/2026-10-24-313-openobserve-retention.md
 ---
