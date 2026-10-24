@@ -44,6 +44,8 @@ spec:
       automountServiceAccountToken: false
       imagePullSecrets: [{ name: ghcr-pull }]
       enableServiceLinks: false
+      # The preStop drain (factory-gitops#303) waits up to 1740s for held runs; 1800 leaves 60s for SIGTERM.
+      terminationGracePeriodSeconds: 1800
       # Factory#503. Every CronJob in this namespace has carried this set since
       # it was written; the Deployments never did, so nothing VERIFIED that the
       # control plane runs non-root — the image's `USER nonroot` was the only
@@ -429,6 +431,8 @@ spec:
           # continuous unresponsiveness — genuinely wedged, not merely loaded.
           readinessProbe: { httpGet: { path: /api/ready, port: 3114 }, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 30, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6 }
+          # Hold the pod until /api/drain says no run is held (200), at most 1740s (factory-gitops#303).
+          lifecycle: { preStop: { exec: { command: ["sh","-c","end=$(( $(date +%s) + 1740 )); while [ $(date +%s) -lt $end ]; do curl -fs http://localhost:3114/api/drain >/dev/null && exit 0; sleep 10; done; exit 0"] } } }
           resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 8Gi } }
       volumes:
         - { name: data,      persistentVolumeClaim: { claimName: pfactory-data } }
