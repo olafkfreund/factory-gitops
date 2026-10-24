@@ -149,6 +149,11 @@ spec:
             # failed every 15 minutes indefinitely. 10 years lets the immutable
             # audit chain backfill in full.
             - { name: ZO_INGEST_ALLOWED_UPTO, value: "87600" }
+            # Explicit retention (Factory#313). 3650 is OpenObserve v0.90.3's own
+            # default (src/config/src/config.rs), pinned so the window is stated,
+            # not inherited. NEVER set this below the backfill window above:
+            # compaction would delete backfilled audit rows. Needs >= 395 days.
+            - { name: ZO_COMPACT_DATA_RETENTION_DAYS, value: "3650" }
             # Bootstrap root user. Credentials are NEVER inlined here — they come
             # from a Secret the operator creates out-of-band (see README.md):
             #   kubectl -n factory create secret generic observe-root \
