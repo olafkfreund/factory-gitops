@@ -149,6 +149,10 @@ spec:
               # Tested by .github/scripts/test_cred_sync.py, which also proves the three
               # vendored copies of this script are byte-identical.
               import json, os, shutil, time
+              import signal, sys
+              # As PID 1 this process ignores SIGTERM unless it installs a handler, so since the
+              # 1800s drain grace (#303) every pod stop waited for SIGKILL. Exit on SIGTERM.
+              signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
               SEED = os.environ.get("CRED_SYNC_SEED", "/seed/claude-credentials.json")
               DEST = os.environ.get("CRED_SYNC_DEST", "/h/.claude/.credentials.json")
