@@ -9,6 +9,7 @@ Decision: env name `APP_CFACTORY_READ_KEY` (what all three settings classes read
 
 ## Steps
 1. `apps/aifactory/manifests/manifests.yaml:378`, `apps/pfactory/manifests/manifests.yaml:302`, `apps/tfactory/manifests/manifests.yaml:676`: replace `{ name: CFACTORY_READ_KEY, ... key: CFACTORY_READ_KEY }` with `{ name: APP_CFACTORY_READ_KEY, ... key: APP_API_TOKEN }` → verify by `git grep -n CFACTORY_READ_KEY apps/` showing only the three new lines, and YAML parses.
+   Also fix the comment above each line ("read-scoped" was no longer true).
    Traps: three identical one-line edits, implemented directly (below the coder handoff threshold). Leave `docs/secrets-management.md` alone: the secret key still exists.
 
 ## Tests
