@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 310
 spec: spec/2026-10-26-310-cfactory-read-key.md
 ---
