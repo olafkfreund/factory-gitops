@@ -281,6 +281,11 @@ spec:
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
+            # Ed25519 Task Contract signing key (TFactory#1432, plan step 7). The seed
+            # lives in factory-secrets via agenix; optional so the pod starts before
+            # it is seeded (no key = contract ships HMAC-only, TFactory warns).
+            - { name: PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10, valueFrom: { secretKeyRef: { name: factory-secrets, key: PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10, optional: true } } }
+            - { name: PFACTORY_CONTRACT_SIGNING_KID, value: "pf-2026-10" }
             # bwrap can't run on k3d (node is a container) — disable the bash sandbox
             # so agent bash works. Real syscall sandbox via gVisor: AIFactory #363.
             - { name: AIFACTORY_BASH_SANDBOX, value: "false" }
