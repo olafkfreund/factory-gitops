@@ -468,6 +468,12 @@ spec:
             - { name: TFACTORY_AUTO_GENERATE, value: "true" }
             - { name: TFACTORY_AUTO_EVALUATE, value: "true" }
             - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
+            # Ed25519 public key for PFactory-signed Task Contracts (TFactory#1432,
+            # plan step 7). Public material only; never put the private seed here.
+            # PLACEHOLDER: not valid base64, so the key is skipped and contracts
+            # report unknown_kid. Harmless while TFACTORY_CONTRACT_SIGNATURE_MODE is
+            # unset (warn). Replace with the output of gen-contract-key.sh.
+            - { name: TFACTORY_CONTRACT_PUBKEY_PFACTORY__PF-2026-10, value: "PLACEHOLDER-not-a-key-replace-before-enforce" }
             # Surface the VAL verdict on the PR (#964): commit the triager's
             # accepted+flagged tests back onto the AIFactory feature branch so
             # a green verify visibly adds its verified tests to the open PR.
