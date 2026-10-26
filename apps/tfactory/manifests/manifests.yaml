@@ -540,7 +540,7 @@ spec:
             # 12-Jobs-per-module path let a transient dispatch error flip stability
             # to ERROR, downgrading accept->flag). Keep in lockstep with newTag on
             # every CD bump.
-            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-b062ef7" }
+            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-e195a2b" }
             # PORTAL_UI_IMAGE pins the runner image the portal-ui browser Job
             # runs (portal_testing/dispatch.py). TFactory#886: nothing built that
             # image for the first five weeks of its life, so `:latest` -- the
@@ -676,9 +676,9 @@ spec:
             # send it as `Authorization: Bearer`). Matches aifactory so all three
             # factories accept the one shared token from factory-secrets.
             - { name: APP_API_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
-            # Federated cross-portal search (#149): read-scoped cockpit key so this
+            # Federated cross-portal search (#149): cockpit key (the only keystore entry, read+write; #310) so this
             # portal's /api/search proxy can query the cockpit's aggregated index.
-            - { name: CFACTORY_READ_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_READ_KEY } } }
+            - { name: APP_CFACTORY_READ_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
             # OIDC SSO via Keycloak
             - { name: APP_OIDC_ENABLED, value: "true" }
             - { name: APP_OIDC_ISSUER_URL, value: "https://keycloak.freundcloud.org.uk/realms/factory" }
