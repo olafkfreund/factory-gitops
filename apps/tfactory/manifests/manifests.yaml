@@ -470,9 +470,8 @@ spec:
             - { name: TFACTORY_AUTO_TRIAGE, value: "true" }
             # Ed25519 public key for PFactory-signed Task Contracts (TFactory#1432,
             # plan step 7). Public material only; never put the private seed here.
-            # PLACEHOLDER: not valid base64, so the key is skipped and contracts
-            # report unknown_kid. Harmless while TFACTORY_CONTRACT_SIGNATURE_MODE is
-            # unset (warn). Replace with the output of gen-contract-key.sh.
+            # Seed is PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 in factory-secrets
+            # (nixos_config#2489). Rotate with a new kid; never overwrite this one.
             - { name: TFACTORY_CONTRACT_PUBKEY_PFACTORY__PF-2026-10, value: "QFjJYKp09Zp4fJKpk29MJLnr78IahfXzYtSy6uMm2g4=" }
             # Surface the VAL verdict on the PR (#964): commit the triager's
             # accepted+flagged tests back onto the AIFactory feature branch so
