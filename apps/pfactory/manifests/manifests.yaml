@@ -302,6 +302,9 @@ spec:
             # send it as `Authorization: Bearer`). Matches aifactory so all three
             # factories accept the one shared token from factory-secrets.
             - { name: APP_API_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
+            # Signs logins; without it the server auto-generates a file in its home
+            # that in-pod agents can read and that changes on every restart (AIFactory#1931).
+            - { name: APP_JWT_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: PFACTORY_JWT_SECRET } } }
             # Federated cross-portal search (#149): cockpit key (the only keystore entry, read+write; #310) so this
             # portal's /api/search proxy can query the cockpit's aggregated index.
             - { name: APP_CFACTORY_READ_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: APP_API_TOKEN } } }
