@@ -26,8 +26,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: model-gateway
-          # Tag AND digest: Kyverno image globs match the tag, a bare digest matches none.
-          image: ghcr.io/olafkfreund/aifactory:v3.10.12-gateway@sha256:17de698aeca67c11c1f6c2d678353162bcfbb97b9971a868547435b310c3232a
+          # Immutable build tag, NOT tag@digest: Kyverno v1.18 does not match
+          # `aifactory:<tag>@sha256:...` against the `aifactory:*` glob, so a
+          # tag@digest Pod is admitted with no signature check (measured, #1959).
+          image: ghcr.io/olafkfreund/aifactory:sha-ec354c0-gateway
           ports:
             - name: http
               containerPort: 8080
