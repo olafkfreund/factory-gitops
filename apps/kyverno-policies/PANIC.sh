@@ -12,7 +12,8 @@
 # cluster. This script is the way back.
 #
 #   ./PANIC.sh status     what mode is the gate in, and is anything denying
-#   ./PANIC.sh 1          gate -> Audit, and stop ArgoCD putting Enforce back
+#   ./PANIC.sh 1          both policies (signature + coverage) -> Audit, and stop
+#                         ArgoCD putting Enforce back
 #   ./PANIC.sh 2          defang the webhook itself (see the caveat below)
 #   ./PANIC.sh 3          delete the ClusterPolicy outright
 #   ./PANIC.sh restore    undo level 2 and re-enable ArgoCD auto-sync
@@ -51,6 +52,7 @@ set -uo pipefail
 
 CTX=factory
 POLICY=verify-factory-image-signatures
+COVERAGE=require-first-party-signature-coverage  # Enforce since Factory#3664
 WEBHOOK_CFG=kyverno-resource-mutating-webhook-cfg
 WEBHOOK=mutate.kyverno.svc-ignore
 APP=kyverno-policies
@@ -73,6 +75,7 @@ case "${1:-status}" in
     echo "== gate"
     k get clusterpolicy "$POLICY" \
       -o jsonpath='{.metadata.name}{"  action="}{.spec.validationFailureAction}{"  failurePolicy="}{.spec.failurePolicy}{"  rules="}{range .spec.rules[*]}{.name}{" "}{end}{"\n"}' 2>&1
+    k get clusterpolicy "$COVERAGE" -o jsonpath='{.metadata.name}{"  action="}{.spec.validationFailureAction}{"\n"}' 2>&1
     echo "== argocd"
     k -n argocd get application "$APP" -o jsonpath='{"automated="}{.spec.syncPolicy.automated}{"  sync="}{.status.sync.status}{"  health="}{.status.health.status}{"\n"}'
     echo "== webhook (index is looked up, not assumed)"
@@ -88,8 +91,10 @@ case "${1:-status}" in
   1)
     echo "level 1: auto-sync OFF first, then gate -> Audit"
     k -n argocd patch application "$APP" --type=merge -p '{"spec":{"syncPolicy":{"automated":null}}}'
-    k patch clusterpolicy "$POLICY" --type=merge -p '{"spec":{"validationFailureAction":"Audit"}}'
-    k get clusterpolicy "$POLICY" -o jsonpath='{"now action="}{.spec.validationFailureAction}{"\n"}'
+    for p in "$POLICY" "$COVERAGE"; do
+      k patch clusterpolicy "$p" --type=merge -p '{"spec":{"validationFailureAction":"Audit"}}'
+      k get clusterpolicy "$p" -o jsonpath='{"now "}{.metadata.name}{" action="}{.spec.validationFailureAction}{"\n"}'
+    done
     echo "REMEMBER: ./PANIC.sh restore re-enables auto-sync once the fix is in git."
     ;;
 
@@ -128,7 +133,7 @@ case "${1:-status}" in
   3)
     echo "level 3: auto-sync OFF, then delete the ClusterPolicy"
     k -n argocd patch application "$APP" --type=merge -p '{"spec":{"syncPolicy":{"automated":null}}}'
-    k delete clusterpolicy "$POLICY"
+    k delete clusterpolicy "$POLICY" "$COVERAGE"
     ;;
 
   restore)

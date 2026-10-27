@@ -33,14 +33,38 @@ metadata: {name: uncovered-future-service, namespace: factory}
 spec:
   containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
 ---
-# A digest reference is NOT matched by the glob `ghcr.io/olafkfreund/tfactory:*`
-# -- the glob wants a literal `:` -- so a digest-pinned first-party image is
-# genuinely uncovered even though its repository has a rule.
+# Factory#3664: Kyverno normalises tag@digest to @digest, and `<repo>@*` covers
+# it, so a digest-pinned first-party image of a ruled repo is covered.
 apiVersion: v1
 kind: Pod
-metadata: {name: uncovered-digest-pinned, namespace: factory}
+metadata: {name: covered-digest-pinned, namespace: factory}
 spec:
   containers: [{name: c, image: "ghcr.io/olafkfreund/tfactory@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-tag-digest, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/tfactory:sha-1@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
+---
+# Factory#3664: spellings of the registry that the selector must still catch.
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-port443, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io:443/olafkfreund/aifactory:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-uppercase-registry, namespace: factory}
+spec:
+  containers: [{name: c, image: "GHCR.IO/olafkfreund/aifactory:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-untagged, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory"}]
 ---
 # An uncovered image hiding in an initContainer behind a covered app container.
 # The first draft of the JMESPath read only `spec.containers` and let this pass.

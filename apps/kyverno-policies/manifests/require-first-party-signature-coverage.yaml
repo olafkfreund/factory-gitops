@@ -192,27 +192,28 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: Pod
     policies.kyverno.io/description: >-
-      Reports any ghcr.io/olafkfreund image running in the `factory` namespace
-      that no verifyImages rule in verify-factory-image-signatures names, and
-      which is therefore admitted with no signature check and produces no
-      result there. AUDIT mode: reported, never denied.
+      Denies (Factory#3664) a Pod in `factory` or `gateway` carrying any
+      ghcr.io/olafkfreund image that no verifyImages rule in
+      verify-factory-image-signatures names, which would otherwise be admitted
+      with no signature check.
     # Pods only. See the note above: this rule wants one row per running Pod,
     # not the same finding repeated across Deployment, ReplicaSet and Pod.
     pod-policies.kyverno.io/autogen-controllers: none
 spec:
-  # AUDIT/WARN ONLY. Do NOT flip this to Enforce. Factory#522 tracks the flip
-  # for the signature policy with its own blockers, and this control shares the
-  # decisive one: nothing has yet been observed denying on a real workload.
+  # ENFORCE (Factory#3664): fail closed. Digest references used to slip past
+  # both policies unverified; with the `@*` globs added, an uncovered
+  # first-party image is now denied rather than reported. ./PANIC.sh 1 returns
+  # this and the signature policy to Audit.
   #
   # What HAS now been observed, and is the closest thing to that evidence this
   # control has produced (Factory#572): it reported a standing `fail` against a
   # real running Pod -- odin-dashboard, on ghcr.io/olafkfreund/odin:sha-2749b26
   # -- for as long as the gap was real, and stopped when the gap was closed.
   # That is a control objecting to a genuine workload and then falling silent
-  # for a reason, rather than one that has only ever been quiet. It is still not
-  # a denial, which is what #522 needs.
-  validationFailureAction: Audit
-  # If Kyverno is down, admit. This is a reporting control, not a gate.
+  # for a reason, rather than one that has only ever been quiet. Factory#3664 made it
+  # a denial: the digest bypass showed that a reported gap is still admitted.
+  validationFailureAction: Enforce
+  # If Kyverno is down, admit, like verify-factory-image-signatures.
   failurePolicy: Ignore
   webhookTimeoutSeconds: 30
   # Factory#444's reasoning applies here too: without background scanning a
@@ -237,21 +238,19 @@ spec:
         # covered but whose init container is not would otherwise pass silently.
         # This is verified by a test case (`must-warn-in-initcontainer`).
         #
-        # Note the covered patterns end in a literal `:` where the rule they
-        # mirror ends in `:*`. That is exact, not sloppy: the glob
-        # `ghcr.io/olafkfreund/tfactory:*` does not match a digest reference
-        # `ghcr.io/olafkfreund/tfactory@sha256:...`, so a digest-pinned
-        # first-party image is genuinely uncovered today and this rule reports
-        # it. `tfactory-runner-` and `factory-runner-` have no `:` because the
-# globs they mirror have
+        # Note the covered patterns end in a literal `:` or `@` where the rules
+        # they mirror end in `:*` and `@*` (Factory#3664: Kyverno normalises
+        # `repo:tag@sha256:x` to `repo@sha256:x`, so both digest forms are
+        # covered by the `@*` glob). `tfactory-runner-` and `factory-runner-`
+        # have no `:` because the globs they mirror have
         # none either -- and that same missing `:` is why `cfactory:*` does NOT
         # match `cfactory-frontend:*` and both must be listed over there.
         - name: uncovered
           variable:
             jmesPath: >-
               request.object.spec.[containers, initContainers, ephemeralContainers][].image
-              | [?regex_match('^ghcr\.io/olafkfreund/', @)]
-              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|pfactory:|tfactory:|cfactory:|cfactory-frontend:|odin:|skillai:|skillai-migrator:|tfactory-runner-|factory-runner-|fides-server:|fides-k8s-reporter:)', @)]
+              | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@|pfactory:|pfactory@|tfactory:|tfactory@|cfactory:|cfactory@|cfactory-frontend:|cfactory-frontend@|odin:|odin@|skillai:|skillai@|skillai-migrator:|skillai-migrator@|tfactory-runner-|factory-runner-|fides-server:|fides-server@|fides-k8s-reporter:|fides-k8s-reporter@)', @)]
             # A Pod with no containers matching cannot produce a null here.
             default: []
       preconditions:
@@ -261,7 +260,7 @@ spec:
             value: 0
       validate:
         message: >-
-          IMAGE COVERAGE GAP (Factory#564): {{ uncovered | join(', ', @) }}.
+          IMAGE COVERAGE GAP (Factory#564): {{ uncovered | join(', ', @) }}. This Pod is denied.
           These are first-party ghcr.io/olafkfreund images that NO verifyImages
           rule in verify-factory-image-signatures names, so admission never
           checks their signature and they produce no pass and no fail there.

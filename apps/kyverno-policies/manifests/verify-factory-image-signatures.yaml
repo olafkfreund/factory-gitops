@@ -5,6 +5,12 @@
 # was Audit until Factory#522; see docs/image-signature-admission.md, and
 # ./PANIC.sh 1 to return it to Audit if a deny turns out to be wrong.
 #
+# Factory#3664: every first-party glob below is listed twice, `<repo>:*` and
+# `<repo>@*`. Kyverno normalises `repo:tag@sha256:x` to `repo@sha256:x` before
+# matching, so `:*` alone misses BOTH digest forms and they were admitted
+# unverified. Add both globs together: the agree script does NOT check the pairing, and a
+# missing `@*` shows up only as denied digest-pinned Pods (coverage fails closed).
+#
 # Signer identity verified per repo:
 #   issuer  = https://token.actions.githubusercontent.com  (GitHub Actions OIDC)
 #   subject = the FULL workflow-and-ref identity, anchored at both ends.
@@ -240,6 +246,7 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/aifactory:*"
+            - "ghcr.io/olafkfreund/aifactory@*"
           # Audit phase: verify the signature only. Do not require digest
           # pinning and do not mutate the tag to a digest.
           verifyDigest: false
@@ -275,6 +282,7 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/pfactory:*"
+            - "ghcr.io/olafkfreund/pfactory@*"
           verifyDigest: false
           mutateDigest: false
           required: true
@@ -304,6 +312,7 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/tfactory:*"
+            - "ghcr.io/olafkfreund/tfactory@*"
           verifyDigest: false
           mutateDigest: false
           required: true
@@ -358,7 +367,9 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/cfactory:*"
+            - "ghcr.io/olafkfreund/cfactory@*"
             - "ghcr.io/olafkfreund/cfactory-frontend:*"
+            - "ghcr.io/olafkfreund/cfactory-frontend@*"
           verifyDigest: false
           mutateDigest: false
           required: true
@@ -560,7 +571,9 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/skillai:*"
+            - "ghcr.io/olafkfreund/skillai@*"
             - "ghcr.io/olafkfreund/skillai-migrator:*"
+            - "ghcr.io/olafkfreund/skillai-migrator@*"
           verifyDigest: false
           mutateDigest: false
           required: true
@@ -630,6 +643,7 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/odin:*"
+            - "ghcr.io/olafkfreund/odin@*"
           verifyDigest: false
           mutateDigest: false
           required: true
@@ -668,7 +682,9 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/fides-server:*"
+            - "ghcr.io/olafkfreund/fides-server@*"
             - "ghcr.io/olafkfreund/fides-k8s-reporter:*"
+            - "ghcr.io/olafkfreund/fides-k8s-reporter@*"
           # Deliberately narrow: the `fides` namespace also runs
           # postgres:15-alpine, which is third-party and not ours to sign. These
           # two globs name only the first-party images.

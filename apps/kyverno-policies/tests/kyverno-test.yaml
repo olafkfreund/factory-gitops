@@ -36,7 +36,9 @@ results:
     resources:
       - uncovered-odin-exporter
       - uncovered-future-service
-      - uncovered-digest-pinned
+      - uncovered-port443
+      - uncovered-uppercase-registry
+      - uncovered-untagged
       - uncovered-in-initcontainer
       - uncovered-mixed
   # --- MUST NOT FAIL: covered first-party, third-party, and lookalikes
@@ -45,6 +47,8 @@ results:
     kind: Pod
     result: skip
     resources:
+      - covered-digest-pinned
+      - covered-tag-digest
       - covered-aifactory
       - covered-aifactory-nix
       - covered-pfactory
