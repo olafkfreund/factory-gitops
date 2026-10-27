@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 3664
 repo-issue: olafkfreund/Factory#3664
 intent: intent/2026-10-27-3664-digest-followup.md
