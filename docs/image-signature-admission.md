@@ -1533,6 +1533,25 @@ signature is up to interval + TTL, roughly two hours.
 
 ### Escape hatch: `apps/kyverno-policies/PANIC.sh`
 
+**Since Factory#3664, know two things before you need this script:**
+
+- **Digest-pinned first-party Pods need ghcr.io and Sigstore at admission.**
+  `repo@sha256:…` and `repo:tag@sha256:…` are now verified like tags. That
+  includes the sandbox, gate and TFactory job Pods on
+  `factory-runner-nix:…@sha256:e2e4…`. If ghcr.io, Fulcio or Rekor cannot be
+  reached, verification cannot complete. Kyverno's verify cache (60m,
+  positive-only) covers an image that was verified recently, not a new one.
+- **A denial shows up at Pod creation, not at Argo sync.** Argo applies the
+  Deployment, Job or DaemonSet and reports Synced/Healthy-ish. The controller
+  then fails to create the Pod. Watch for `FailedCreate` events on
+  ReplicaSets, Jobs and DaemonSets
+  (`kubectl get events -A --field-selector reason=FailedCreate`), and for a
+  Deployment stuck `Progressing` past its deadline
+  (`ProgressDeadlineExceeded`). The event message names the policy:
+  `verify-factory-image-signatures` for a signature, or
+  `require-first-party-signature-coverage` ("IMAGE COVERAGE GAP") for an image
+  no rule names.
+
 Written and tested **before** anything was applied, because this policy rides on
 `mutate.kyverno.svc-ignore`, which intercepts pods, deployments, replicasets,
 statefulsets, daemonsets, jobs and cronjobs in every namespace except
