@@ -1,0 +1,136 @@
+# Model gateway stage 0 (Factory#1959) — Deployment, Service, PDB, NetworkPolicies.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-gateway
+  namespace: gateway
+  labels:
+    app: model-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: model-gateway
+  template:
+    metadata:
+      labels:
+        app: model-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: model-gateway
+          # Tag AND digest: Kyverno image globs match the tag, a bare digest matches none.
+          image: ghcr.io/olafkfreund/aifactory:v3.10.12-gateway@sha256:17de698aeca67c11c1f6c2d678353162bcfbb97b9971a868547435b310c3232a
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-gateway
+  namespace: gateway
+  labels:
+    app: model-gateway
+spec:
+  selector:
+    app: model-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: model-gateway
+  namespace: gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: model-gateway
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: gateway
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-factory-ingress
+  namespace: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: model-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: factory
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# DNS only: no upstream egress until stage 1 configures one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: model-gateway
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
