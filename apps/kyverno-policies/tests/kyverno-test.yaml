@@ -60,3 +60,41 @@ results:
       - covered-skillai-both
       - thirdparty-out-of-scope
       - lookalikes-not-ours
+  # --- Factory#3665: one rule per namespace group
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-gateway
+    kind: Pod
+    result: fail
+    resources:
+      - gw-uncovered-pfactory-digest
+      - gw-uncovered-runner-tag-digest
+      - gw-uncovered-odin
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-gateway
+    kind: Pod
+    result: skip
+    resources:
+      - gw-covered-aifactory
+      - gw-covered-aifactory-digest
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-fides
+    kind: Pod
+    result: fail
+    resources:
+      - fides-uncovered-pfactory
+      - fides-uncovered-future
+      - fidesreporter-uncovered-odin-digest
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-fides
+    kind: Pod
+    result: skip
+    resources:
+      - fides-covered-server
+      - fidesreporter-covered-reporter
+      - fides-thirdparty
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-by-a-signature-rule
+    kind: Pod
+    result: fail
+    resources:
+      - uncovered-fides-in-factory

@@ -176,3 +176,99 @@ spec:
   containers:
     - {name: a, image: "ghcr.io/someoneelse/odin:v1"}
     - {name: b, image: "docker.io/olafkfreund/odin:v1"}
+---
+# pfactory is verified in factory only; in gateway its digest form is uncovered (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: gw-uncovered-pfactory-digest, namespace: gateway}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/pfactory@sha256:e81259ebb9c4863d4952d9822ba60ae80c05bef6841e213d8fa6835944ef306c"}
+---
+# a factory-only runner image, tag plus digest, is uncovered in gateway (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: gw-uncovered-runner-tag-digest, namespace: gateway}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/factory-runner-nix:x@sha256:e81259ebb9c4863d4952d9822ba60ae80c05bef6841e213d8fa6835944ef306c"}
+---
+# odin is verified in factory only; uncovered in gateway (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: gw-uncovered-odin, namespace: gateway}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/odin:x"}
+---
+# a factory image in fides is uncovered; fides verifies only its own two (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-uncovered-pfactory, namespace: fides}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/pfactory:x"}
+---
+# the next unknown first-party image in fides must fail on arrival (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-uncovered-future, namespace: fides}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/some-future-service:v1"}
+---
+# fides-reporter is in the fides group; a digest-only odin is uncovered there (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: fidesreporter-uncovered-odin-digest, namespace: fides-reporter}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/odin@sha256:e81259ebb9c4863d4952d9822ba60ae80c05bef6841e213d8fa6835944ef306c"}
+---
+# fides images are verified in fides only; in factory they are uncovered (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-fides-in-factory, namespace: factory}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/fides-server@sha256:e81259ebb9c4863d4952d9822ba60ae80c05bef6841e213d8fa6835944ef306c"}
+---
+# aifactory is the one image verified in gateway (#1959).
+apiVersion: v1
+kind: Pod
+metadata: {name: gw-covered-aifactory, namespace: gateway}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/aifactory:sha-ec354c0-gateway"}
+---
+# digest form of the gateway-covered aifactory (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: gw-covered-aifactory-digest, namespace: gateway}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/aifactory@sha256:e81259ebb9c4863d4952d9822ba60ae80c05bef6841e213d8fa6835944ef306c"}
+---
+# fides-server is verified in fides (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-covered-server, namespace: fides}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/fides-server:x"}
+---
+# fides-k8s-reporter is verified in fides-reporter (#3665).
+apiVersion: v1
+kind: Pod
+metadata: {name: fidesreporter-covered-reporter, namespace: fides-reporter}
+spec:
+  containers:
+    - {name: a, image: "ghcr.io/olafkfreund/fides-k8s-reporter:latest"}
+---
+# Third-party images stay out of scope in fides too.
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-thirdparty, namespace: fides}
+spec:
+  containers:
+    - {name: a, image: "postgres:15-alpine"}
