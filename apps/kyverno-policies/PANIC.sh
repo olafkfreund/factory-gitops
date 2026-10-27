@@ -133,7 +133,7 @@ case "${1:-status}" in
   3)
     echo "level 3: auto-sync OFF, then delete the ClusterPolicy"
     k -n argocd patch application "$APP" --type=merge -p '{"spec":{"syncPolicy":{"automated":null}}}'
-    k delete clusterpolicy "$POLICY"
+    k delete clusterpolicy "$POLICY" "$COVERAGE"
     ;;
 
   restore)

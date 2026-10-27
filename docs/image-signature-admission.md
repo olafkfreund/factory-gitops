@@ -577,14 +577,18 @@ accumulated is that **nothing objected**, so the fix that matters is the one
 that makes the *next* unmatched first-party image fail on its own.
 
 `apps/kyverno-policies/manifests/require-first-party-signature-coverage.yaml`
-is a separate ClusterPolicy that reports any `ghcr.io/olafkfreund/*` image
-running in `factory` that no glob in `verify-factory-image-signatures` names.
+is a separate ClusterPolicy that, since Factory#3664, **denies** (Enforce) any
+`ghcr.io/olafkfreund/*` image in `factory` or `gateway` that no glob in
+`verify-factory-image-signatures` names. Digest references (`repo@sha256:…`,
+`repo:tag@sha256:…`) are normalised by Kyverno to `repo@sha256:…`, so every
+`<repo>:*` glob has a `<repo>@*` partner; `./PANIC.sh 1` returns both policies
+to Audit.
 
 Read its board as:
 
 | result | meaning |
 |--------|---------|
-| `fail` | a real coverage gap — this image is admitted with no signature check |
+| `fail` | a real coverage gap — the Pod is denied at admission (a background-scan `fail` is a Pod admitted before the policy, or while Kyverno was down) |
 | `skip` | this Pod was checked and has no uncovered first-party image |
 | `pass` | never emitted; this rule verifies nothing itself |
 

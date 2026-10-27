@@ -26,11 +26,12 @@ spec:
 P
   out=$($KY apply manifests/verify-factory-image-signatures.yaml --resource "$tmp/pod.yaml" 2>&1 || true)
   p=$(sed -n 's/.*pass: \([0-9]*\).*/\1/p' <<<"$out" | tail -1); f=$(sed -n 's/.*fail: \([0-9]*\).*/\1/p' <<<"$out" | tail -1)
-  p=${p:-0}; f=${f:-0}
-  if { [ "$3" = pass ] && [ "$p" -gt 0 ] && [ "$f" -eq 0 ]; } || { [ "$3" = fail ] && [ "$f" -gt 0 ]; }; then
-    echo "ok   $1 (pass=$p fail=$f)"
+  e=$(sed -n 's/.*error: \([0-9]*\).*/\1/p' <<<"$out" | tail -1)
+  p=${p:-0}; f=${f:-0}; e=${e:-0}
+  if { [ "$3" = pass ] && [ "$p" -gt 0 ] && [ "$f" -eq 0 ]; } || { [ "$3" = fail ] && [ "$f" -gt 0 ] && [ "$e" -eq 0 ]; }; then
+    echo "ok   $1 (pass=$p fail=$f error=$e)"
   else
-    echo "FAIL $1: wanted $3, got pass=$p fail=$f"; rc=1
+    echo "FAIL $1: wanted $3, got pass=$p fail=$f error=$e"; rc=1
   fi
 }
 

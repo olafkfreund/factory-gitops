@@ -8,7 +8,8 @@
 # Factory#3664: every first-party glob below is listed twice, `<repo>:*` and
 # `<repo>@*`. Kyverno normalises `repo:tag@sha256:x` to `repo@sha256:x` before
 # matching, so `:*` alone misses BOTH digest forms and they were admitted
-# unverified. Add both globs together; the agree script checks the pairing.
+# unverified. Add both globs together: the agree script does NOT check the pairing, and a
+# missing `@*` shows up only as denied digest-pinned Pods (coverage fails closed).
 #
 # Signer identity verified per repo:
 #   issuer  = https://token.actions.githubusercontent.com  (GitHub Actions OIDC)

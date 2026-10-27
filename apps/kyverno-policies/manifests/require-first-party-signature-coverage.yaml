@@ -192,10 +192,10 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: Pod
     policies.kyverno.io/description: >-
-      Reports any ghcr.io/olafkfreund image running in the `factory` namespace
-      that no verifyImages rule in verify-factory-image-signatures names, and
-      which is therefore admitted with no signature check and produces no
-      result there. ENFORCE (Factory#3664): such a Pod is denied.
+      Denies (Factory#3664) a Pod in `factory` or `gateway` carrying any
+      ghcr.io/olafkfreund image that no verifyImages rule in
+      verify-factory-image-signatures names, which would otherwise be admitted
+      with no signature check.
     # Pods only. See the note above: this rule wants one row per running Pod,
     # not the same finding repeated across Deployment, ReplicaSet and Pod.
     pod-policies.kyverno.io/autogen-controllers: none
@@ -210,10 +210,10 @@ spec:
   # real running Pod -- odin-dashboard, on ghcr.io/olafkfreund/odin:sha-2749b26
   # -- for as long as the gap was real, and stopped when the gap was closed.
   # That is a control objecting to a genuine workload and then falling silent
-  # for a reason, rather than one that has only ever been quiet. It is still not
-  # a denial, which is what #522 needs.
+  # for a reason, rather than one that has only ever been quiet. Factory#3664 made it
+  # a denial: the digest bypass showed that a reported gap is still admitted.
   validationFailureAction: Enforce
-  # If Kyverno is down, admit. This is a reporting control, not a gate.
+  # If Kyverno is down, admit, like verify-factory-image-signatures.
   failurePolicy: Ignore
   webhookTimeoutSeconds: 30
   # Factory#444's reasoning applies here too: without background scanning a

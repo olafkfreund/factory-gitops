@@ -92,3 +92,13 @@ All paths under `apps/kyverno-policies/`.
 ## Rollback
 
 `./PANIC.sh 1` (both policies → Audit, auto-sync off), then revert the PR.
+
+## Deviations from Opus review (PR #316)
+
+- `PANIC.sh` level 3 deletes both policies (level 1 already did both; level 2
+  only defangs the mutating webhook, unchanged).
+- `check-digest-forms.sh` requires `error: 0` on the unsigned cases, so a
+  network failure is not read as a deny.
+- Stale "reporting control" comments and `docs/image-signature-admission.md`
+  updated for Enforce. Fides-in-`factory`, non-aifactory-in-`gateway` and the
+  `Pod/ephemeralcontainers` subresource are recorded on Factory#3665.
