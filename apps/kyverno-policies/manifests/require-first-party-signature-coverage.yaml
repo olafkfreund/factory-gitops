@@ -226,7 +226,8 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              namespaces: [factory]
+              # Factory#1959: the model gateway runs the aifactory image in `gateway`.
+              namespaces: [factory, gateway]
       context:
         # Every image on the Pod -- containers, initContainers AND
         # ephemeralContainers -- that is first-party and is NOT named by any

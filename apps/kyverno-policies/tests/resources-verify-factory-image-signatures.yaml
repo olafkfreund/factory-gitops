@@ -134,7 +134,8 @@ spec:
     - {name: a, image: "postgres:16.4"}
     - {name: b, image: "quay.io/keycloak/keycloak:26.1"}
 ---
-# NAMESPACE SCOPE. Every rule matches `namespaces: [factory]` only. A covered
+# NAMESPACE SCOPE. Every rule matches `namespaces: [factory]` only (plus `gateway`
+# for verify-aifactory-signature, Factory#1959). A covered
 # image outside that namespace must produce nothing. If this turns red the
 # policy has grown a scope nobody agreed to -- and at Enforce (Factory#522)
 # that would put a Rekor round trip in front of Pods in other namespaces.
