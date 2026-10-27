@@ -235,7 +235,8 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              namespaces: [factory]
+              # Factory#1959: the model gateway runs this image in `gateway`.
+              namespaces: [factory, gateway]
       verifyImages:
         - imageReferences:
             - "ghcr.io/olafkfreund/aifactory:*"
