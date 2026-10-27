@@ -13,9 +13,11 @@ spec: spec/2026-10-27-3664-kyverno-digest-refs.md
   matching `imageReferences`; `<repo>:*` globs never match a digest reference.
 - Add `ghcr.io/olafkfreund/<repo>@*` beside every `<repo>:*` glob (ten repos).
   NOT `<repo>*` (widens into sibling repos). `-*` runner globs unchanged.
-- `require-first-party-signature-coverage` → Enforce (fail closed) in `factory`
-  only; selector `(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/`; mirror gains `<repo>@`
-  beside each `<repo>:`. gateway/fides fail-closed is a follow-up issue.
+- `require-first-party-signature-coverage` → Enforce (fail closed) in its
+  existing scope `[factory, gateway]` (deviation: the spec said `factory` only,
+  but #313 had already widened the policy to `gateway`; the only image there,
+  aifactory:sha-ec354c0-gateway, is covered and verified, so Enforce is safe); selector `(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/`; mirror gains `<repo>@`
+  beside each `<repo>:`. fides fail-closed and per-namespace mirrors are Factory#3665.
 - PANIC.sh level 1 sets both policies to Audit.
 - No network in the required gate; online form checks live in a script CI
   does not discover.
