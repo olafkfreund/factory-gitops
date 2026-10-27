@@ -559,7 +559,12 @@ spec:
             # AIFACTORY_PACK_WORKSPACE ON, the build Job MUST run sha-ccbd0ce — the
             # control plane (newTag) emits the writable-/work emptyDir manifest and
             # the build Job (this pin) unpacks + git-safes /work end-to-end.
-            - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-ccbd0ce" }
+            # Factory#3664 (2026-10-27): ccbd0ce has NO cosign signature, so a build
+            #   Job falling back to it would be denied by verify-aifactory-signature.
+            #   Repinned to the AIFACTORY_BUILD_IMAGE value below, a strict superset
+            #   of ccbd0ce (carries the #727 fixes). Kept, not dropped: without it the
+            #   fallback is DEFAULT_NIX_IMAGE, which cannot run the build entrypoint.
+            - { name: AIFACTORY_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-ec354c0-nix" }
             # FLIP #4 (round-4, 2026-06-21, post-#687) REVERTED — but #687 DID
             # work, the empty-worktree defect that reverted FLIP #3 is RESOLVED.
             # Proven live on aifactory-test, Job

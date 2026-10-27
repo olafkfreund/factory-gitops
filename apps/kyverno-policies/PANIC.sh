@@ -18,6 +18,11 @@
 #   ./PANIC.sh 3          delete the ClusterPolicy outright
 #   ./PANIC.sh restore    undo level 2 and re-enable ArgoCD auto-sync
 #
+# HOW YOU NOTICE (Factory#3664). A denial lands at Pod creation, not at Argo
+# sync: look for `FailedCreate` on ReplicaSets/Jobs/DaemonSets or a Deployment
+# stuck Progressing. Digest-pinned first-party Pods now also need ghcr.io and
+# Sigstore reachable at admission. See docs/image-signature-admission.md.
+#
 # LEVEL 1 IS THE ONE YOU WANT almost every time. Kyverno stays healthy, every
 # other policy keeps working, and the gate degrades to exactly the reporting
 # behaviour it had before the flip.
