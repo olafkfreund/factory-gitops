@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 3665
 repo-issue: olafkfreund/Factory#3665
 author: olafkfreund
