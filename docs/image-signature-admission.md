@@ -391,8 +391,8 @@ Two ArgoCD Applications, auto-discovered by `bootstrap/argocd-root-app.yaml`:
      `kyverno` namespace, Kyverno CRDs, and one ValidatingWebhookConfiguration.
 
 2. `apps/kyverno-policies/` — the `verify-factory-image-signatures`
-   **ClusterPolicy** (`verifyImages`), scoped to Pods in the `factory`
-   namespace.
+   **ClusterPolicy** (`verifyImages`), scoped to Pods in the `factory`,
+   `gateway`, `fides` and `fides-reporter` namespaces (per rule).
 
 ### The audit-mode policy
 
@@ -578,11 +578,28 @@ that makes the *next* unmatched first-party image fail on its own.
 
 `apps/kyverno-policies/manifests/require-first-party-signature-coverage.yaml`
 is a separate ClusterPolicy that, since Factory#3664, **denies** (Enforce) any
-`ghcr.io/olafkfreund/*` image in `factory` or `gateway` that no glob in
-`verify-factory-image-signatures` names. Digest references (`repo@sha256:…`,
+`ghcr.io/olafkfreund/*` image that no glob in `verify-factory-image-signatures`
+names **in that Pod's namespace** (Factory#3665, below). Digest references (`repo@sha256:…`,
 `repo:tag@sha256:…`) are normalised by Kyverno to `repo@sha256:…`, so every
 `<repo>:*` glob has a `<repo>@*` partner; `./PANIC.sh 1` returns both policies
 to Audit.
+
+**One rule and one mirror per namespace group (Factory#3665).** A repo counts as
+covered only where its verify rule actually runs:
+
+| rule | namespaces | covered repos |
+|------|------------|---------------|
+| `first-party-image-must-be-covered-by-a-signature-rule` | `factory` | every first-party repo with a verify rule in `factory`, including `aifactory`; not the fides images |
+| `first-party-image-must-be-covered-in-gateway` | `gateway` | `aifactory` only |
+| `first-party-image-must-be-covered-in-fides` | `fides`, `fides-reporter` | `fides-server`, `fides-k8s-reporter` only |
+
+One union list used to cover all of them, so `pfactory` or `odin` in `gateway`
+or `fides` passed as covered although no verify rule runs there. Each rule now
+carries its own list, and `assert-signature-lists-agree.py` compares each list
+with the globs of the verify rules that run in every namespace of that rule. It
+also fails when a namespace named by a verify rule has no coverage rule.
+Out of scope: `Pod/ephemeralcontainers` (`kubectl debug`; neither policy matches
+that subresource yet) and namespaces with no group (no catch-all rule yet).
 
 Read its board as:
 
@@ -641,8 +658,8 @@ digest pinning (Factory#573), not signature verification.
 
 #### When you add a rule, update the mirror in the same commit
 
-The coverage policy carries a regex mirroring the globs in
-`verify-factory-image-signatures`. It is duplication and it can drift.
+The coverage policy carries one regex per namespace group (above) mirroring the
+globs in `verify-factory-image-signatures`. It is duplication and it can drift.
 
 - A glob added **there** but not **here** produces a false `fail` for an image
   that is in fact covered. Noisy, self-correcting, someone investigates.
@@ -1629,7 +1646,8 @@ Residual risks, named rather than implied away:
 
 ## Notes
 
-- Scope is deliberately the `factory` namespace only. System namespaces
+- Scope is deliberately the four application namespaces (`factory`, `gateway`,
+  `fides`, `fides-reporter`) only. System namespaces
   (`kube-system`, `argocd`, `kyverno`, ...) are never subject to this policy.
 - `verifyDigest: false` / `mutateDigest: false` in the audit phase: we verify
   the signature but do not yet require digest-pinned references or rewrite tags
