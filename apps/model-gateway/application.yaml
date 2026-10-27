@@ -1,0 +1,31 @@
+# Model gateway, stage 0 (Factory#1959) — unconfigured: no env, no Secret, no
+# provider key. It serves /healthz and answers chat requests 503 until stage 1
+# configures an upstream.
+#
+# Own Application and namespace (`gateway`), not part of the `aifactory`
+# kustomization: the gateway is a separate trust boundary with its own
+# default-deny NetworkPolicies, and must sync/prune independently of the fleet.
+# It needs `gateway` in the verify-aifactory-signature scope (factory-gitops#313)
+# to be live before this app syncs.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: model-gateway
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/model-gateway/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gateway
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
