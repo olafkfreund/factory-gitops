@@ -96,18 +96,19 @@ metadata: {name: near-odin-exporter, namespace: factory}
 spec:
   containers: [{name: c, image: "ghcr.io/olafkfreund/odin-exporter:v1"}]
 ---
-# A DIGEST-PINNED first-party image is matched by none of these globs: they all
-# end in a literal `:`, and a digest reference has `@` there instead. This is
-# the same finding as `uncovered-digest-pinned` in resources.yaml, asserted
-# here against the policy that would have to do the verifying. It is a real
-# hole, not a test artefact: pin a factory Deployment to a digest today and its
-# signature stops being checked. Tracked by the coverage policy, which reports
-# exactly this Pod as uncovered.
+# Factory#3664: near-misses of the new `<repo>@*` globs. `aifactory-worker@...`
+# is a different repository, so neither digest form may match `aifactory@*`.
 apiVersion: v1
 kind: Pod
-metadata: {name: digest-pinned-first-party, namespace: factory}
+metadata: {name: near-aifactory-worker-digest, namespace: factory}
 spec:
-  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory-worker@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: near-aifactory-worker-tag-digest, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory-worker:v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
 ---
 # Another account's package with our repository name, on the same registry.
 # Verifying it against OUR signer identity would be wrong in both directions.

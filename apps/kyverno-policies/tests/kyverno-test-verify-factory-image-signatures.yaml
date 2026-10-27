@@ -159,7 +159,8 @@ results:
       - near-skillai-migrator-tools
       - near-miss-in-initcontainer
       - near-odin-exporter
-      - digest-pinned-first-party
+      - near-aifactory-worker-digest
+      - near-aifactory-worker-tag-digest
       - other-owner-same-name
       - other-registry-same-name
       - thirdparty-out-of-scope
