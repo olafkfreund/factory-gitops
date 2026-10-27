@@ -26,7 +26,13 @@ same commit and every channel is silent again.
 
 WHAT THIS ASSERTS, AND WHY EACH DIRECTION MATTERS
 
-  A. The glob set and the mirror alternation are the SAME set, after
+  A. Per namespace group (Factory#3665): each coverage rule's mirror alternation
+     equals the glob prefixes of the verify rules that run in EVERY namespace of
+     that rule (no `namespaces` on a verify rule = everywhere). One union list
+     let `pfactory` pass uncovered in `gateway`, where its verify rule does not
+     run. Every namespace a verify rule names must also be matched by some
+     coverage rule, or its images get no coverage check at all. The sets are the
+     SAME set, after
      normalising `ghcr.io/olafkfreund/X*` -> `X`. That normalisation is not a
      convenience: the coverage policy's own header states the correspondence
      ("the covered patterns end in a literal `:` where the rule they mirror
@@ -43,6 +49,8 @@ WHAT THIS ASSERTS, AND WHY EACH DIRECTION MATTERS
      catch a glob WIDENED to something like `ghcr.io/olafkfreund/*`, which
      manufactures coverage without any. Asserting it here means the canary's
      contract is checked in CI and not only in the six-hourly probe run.
+
+B and C below use the union of all globs.
 
 NO NETWORK. This is three text comparisons. The reason the obvious fix -- a
 positive `kyverno test` case on a matched image -- was declined twice (#149,
@@ -106,15 +114,31 @@ def die(msg):
 
 def globs():
     """The `imageReferences` globs, normalised to the literal prefix each names."""
-    raw = json.loads(
-        yq("[.spec.rules[].verifyImages[]?.imageReferences[]?] | tojson", SIGNATURES)
+    rules = json.loads(
+        yq(
+            '[.spec.rules[] | select(.verifyImages) | {"g": [.verifyImages[].imageReferences[]?],'
+            ' "n": ([(.match.any // [])[], (.match.all // [])[]] | map(.resources.namespaces))}]'
+            " | tojson",
+            SIGNATURES,
+        )
     )
+    raw = [g for r in rules for g in r["g"]]
     if not raw:
         die(
             f"no imageReferences glob found in {SIGNATURES} -- "
             "this check compared nothing (#181)"
         )
     prefixes = {}
+    scope = {}  # prefix -> set of namespaces it is verified in, None = everywhere
+    for r in rules:
+        # shortcut: `any` and `all` entries are unioned, and one entry without
+        # `namespaces` means everywhere; upgrade if a rule needs an intersection.
+        lists = r["n"]
+        ns = None if not lists or any(x is None for x in lists) else {n for x in lists for n in x}
+        for g in r["g"]:
+            p = g[len(REPO_PREFIX):-1]
+            old = scope.get(p, set())
+            scope[p] = None if ns is None or old is None else old | ns
     for g in raw:
         if not g.startswith(REPO_PREFIX):
             err(
@@ -136,33 +160,41 @@ def globs():
             )
             continue
         prefixes[tail[:-1]] = g
-    return prefixes
+    return prefixes, scope
 
 
 def mirror():
-    """The alternation inside require-first-party-signature-coverage's jmesPath."""
-    expr = yq(
-        '[.spec.rules[].context[]? | select(.name == "uncovered") | .variable.jmesPath] | .[]',
-        COVERAGE,
-    ).strip()
-    if not expr:
+    """Per coverage rule: (name, namespaces or None, set of covered entries)."""
+    rules = json.loads(
+        yq(
+            '[.spec.rules[] | select(.context[]? | .name == "uncovered") | {"name": .name,'
+            ' "ns": ([(.match.any // [])[], (.match.all // [])[]] | map(.resources.namespaces)),'
+            ' "expr": ([.context[] | select(.name == "uncovered") | .variable.jmesPath][0])}] | tojson',
+            COVERAGE,
+        )
+    )
+    if not rules:
         die(
             f"no `uncovered` context variable found in {COVERAGE} -- "
             "this check compared nothing (#181)"
         )
-    # The negative half: `[?!regex_match('^ghcr\.io/olafkfreund/(a|b|c)', @)]`
-    m = re.search(
-        r"!regex_match\('\^ghcr\\\.io/olafkfreund/\(([^)]*)\)'", expr
-    )
-    if not m:
-        die(
-            f"could not read the covered-image alternation out of {COVERAGE} -- "
-            "the jmesPath changed shape and this check can no longer compare it (#181)"
-        )
-    entries = [e for e in m.group(1).split("|") if e]
-    if not entries:
-        die(f"the covered-image alternation in {COVERAGE} is empty (#181)")
-    return set(entries)
+    out = []
+    for r in rules:
+        # The negative half: `[?!regex_match('^ghcr\.io/olafkfreund/(a|b|c)', @)]`
+        m = re.search(r"!regex_match\('\^ghcr\\\.io/olafkfreund/\(([^)]*)\)'", r["expr"])
+        if not m:
+            die(
+                f"could not read the covered-image alternation of rule {r['name']} out of "
+                f"{COVERAGE} -- the jmesPath changed shape and this check can no longer "
+                "compare it (#181)"
+            )
+        entries = {e for e in m.group(1).split("|") if e}
+        if not entries:
+            die(f"the covered-image alternation of rule {r['name']} in {COVERAGE} is empty (#181)")
+        lists = r["ns"]
+        ns = None if not lists or any(x is None for x in lists) else {n for x in lists for n in x}
+        out.append((r["name"], ns, entries))
+    return out
 
 
 def probe():
@@ -187,24 +219,37 @@ def main():
     if not os.path.exists(".git"):
         die("run this from the repository root")
 
-    prefixes = globs()
-    covered = mirror()
+    prefixes, scope = globs()
+    rules = mirror()
     images, canary = probe()
 
-    # A. glob set == mirror set.
-    for missing in sorted(covered - set(prefixes)):
-        err(
-            COVERAGE,
-            f"`{missing}` is in the coverage mirror but NO imageReferences glob in "
-            f"{SIGNATURES} names it -- this rule reports that image as covered when "
-            "admission never checks its signature (#181)",
-        )
-    for extra in sorted(set(prefixes) - covered):
-        err(
-            SIGNATURES,
-            f"glob `{prefixes[extra]}` has no `{extra}` entry in the coverage mirror "
-            f"in {COVERAGE} -- the two lists have drifted and one of them is lying (#181)",
-        )
+    # A. per group: mirror == prefixes verified in every namespace of the rule.
+    for name, ns, entries in rules:
+        want = {p for p, v in scope.items() if v is None or (ns is not None and ns <= v)}
+        for missing in sorted(entries - want):
+            err(
+                COVERAGE,
+                f"rule {name}: `{missing}` is in its mirror but no verify rule in "
+                f"{SIGNATURES} names it in every namespace this rule covers -- it would "
+                "be reported as covered where admission never checks its signature "
+                "(Factory#3665, #181)",
+            )
+        for extra in sorted(want - entries):
+            err(
+                COVERAGE,
+                f"rule {name}: `{extra}` is verified in every namespace this rule covers "
+                f"but is missing from its mirror -- live pods running it would be denied "
+                "(Factory#3665, #181)",
+            )
+    # A2. every namespace a verify rule names has a coverage rule.
+    if not any(ns is None for _, ns, _ in rules):
+        have = {n for _, ns, _ in rules for n in ns}
+        for n in sorted({n for v in scope.values() if v for n in v} - have):
+            err(
+                COVERAGE,
+                f"namespace `{n}` has a verify rule in {SIGNATURES} but no coverage rule "
+                "matches it -- its images get no coverage check (Factory#3665)",
+            )
 
     # B. every probed image is named by some glob.
     # ponytail: fnmatch, not Kyverno's globbing. These patterns are a literal
@@ -232,7 +277,7 @@ def main():
     if FAILED:
         return 1
     print(
-        f"ok  {len(prefixes)} signature glob(s) agree with the coverage mirror; "
+        f"ok  {len(prefixes)} signature glob(s) agree with {len(rules)} coverage mirror(s); "
         f"all {len(images)} probed image(s) are named by one; the canary is named by none"
     )
     return 0
