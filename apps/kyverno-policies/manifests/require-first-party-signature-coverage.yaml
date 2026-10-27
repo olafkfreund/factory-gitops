@@ -146,6 +146,13 @@
 # have drifted and one of the two is lying.
 #
 # ---------------------------------------------------------------------------
+# ONE MIRROR PER NAMESPACE GROUP (Factory#3665). A repo counts as covered only
+# where its verify rule actually runs: the aifactory verify rule is scoped to
+# `factory, gateway` and the fides rules to `fides, fides-reporter`, so a single
+# union list let `pfactory` in `gateway` or `fides` pass uncovered. The rules
+# below are `factory`, `gateway` and `fides` / `fides-reporter`, each with its
+# own list. Out of scope: Pod/ephemeralcontainers and namespaces with no group.
+#
 # THE COVERED LIST BELOW MIRRORS THE GLOBS IN verify-factory-image-signatures.
 # KEEP THEM IN STEP. Since #181 that is no longer a convention -- CI compares
 # the two lists (and the probe's) and fails when they disagree, because the
@@ -192,10 +199,11 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: Pod
     policies.kyverno.io/description: >-
-      Denies (Factory#3664) a Pod in `factory` or `gateway` carrying any
-      ghcr.io/olafkfreund image that no verifyImages rule in
-      verify-factory-image-signatures names, which would otherwise be admitted
-      with no signature check.
+      Denies (Factory#3664) a Pod carrying any ghcr.io/olafkfreund image that
+      no verifyImages rule in verify-factory-image-signatures names IN THAT
+      NAMESPACE (Factory#3665), which would otherwise be admitted with no
+      signature check. One rule per namespace group: `factory`, `gateway`,
+      and `fides` / `fides-reporter`.
     # Pods only. See the note above: this rule wants one row per running Pod,
     # not the same finding repeated across Deployment, ReplicaSet and Pod.
     pod-policies.kyverno.io/autogen-controllers: none
@@ -227,8 +235,8 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              # Factory#1959: the model gateway runs the aifactory image in `gateway`.
-              namespaces: [factory, gateway]
+              # Factory#3665: one rule per namespace group; see the header.
+              namespaces: [factory]
       context:
         # Every image on the Pod -- containers, initContainers AND
         # ephemeralContainers -- that is first-party and is NOT named by any
@@ -250,7 +258,79 @@ spec:
             jmesPath: >-
               request.object.spec.[containers, initContainers, ephemeralContainers][].image
               | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
-              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@|pfactory:|pfactory@|tfactory:|tfactory@|cfactory:|cfactory@|cfactory-frontend:|cfactory-frontend@|odin:|odin@|skillai:|skillai@|skillai-migrator:|skillai-migrator@|tfactory-runner-|factory-runner-|fides-server:|fides-server@|fides-k8s-reporter:|fides-k8s-reporter@)', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@|pfactory:|pfactory@|tfactory:|tfactory@|cfactory:|cfactory@|cfactory-frontend:|cfactory-frontend@|odin:|odin@|skillai:|skillai@|skillai-migrator:|skillai-migrator@|tfactory-runner-|factory-runner-)', @)]
+            # A Pod with no containers matching cannot produce a null here.
+            default: []
+      preconditions:
+        all:
+          - key: "{{ uncovered | length(@) }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          IMAGE COVERAGE GAP (Factory#564): {{ uncovered | join(', ', @) }}. This Pod is denied.
+          These are first-party ghcr.io/olafkfreund images that NO verifyImages
+          rule in verify-factory-image-signatures names, so admission never
+          checks their signature and they produce no pass and no fail there.
+          `required: true` on those rules means "a matched image must have a
+          signature"; it does not mean "every image must match a rule". The fix
+          is in this order and only this order -- add cosign signing plus an
+          anchored-identity verify self-test to the image's publishing workflow,
+          confirm it against the live registry, and only then add a rule with a
+          pinned subjectRegExp. A rule in front of an unsigned image produces
+          nothing but Audit noise. See docs/image-signature-admission.md.
+        deny: {}
+    - name: first-party-image-must-be-covered-in-gateway
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              # Factory#1959: the model gateway runs the aifactory image here, and only it.
+              namespaces: [gateway]
+      context:
+        # Same shape as the `factory` rule above; only the mirror differs (Factory#3665).
+        - name: uncovered
+          variable:
+            jmesPath: >-
+              request.object.spec.[containers, initContainers, ephemeralContainers][].image
+              | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@)', @)]
+            # A Pod with no containers matching cannot produce a null here.
+            default: []
+      preconditions:
+        all:
+          - key: "{{ uncovered | length(@) }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          IMAGE COVERAGE GAP (Factory#564): {{ uncovered | join(', ', @) }}. This Pod is denied.
+          These are first-party ghcr.io/olafkfreund images that NO verifyImages
+          rule in verify-factory-image-signatures names, so admission never
+          checks their signature and they produce no pass and no fail there.
+          `required: true` on those rules means "a matched image must have a
+          signature"; it does not mean "every image must match a rule". The fix
+          is in this order and only this order -- add cosign signing plus an
+          anchored-identity verify self-test to the image's publishing workflow,
+          confirm it against the live registry, and only then add a rule with a
+          pinned subjectRegExp. A rule in front of an unsigned image produces
+          nothing but Audit noise. See docs/image-signature-admission.md.
+        deny: {}
+    - name: first-party-image-must-be-covered-in-fides
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              # Factory#3665: fides runs only the two fides images; its verify rules apply in these namespaces.
+              namespaces: [fides, fides-reporter]
+      context:
+        # Same shape as the `factory` rule above; only the mirror differs (Factory#3665).
+        - name: uncovered
+          variable:
+            jmesPath: >-
+              request.object.spec.[containers, initContainers, ephemeralContainers][].image
+              | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(fides-server:|fides-server@|fides-k8s-reporter:|fides-k8s-reporter@)', @)]
             # A Pod with no containers matching cannot produce a null here.
             default: []
       preconditions:
