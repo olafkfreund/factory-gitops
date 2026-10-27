@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 3665
 intent: intent/2026-10-27-3665-per-namespace-coverage.md
 ---
