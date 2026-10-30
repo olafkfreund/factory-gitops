@@ -29,7 +29,7 @@ spec:
           # Immutable build tag, NOT tag@digest: Kyverno v1.18 does not match
           # `aifactory:<tag>@sha256:...` against the `aifactory:*` glob, so a
           # tag@digest Pod is admitted with no signature check (measured, #1959).
-          image: ghcr.io/olafkfreund/aifactory:sha-ec354c0-gateway
+          image: ghcr.io/olafkfreund/aifactory:sha-b985d79-gateway
           ports:
             - name: http
               containerPort: 8080
