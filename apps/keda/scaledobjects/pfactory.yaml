@@ -15,9 +15,9 @@ spec:
   scaleTargetRef:
     name: pfactory
   minReplicaCount: 1
-  # 2 first (#273); 4 only after a week at 2 with no anomalies. Must equal
+  # 2 first (#273), 4 after a week at 2 with no anomalies (#303). Must equal
   # PFACTORY_REPLICA_COUNT in apps/pfactory/manifests/manifests.yaml.
-  maxReplicaCount: 2
+  maxReplicaCount: 4
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:

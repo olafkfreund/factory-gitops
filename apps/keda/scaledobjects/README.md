@@ -57,7 +57,7 @@ path — once they are known-good.)
 
 | Service   | maxReplicaCount | Can scale >1 once Postgres lands? | Blocker for >1 |
 |-----------|-----------------|-----------------------------------|----------------|
-| pfactory  | 2 (#273; 4 after a week at 2) | Yes                  | none: shared Postgres state and the WS relay (PFactory#755, #804, #829, #905, #912) |
+| pfactory  | 4 (#273, #303) | Yes                  | none: shared Postgres state and the WS relay (PFactory#755, #804, #829, #905, #912) |
 | tfactory  | 4               | Yes                               | none (no WS fan-out) |
 | aifactory | **1** (capped)  | No — capped at 1                  | rmux WebSocket fan-out (`AIFACTORY_RMUX_ENABLED=true`, pod-local panes PVC) needs Redis pub/sub for multi-replica WS — out of scope for #192 |
 
