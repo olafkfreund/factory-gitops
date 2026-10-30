@@ -7,7 +7,7 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/aifactory
   newName: ghcr.io/olafkfreund/aifactory
-  newTag: sha-03a6fab
+  newTag: sha-b985d79
 # AIFactory#1737: the gate-image-prepull DaemonSet pulls exactly what the Jobs
 # run. Runs after `images:` above, so the -nix tag is not retagged.
 replacements:
