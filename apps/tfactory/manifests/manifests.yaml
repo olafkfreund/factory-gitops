@@ -778,6 +778,8 @@ spec:
             - { name: home-local, mountPath: /home/nonroot/.local }
           readinessProbe: { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 30, periodSeconds: 20 }
+          # Liveness waits until boot (migration lock wait up to 300s + migration) answers, at most 360s (factory-gitops#323).
+          startupProbe:   { httpGet: { path: /api/health, port: 3103 }, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 36 }
           resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 8Gi } }
       volumes:
         - { name: data,      persistentVolumeClaim: { claimName: tfactory-data } }

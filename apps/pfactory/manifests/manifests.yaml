@@ -443,6 +443,8 @@ spec:
           # continuous unresponsiveness — genuinely wedged, not merely loaded.
           readinessProbe: { httpGet: { path: /api/ready, port: 3114 }, initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3114 }, initialDelaySeconds: 30, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6 }
+          # Liveness waits until boot (migration lock wait up to 300s + migration) answers, at most 360s (factory-gitops#323).
+          startupProbe:   { httpGet: { path: /api/health, port: 3114 }, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 36 }
           # Hold the pod until /api/drain says no run is held (200), at most 1740s (factory-gitops#303).
           lifecycle: { preStop: { exec: { command: ["sh","-c","end=$(( $(date +%s) + 1740 )); while [ $(date +%s) -lt $end ]; do curl -fs --max-time 5 http://localhost:3114/api/drain >/dev/null && exit 0; sleep 10; done; exit 0"] } } }
           resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 8Gi } }
