@@ -79,9 +79,15 @@ spec:
             # nothing bounded it, so heap grew toward the limit and the non-heap
             # cost -- metaspace, code cache, direct buffers, GC overhead, and the
             # `start-dev` Quarkus augmentation below -- pushed the container past
-            # the cgroup ceiling. 65% leaves that headroom rather than raising
-            # the limit and moving the wall.
-            - { name: JAVA_OPTS_APPEND, value: "-XX:MaxRAMPercentage=65 -XX:InitialRAMPercentage=40" }
+            # the cgroup ceiling. Capping the heap leaves that headroom rather
+            # than raising the limit and moving the wall.
+            # 50% + a direct-memory cap, not 65% (Factory#3670): at 65% the pod
+            # still OOMKilled after ~81h with no java.lang.OutOfMemoryError in
+            # the log, so the heap never filled -- native memory crept past the
+            # 1.4Gi left beside a 2.6Gi heap. Direct buffers default to the heap
+            # size, so nothing bounded them. 2Gi heap still clears the start-dev
+            # augmentation peak (1.66Gi was the measured too-small floor).
+            - { name: JAVA_OPTS_APPEND, value: "-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=30 -XX:MaxDirectMemorySize=256m" }
           ports: [{ containerPort: 8080 }]
           volumeMounts: [{ name: data, mountPath: /opt/keycloak/data }]
           # startupProbe gates liveness/readiness during the slow Quarkus
