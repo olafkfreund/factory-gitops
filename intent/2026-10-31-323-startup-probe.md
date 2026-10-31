@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 323
 repo-issue: olafkfreund/factory-gitops#323
 author: olafkfreund
