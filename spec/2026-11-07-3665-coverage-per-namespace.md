@@ -42,18 +42,29 @@ the jmesPath already reads `ephemeralContainers`.
 Model namespaces instead of one flat set:
 
 - `globs()` returns, per signature rule, `(rule name, namespaces, {prefix: glob})`.
-  A rule whose match is not exactly `match.any[].resources` with non-empty
-  `namespaces`, or that has `exclude` or `preconditions`, is an error: the
-  script cannot say which namespaces it really covers.
+- One shared `scope(rule)` helper allow-lists the match shape for BOTH
+  policies' rules: `match` has only `any`; each `any[]` entry has only
+  `resources`; each `resources` has only `kinds: [Pod]` and non-empty
+  `namespaces`; the rule has no `exclude`. Signature rules may carry only
+  `name, match, verifyImages`; coverage rules only
+  `name, match, context, preconditions, validate`. Anything else (selectors,
+  `names`, `operations`, `namespaceSelector`, other kinds, rule-level
+  `preconditions` on a signature rule) is an error: the script cannot say
+  where such a rule really runs, so it must not claim coverage from it.
+- Glob prefixes and mirror entries must match `^[a-z0-9-]+[:@]?$`. That makes
+  the existing comment ("globs() refuses `?` or a character class") true, and
+  rules out `.` (regex-meaningful in the mirror, literal in the glob).
 - `mirror()` returns, per coverage rule that has an `uncovered` context,
   `(rule name, namespaces, alternation set)`, parsing each rule's jmesPath on
   its own (today it concatenates them and reads only the first match).
 - Assertion A becomes, for every coverage rule and every namespace `n` it
   matches: mirror == union of prefixes of signature rules whose namespaces
   contain `n`. Errors name the rule and the namespace.
-- New assertion D: every namespace any signature rule names is matched by
-  some coverage rule. Without it, adding a signature rule in a new namespace
-  silently leaves that namespace fail-open (the `fides` case in this issue).
+- New assertion D: every namespace in `REQUIRED_NAMESPACES = {factory,
+  gateway, fides, fides-reporter}` and every namespace any signature rule
+  names is matched by some coverage rule. The fixed floor means removing a
+  signature rule and its coverage rule together still goes red; the derived
+  part catches a signature rule added in a new namespace (the `fides` case).
 - B (probed images named by some glob) and C (canary named by none) keep
   using the union of all globs, unchanged.
 
@@ -68,7 +79,11 @@ Add Pods:
 - `gateway-covered-aifactory`, `fides-covered-server`,
   `fides-reporter-covered-reporter` → `skip` on their rules.
 - `uncovered-in-ephemeralcontainer` (factory, uncovered image only in
-  `ephemeralContainers`) → `fail`. Case 4 pin.
+  `ephemeralContainers`) → `fail`. This pins that the jmesPath reads the
+  field (and so the background scan of a debugged Pod fails). It does NOT
+  exercise subresource routing: that evidence is Kyverno's source and the live
+  webhook configs (intent, case 4), and it also covers the "covered but
+  unsigned" ephemeral image, which is `verifyImages`' job, not this rule's.
 
 ## Alternatives rejected
 
@@ -92,9 +107,11 @@ Add Pods:
   inventory on 2026-11-07 shows none (aifactory in gateway, fides-server in
   fides, fides-k8s-reporter in fides-reporter). `factory` loses only the
   fides entries; no fides image runs there. Rollback: `./PANIC.sh 1`.
-- `failurePolicy: Ignore` means a policy Kyverno rejects is not enforced and
-  ArgoCD keeps the old one (Factory#430). Mitigated by CI's `kyverno apply`
-  validation step and a local run with the v1.18.2 CLI.
+- A policy update Kyverno's validation rejects is never applied, and ArgoCD
+  keeps serving the previous version (Factory#430). Mitigated offline by CI's
+  `kyverno apply` validation step and a local v1.18.2 run; that is offline
+  evidence, not live acceptance, which is confirmed after merge by reading the
+  ClusterPolicy back (`kubectl get clusterpolicy ... -o yaml`, read-only).
 - YAML anchors: if any consumer did not resolve them, the rule would lose its
   validate block. Mitigated: CI's `kyverno apply`/`kyverno test` read the same
   file; a local `kyverno test` proves the anchored rules fire.
@@ -103,9 +120,10 @@ Add Pods:
 
 - `python3 apps/kyverno-policies/assert-signature-lists-agree.py` prints `ok`.
 - Mutation checks (not committed): drop `aifactory@` from the gateway mirror;
-  add `pfactory:` to it; remove the fides rule; scope a signature rule to a
-  new namespace — each must fail the script with a message naming rule and
-  namespace.
+  add `pfactory:` to it; remove the fides rule; remove both the fides
+  signature and coverage rules; scope a signature rule to a new namespace;
+  add a `selector` to a signature rule's match; add a `.` to a glob — each
+  must fail the script with a message naming rule and namespace.
 - `kyverno test apps/kyverno-policies/tests -f kyverno-test.yaml` with CLI
   v1.18.2: all old and new cases pass.
 - `kyverno apply` on the policy (CI's validation step) succeeds.
