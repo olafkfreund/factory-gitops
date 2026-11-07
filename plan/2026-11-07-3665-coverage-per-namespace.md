@@ -57,7 +57,10 @@ Kyverno v1.18.2 (cluster and CLI). CLI for local runs:
      signature rules scoped to those namespaces, and the agree script checks
      each pairing (Factory#3665). Do not rewrite other history in the header.
    → verify: `yq '.spec.rules[] | [.name, .match.any[0].resources.namespaces, .validate.message != null]' -o json <file>`
-     shows three rules each with a message; `kyverno apply <file> --resource apps/kyverno-policies/tests/resources.yaml` exits 0 without validation errors.
+     shows three rules each with a message; `kyverno apply <file> --resource <scratch pod: one busybox container in factory>`
+     reports `pass: 0, fail: 0, ... skip: 1` and no policy validation error
+     (a fixture that is meant to fail would make `apply` exit non-zero, so it
+     is not used to check that the policy loads).
    Traps: CI strips `webhookConfiguration.matchConditions` before CLI runs
    (none here). Keep `ghcr\.io` escaping exactly as today inside the folded
    `>-` scalar. Don't touch `verify-factory-image-signatures.yaml`.
@@ -69,7 +72,9 @@ Kyverno v1.18.2 (cluster and CLI). CLI for local runs:
      or reports `err` and returns None, allowing only: rule keys ⊆
      `allowed_keys`; `match` keys == {`any`}; each `any[]` keys == {`resources`};
      each `resources` keys == {`kinds`, `namespaces`}, `kinds == ["Pod"]`,
-     `namespaces` non-empty list of strings.
+     `namespaces` non-empty list of strings each matching `^[a-z0-9-]+$`
+     (Kyverno treats `*`/`?` in namespaces as wildcards; the checker compares
+     literal names, so it must refuse them).
    - `globs()` reads `.spec.rules` as JSON (one yq call), returns a list of
      `(name, namespaces, {prefix: glob})` for rules with `verifyImages`
      (allowed keys `name, match, verifyImages`); applies the existing
@@ -85,8 +90,10 @@ Kyverno v1.18.2 (cluster and CLI). CLI for local runs:
      `expected - covered` (drift), naming rule and namespace. D — every
      namespace in `REQUIRED_NAMESPACES ∪ (all signature namespaces)` is in some
      coverage rule's namespaces, else err. B/C on the union of all globs,
-     unchanged. Update the module docstring's "WHAT THIS ASSERTS" for A and D
-     and the ok line (count rules and namespaces).
+     unchanged. Update the module docstring's "WHAT THIS ASSERTS" for A and D,
+     state in THE CEILING that it compares lists only (that each rule actually
+     denies is proven by `kyverno test`, not here), and update the ok line
+     (count rules and namespaces).
    → verify: `python3 apps/kyverno-policies/assert-signature-lists-agree.py`
      from the repo root prints `ok ...` after step 1; before step 1 it must
      FAIL (gateway mirror claims pfactory etc.), proving the check bites.
@@ -113,7 +120,7 @@ Kyverno v1.18.2 (cluster and CLI). CLI for local runs:
      for `fides-covered-server`, `fides-reporter-covered-reporter`.
      One line of comment per new block citing Factory#3665.
    → verify: `kyverno test apps/kyverno-policies/tests -f kyverno-test.yaml`
-     passes every case, and the case count rose by 10.
+     passes every case, and the case count rose by 8.
    Traps: these tests never send the CLI to a registry (coverage rule only);
    do not add `verify-factory-image-signatures` to this suite. Existing
    resources must not change.
@@ -128,9 +135,13 @@ Kyverno v1.18.2 (cluster and CLI). CLI for local runs:
   coverage rule; delete fides signature + coverage rules; add
   `namespaces: [factory, newns]` to a signature rule; add
   `selector: {matchLabels: {a: b}}` to a signature rule's resources; rename a
-  glob to `ghcr.io/olafkfreund/a.b:*` → each prints `::error` and exits 1.
+  glob to `ghcr.io/olafkfreund/a.b:*`; set a coverage rule's namespaces to
+  `[fides*]` → each prints `::error` and exits 1.
+- Live (read-only, after merge, for the user): ephemeral-container admission is
+  evidenced by Kyverno source and webhook config, not exercised here.
 - `kyverno test` on every `apps/kyverno-policies/tests/kyverno-test*.yaml` → pass.
-- `kyverno apply` of both policy files against `tests/resources.yaml` → no validation error.
+- `kyverno apply` of both policy files against a scratch busybox-only Pod in
+  `factory` (third-party, so no registry call) → no policy validation error.
 - `python3 apps/kyverno-policies/assert-mutate-idempotent.py` if runnable → unchanged.
 
 ## Rollback
