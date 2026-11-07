@@ -328,6 +328,10 @@ spec:
             # limits={cpu: 2, memory: 4Gi, ephemeral-storage: 4Gi}, verified in
             # the running pod before this landed.
             - { name: APP_MAX_CONCURRENT_TASKS, value: "12" }
+            # Factory#1960: Agent-Identity / Autonomy-Tier / Originator trailers on
+            # factory commits and on the squash merge that reaches the base branch
+            # (AIFactory #1907, #1918). Off: commits byte-identical; unset to roll back.
+            - { name: AIFACTORY_AGENT_COMMIT_TRAILERS, value: "true" }
             # RFC-0016 #220/#673: durable shared state in Postgres (aifactory DB).
             # Replaces pod-local SQLite (~/.aifactory/data.db); init_db() runs
             # `alembic upgrade head` on boot (MIGRATIONS_AUTO_APPLY default true),
