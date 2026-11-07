@@ -70,6 +70,8 @@ REPO_PREFIX = "ghcr.io/olafkfreund/"
 REQUIRED_NAMESPACES = {"factory", "gateway", "fides", "fides-reporter"}
 PREFIX = re.compile(r"^[a-z0-9-]+[:@]?$")
 NAMESPACE = re.compile(r"^[a-z0-9-]+$")
+VERIFY_KEYS = {"imageReferences", "verifyDigest", "mutateDigest", "required",
+               "useCache", "attestors"}
 
 SIGNATURES = "apps/kyverno-policies/manifests/verify-factory-image-signatures.yaml"
 COVERAGE = "apps/kyverno-policies/manifests/require-first-party-signature-coverage.yaml"
@@ -152,6 +154,11 @@ def globs():
             continue
         prefixes = {}
         for verify in rule["verifyImages"]:
+            # A skip list or `required: false` would leave a mirrored image unchecked.
+            if not set(verify) <= VERIFY_KEYS or verify.get("required") is not True:
+                err(SIGNATURES, f"rule {rule.get('name')} has a verifyImages entry with "
+                    "unsupported keys or without `required: true` (#3665)")
+                continue
             for g in verify.get("imageReferences", []):
                 if not isinstance(g, str) or not g.startswith(REPO_PREFIX):
                     err(SIGNATURES, f"glob {g} is not under {REPO_PREFIX} (#181)")
@@ -183,7 +190,7 @@ def mirror():
         if namespaces is None:
             continue
         for context in uncovered:
-            expr = context.get("variable", {}).get("jmesPath", "")
+            expr = (context.get("variable") or {}).get("jmesPath", "")
             m = re.search(r"!regex_match\('\^ghcr\\\.io/olafkfreund/\(([^)]*)\)'", expr)
             if not m:
                 die(

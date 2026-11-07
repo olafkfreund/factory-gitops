@@ -79,6 +79,11 @@ Kyverno v1.18.2 (cluster and CLI). CLI for local runs:
      `(name, namespaces, {prefix: glob})` for rules with `verifyImages`
      (allowed keys `name, match, verifyImages`); applies the existing
      trailing-`*` check plus `PREFIX` to each prefix. Dies if no glob found.
+     Deviation (final Opus review): each `verifyImages[]` entry's keys must be
+     ⊆ {imageReferences, verifyDigest, mutateDigest, required, useCache,
+     attestors} and `required` must be `true`; otherwise `skipImageReferences`
+     or `required: false` would leave a mirrored image unchecked while the
+     script reads green.
    - `mirror()` reads `.spec.rules` as JSON, returns a list of
      `(name, namespaces, set)` for rules whose `context` has a variable named
      `uncovered` (allowed keys `name, match, context, preconditions, validate`),
