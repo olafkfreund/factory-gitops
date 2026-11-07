@@ -153,6 +153,10 @@
 #
 #   python3 apps/kyverno-policies/assert-signature-lists-agree.py
 #
+# There is one mirror per namespace group, each equal to the globs of the
+# signature rules scoped to those namespaces, and the agree script checks each
+# pairing (Factory#3665).
+#
 # When a rule is added there, add its glob here in the same
 # commit, or this rule will report a false gap for an image that is in fact
 # covered. Re-check the mirror against the live webhook with:
@@ -192,10 +196,10 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: Pod
     policies.kyverno.io/description: >-
-      Denies (Factory#3664) a Pod in `factory` or `gateway` carrying any
-      ghcr.io/olafkfreund image that no verifyImages rule in
-      verify-factory-image-signatures names, which would otherwise be admitted
-      with no signature check.
+      Denies (Factory#3664) a Pod in `factory`, `gateway`, `fides` or
+      `fides-reporter` carrying any ghcr.io/olafkfreund image that no
+      verifyImages rule in verify-factory-image-signatures running in that
+      namespace names, which would otherwise be admitted with no signature check.
     # Pods only. See the note above: this rule wants one row per running Pod,
     # not the same finding repeated across Deployment, ReplicaSet and Pod.
     pod-policies.kyverno.io/autogen-controllers: none
@@ -227,8 +231,8 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              # Factory#1959: the model gateway runs the aifactory image in `gateway`.
-              namespaces: [factory, gateway]
+              # Factory#3665: each rule mirrors only the signature rules scoped to its namespaces.
+              namespaces: [factory]
       context:
         # Every image on the Pod -- containers, initContainers AND
         # ephemeralContainers -- that is first-party and is NOT named by any
@@ -250,15 +254,15 @@ spec:
             jmesPath: >-
               request.object.spec.[containers, initContainers, ephemeralContainers][].image
               | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
-              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@|pfactory:|pfactory@|tfactory:|tfactory@|cfactory:|cfactory@|cfactory-frontend:|cfactory-frontend@|odin:|odin@|skillai:|skillai@|skillai-migrator:|skillai-migrator@|tfactory-runner-|factory-runner-|fides-server:|fides-server@|fides-k8s-reporter:|fides-k8s-reporter@)', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@|pfactory:|pfactory@|tfactory:|tfactory@|cfactory:|cfactory@|cfactory-frontend:|cfactory-frontend@|odin:|odin@|skillai:|skillai@|skillai-migrator:|skillai-migrator@|tfactory-runner-|factory-runner-)', @)]
             # A Pod with no containers matching cannot produce a null here.
             default: []
-      preconditions:
+      preconditions: &covered-preconditions
         all:
           - key: "{{ uncovered | length(@) }}"
             operator: GreaterThan
             value: 0
-      validate:
+      validate: &covered-validate
         message: >-
           IMAGE COVERAGE GAP (Factory#564): {{ uncovered | join(', ', @) }}. This Pod is denied.
           These are first-party ghcr.io/olafkfreund images that NO verifyImages
@@ -272,3 +276,35 @@ spec:
           pinned subjectRegExp. A rule in front of an unsigned image produces
           nothing but Audit noise. See docs/image-signature-admission.md.
         deny: {}
+    - name: first-party-image-must-be-covered-in-gateway
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [gateway]
+      context:
+        - name: uncovered
+          variable:
+            jmesPath: >-
+              request.object.spec.[containers, initContainers, ephemeralContainers][].image
+              | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@)', @)]
+            default: []
+      preconditions: *covered-preconditions
+      validate: *covered-validate
+    - name: first-party-image-must-be-covered-in-fides
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [fides, fides-reporter]
+      context:
+        - name: uncovered
+          variable:
+            jmesPath: >-
+              request.object.spec.[containers, initContainers, ephemeralContainers][].image
+              | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(fides-server:|fides-server@|fides-k8s-reporter:|fides-k8s-reporter@)', @)]
+            default: []
+      preconditions: *covered-preconditions
+      validate: *covered-validate
