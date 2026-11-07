@@ -91,23 +91,15 @@ Custody rules:
 
 ### Rotating the KEK
 
-Not a drop-in replace: existing objects have their data keys wrapped by the old
-KEK. To rotate you add a new key and re-wrap:
+`minio-kms` is **compromise-only**: MinIO's built-in single-key KMS mode cannot
+hold an old and a new KEK at the same time, so the previously documented
+in-place `mc cp` recipe is not a working rotation. On compromise, follow the
+untested emergency mirror-out / swap / mirror-back path in
+`secrets-management.md` [Rotation policy](secrets-management.md#rotation-policy).
 
-```bash
-# 1. Add a second key to MINIO_KMS_SECRET_KEY is NOT supported in single-key
-#    mode — instead run KES, or re-encrypt objects under a new default key:
-# 2. Seed a new KEK name (keep the old one available for decryption):
-#    update minio-kms to `factory-kek-2:<new base64 key>` ONLY after all objects
-#    are re-encrypted, otherwise old objects become unreadable.
-# 3. Re-encrypt in place by copying each object onto itself under the new key:
-mc cp --recursive --encrypt "sse-s3" fac/factory-artifacts/ fac/factory-artifacts/
-```
-
-For a small artifact store the copy-in-place re-encryption is fine. If the KEK
-inventory ever needs to grow (multiple named keys, automatic rotation), that is
-the point to graduate from the built-in KMS to a real KES + KMS backend —
-tracked as future work, not needed for the current gap.
+If the KEK inventory ever needs to grow (multiple named keys, automatic
+rotation), that is the point to graduate from the built-in KMS to a real KES +
+KMS backend — tracked as future work, not needed for the current gap.
 
 ### Verifying it is on
 
