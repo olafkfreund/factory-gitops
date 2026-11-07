@@ -47,7 +47,7 @@ All are namespace `factory` and seeded via agenix on p510 unless noted.
 |--------|------|-----------|----------------------------|
 | `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_JWT_SECRET, {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, CFACTORY_CREDENTIAL_KEY, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
 | `minio-creds` | S3_ACCESS_KEY, S3_SECRET_KEY | minio, minio bucket-init, pfactory, tfactory, aifactory, backups | Manual (agenix). Rotate = recreate + bounce minio and every consumer. |
-| `minio-kms` (new, this PR) | MINIO_KMS_SECRET_KEY | minio, minio bucket-init | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; rotation is re-encrypt, not drop-in. |
+| `minio-kms` (new, this PR) | MINIO_KMS_SECRET_KEY | minio, minio bucket-init | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; compromise-only rotation, see [Rotation policy](#rotation-policy). |
 | `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory (mounted) | AUTOMATIC — cred-broker CronJob (`apps/cred-broker`) refreshes the Claude OAuth token every 4h. Others manual. |
 | `factory-db-pfactory` | DATABASE_URL | pfactory | Manual (agenix). Derived from POSTGRES_PASSWORD; rotate together. |
 | `factory-db-tfactory` | DATABASE_URL | tfactory | Manual (agenix). As above. |
@@ -66,7 +66,7 @@ controllers, not the app-seeding path): `kedaorg-certs` (KEDA operator TLS),
 
 ### Observations from the inventory
 
-- `factory-secrets` is a **god-secret**: 16 keys, 6 consumers, one blast radius.
+- `factory-secrets` is a **god-secret**: 20+ keys, 6 consumers, one blast radius.
   A leak of any one key means recreating the whole Secret and bouncing six
   workloads. Splitting it is a natural follow-up but out of scope here.
 - `POSTGRES_PASSWORD` appears in three places that must stay in sync:
@@ -176,8 +176,8 @@ General shape for the manual (agenix) secrets:
   (pfactory/tfactory/aifactory/backups). MinIO root creds change = all clients
   must present the new key.
 
-- **minio-kms** (the KEK): NOT a plain rotation — re-encryption of existing
-  objects is required. See `docs/encryption-at-rest.md` "Rotating the KEK".
+- **minio-kms** (the KEK): compromise-only, never a plain swap — see the
+  emergency path in [Rotation policy](#rotation-policy).
 
 - **factory-cli-creds** (Claude OAuth): normally hands-off (cred-broker). Only
   needs a human when the refresh token is consumed/expired. Full procedure in

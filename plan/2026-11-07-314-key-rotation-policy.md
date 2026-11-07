@@ -112,6 +112,7 @@ just has no schedule.
 
 - Step 2 (review fix, codex): the MinIO emergency path now empties the buckets before mirroring back (`mc mirror` skips existing objects) and keeps the old KEK until verified. The proxy rows require rotating client-secret and cookie-secret together. Both edits are applied to the copied table above and to the doc.
 - Step 3: `--validate-only` is chosen via `env: EVENT` and a shell `if` instead of an inline expression (avoids expression injection lint). Added `concurrency` and `timeout-minutes: 5`.
+- Final-review fixes (Opus): the minio-kms inventory row and per-secret note now say compromise-only, the god-secret key count reads 20+, and the job name reflects the PR-only validation.
 
 ## Rollback
 
