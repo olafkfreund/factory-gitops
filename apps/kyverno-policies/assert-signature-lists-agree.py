@@ -26,13 +26,10 @@ same commit and every channel is silent again.
 
 WHAT THIS ASSERTS, AND WHY EACH DIRECTION MATTERS
 
-  A. The glob set and the mirror alternation are the SAME set, after
-     normalising `ghcr.io/olafkfreund/X*` -> `X`. That normalisation is not a
-     convenience: the coverage policy's own header states the correspondence
-     ("the covered patterns end in a literal `:` where the rule they mirror
-     ends in `:*`"), so `aifactory:*` <-> `aifactory:` and
-     `tfactory-runner-*` <-> `tfactory-runner-`. All three narrowings quoted
-     above break this equality and go red here.
+  A. Each coverage rule's mirror equals the signature globs that run in each
+     of its namespaces, after normalising `ghcr.io/olafkfreund/X*` -> `X`.
+     The coverage policy's header states the correspondence: `aifactory:*`
+     <-> `aifactory:` and `tfactory-runner-*` <-> `tfactory-runner-`.
 
   B. Every image the probe dry-runs is named by at least one glob. This is
      the half that survives "narrow the glob AND edit the mirror": the probe
@@ -44,16 +41,19 @@ WHAT THIS ASSERTS, AND WHY EACH DIRECTION MATTERS
      manufactures coverage without any. Asserting it here means the canary's
      contract is checked in CI and not only in the six-hourly probe run.
 
+  D. Every required namespace and every signature rule's namespace has a
+     coverage rule, so a removed mirror cannot silently escape A.
+
 NO NETWORK. This is three text comparisons. The reason the obvious fix -- a
 positive `kyverno test` case on a matched image -- was declined twice (#149,
 #148) is that a matched image reference sends the CLI to ghcr.io, putting a
 third-party registry inside a required status check. Nothing here resolves an
 image.
 
-THE CEILING, STATED SO NOBODY READS A GREEN TICK AS MORE THAN IT IS: a glob
-narrowed in all three copies in one commit passes. That is a deliberate,
-reviewable change and it should pass. What cannot happen any more is one copy
-moving on its own.
+THE CEILING, STATED SO NOBODY READS A GREEN TICK AS MORE THAN IT IS: this
+compares lists only; `kyverno test` proves that each rule actually denies.
+A glob narrowed in all three copies in one commit passes. That is a
+deliberate, reviewable change and it should pass.
 
 Run it directly -- `python3 apps/kyverno-policies/assert-signature-lists-agree.py`
 from the repo root -- it needs only yq and prints the same annotations CI does.
@@ -67,6 +67,9 @@ import subprocess
 import sys
 
 REPO_PREFIX = "ghcr.io/olafkfreund/"
+REQUIRED_NAMESPACES = {"factory", "gateway", "fides", "fides-reporter"}
+PREFIX = re.compile(r"^[a-z0-9-]+[:@]?$")
+NAMESPACE = re.compile(r"^[a-z0-9-]+$")
 
 SIGNATURES = "apps/kyverno-policies/manifests/verify-factory-image-signatures.yaml"
 COVERAGE = "apps/kyverno-policies/manifests/require-first-party-signature-coverage.yaml"
@@ -104,65 +107,96 @@ def die(msg):
     sys.exit(1)
 
 
+def scope(path, rule, allowed_keys):
+    """Return literal Pod namespaces only for the match shape this checker models."""
+    name = rule.get("name", "<unnamed>")
+    match = rule.get("match")
+    if (not set(rule) <= allowed_keys or not isinstance(match, dict)
+            or set(match) != {"any"}):
+        err(path, f"rule {name} has unsupported keys or match shape")
+        return None
+    clauses = match["any"]
+    if not isinstance(clauses, list) or not clauses:
+        err(path, f"rule {name} must have a non-empty match.any list")
+        return None
+    namespaces = set()
+    for clause in clauses:
+        if not isinstance(clause, dict) or set(clause) != {"resources"}:
+            err(path, f"rule {name} has an unsupported match.any entry")
+            return None
+        resources = clause["resources"]
+        if not isinstance(resources, dict) or set(resources) != {"kinds", "namespaces"}:
+            err(path, f"rule {name} has unsupported match.resources keys")
+            return None
+        values = resources["namespaces"]
+        if (resources["kinds"] != ["Pod"] or not isinstance(values, list)
+                or not values or any(
+                    not isinstance(n, str) or not NAMESPACE.fullmatch(n)
+                    for n in values
+                )):
+            err(path, f"rule {name} must match Pod and literal, non-empty namespaces")
+            return None
+        namespaces.update(values)
+    return namespaces
+
+
 def globs():
-    """The `imageReferences` globs, normalised to the literal prefix each names."""
-    raw = json.loads(
-        yq("[.spec.rules[].verifyImages[]?.imageReferences[]?] | tojson", SIGNATURES)
-    )
-    if not raw:
-        die(
-            f"no imageReferences glob found in {SIGNATURES} -- "
-            "this check compared nothing (#181)"
-        )
-    prefixes = {}
-    for g in raw:
-        if not g.startswith(REPO_PREFIX):
-            err(
-                SIGNATURES,
-                f"glob `{g}` is not under {REPO_PREFIX} -- this check only models "
-                "first-party globs and cannot speak about it (#181)",
-            )
+    """Signature rules with their namespaces and normalised glob prefixes."""
+    rules = json.loads(yq(".spec.rules | tojson", SIGNATURES))
+    found = []
+    for rule in rules:
+        if "verifyImages" not in rule:
             continue
-        tail = g[len(REPO_PREFIX):]
-        # Only a single trailing `*` is normalisable to a literal prefix. A `*`
-        # anywhere else would make the mirror comparison meaningless, and a
-        # comparison that silently means nothing is exactly #181.
-        if not tail.endswith("*") or "*" in tail[:-1]:
-            err(
-                SIGNATURES,
-                f"glob `{g}` does not have exactly one trailing `*` -- it cannot be "
-                "compared with the coverage mirror, so adding it would make this "
-                "check silent about it (#181)",
-            )
+        namespaces = scope(SIGNATURES, rule, {"name", "match", "verifyImages"})
+        if namespaces is None:
             continue
-        prefixes[tail[:-1]] = g
-    return prefixes
+        prefixes = {}
+        for verify in rule["verifyImages"]:
+            for g in verify.get("imageReferences", []):
+                if not isinstance(g, str) or not g.startswith(REPO_PREFIX):
+                    err(SIGNATURES, f"glob {g} is not under {REPO_PREFIX} (#181)")
+                    continue
+                tail = g[len(REPO_PREFIX):]
+                if (not tail.endswith("*") or "*" in tail[:-1]
+                        or not PREFIX.fullmatch(tail[:-1])):
+                    err(SIGNATURES, f"glob {g} is not a literal prefix with one trailing * (#181)")
+                    continue
+                prefixes[tail[:-1]] = g
+        found.append((rule.get("name", "<unnamed>"), namespaces, prefixes))
+    if not any(prefixes for _, _, prefixes in found):
+        die(f"no imageReferences glob found in {SIGNATURES} -- this check compared nothing (#181)")
+    return found
 
 
 def mirror():
-    """The alternation inside require-first-party-signature-coverage's jmesPath."""
-    expr = yq(
-        '[.spec.rules[].context[]? | select(.name == "uncovered") | .variable.jmesPath] | .[]',
-        COVERAGE,
-    ).strip()
-    if not expr:
-        die(
-            f"no `uncovered` context variable found in {COVERAGE} -- "
-            "this check compared nothing (#181)"
+    """Coverage rules with their namespaces and mirror alternations."""
+    rules = json.loads(yq(".spec.rules | tojson", COVERAGE))
+    found = []
+    for rule in rules:
+        contexts = rule.get("context") or []
+        uncovered = [c for c in contexts if c.get("name") == "uncovered"]
+        if not uncovered:
+            continue
+        namespaces = scope(
+            COVERAGE, rule, {"name", "match", "context", "preconditions", "validate"}
         )
-    # The negative half: `[?!regex_match('^ghcr\.io/olafkfreund/(a|b|c)', @)]`
-    m = re.search(
-        r"!regex_match\('\^ghcr\\\.io/olafkfreund/\(([^)]*)\)'", expr
-    )
-    if not m:
-        die(
-            f"could not read the covered-image alternation out of {COVERAGE} -- "
-            "the jmesPath changed shape and this check can no longer compare it (#181)"
-        )
-    entries = [e for e in m.group(1).split("|") if e]
-    if not entries:
-        die(f"the covered-image alternation in {COVERAGE} is empty (#181)")
-    return set(entries)
+        if namespaces is None:
+            continue
+        for context in uncovered:
+            expr = context.get("variable", {}).get("jmesPath", "")
+            m = re.search(r"!regex_match\('\^ghcr\\\.io/olafkfreund/\(([^)]*)\)'", expr)
+            if not m:
+                die(
+                    f"could not read the covered-image alternation in rule "
+                    f"{rule['name']} of {COVERAGE} (#181)"
+                )
+            entries = m.group(1).split("|")
+            if any(not PREFIX.fullmatch(e) for e in entries):
+                err(COVERAGE, f"rule {rule['name']} has an invalid covered-image prefix")
+            found.append((rule["name"], namespaces, set(entries)))
+    if not found:
+        die(f"no uncovered context variable found in {COVERAGE} -- this check compared nothing (#181)")
+    return found
 
 
 def probe():
@@ -187,24 +221,31 @@ def main():
     if not os.path.exists(".git"):
         die("run this from the repository root")
 
-    prefixes = globs()
-    covered = mirror()
+    signatures = globs()
+    coverage = mirror()
     images, canary = probe()
+    prefixes = {prefix: glob for _, _, rule_globs in signatures
+                for prefix, glob in rule_globs.items()}
 
-    # A. glob set == mirror set.
-    for missing in sorted(covered - set(prefixes)):
-        err(
-            COVERAGE,
-            f"`{missing}` is in the coverage mirror but NO imageReferences glob in "
-            f"{SIGNATURES} names it -- this rule reports that image as covered when "
-            "admission never checks its signature (#181)",
-        )
-    for extra in sorted(set(prefixes) - covered):
-        err(
-            SIGNATURES,
-            f"glob `{prefixes[extra]}` has no `{extra}` entry in the coverage mirror "
-            f"in {COVERAGE} -- the two lists have drifted and one of them is lying (#181)",
-        )
+    # A. each mirror matches the signature rules running in its namespaces.
+    for name, namespaces, covered in coverage:
+        for namespace in sorted(namespaces):
+            expected = {prefix for _, scoped, rule_globs in signatures
+                        if namespace in scoped for prefix in rule_globs}
+            for missing in sorted(covered - expected):
+                err(COVERAGE, f"rule {name} in namespace {namespace} mirrors {missing} "
+                    "but admission has no signature glob for it (#181)")
+            for extra in sorted(expected - covered):
+                err(COVERAGE, f"rule {name} in namespace {namespace} is missing "
+                    f"{extra} from the signature globs (#181)")
+
+    # D. a missing coverage rule must not make A vacuously true.
+    signature_namespaces = set().union(*(scoped for _, scoped, _ in signatures))
+    coverage_namespaces = set().union(*(scoped for _, scoped, _ in coverage))
+    for namespace in sorted(
+        (REQUIRED_NAMESPACES | signature_namespaces) - coverage_namespaces
+    ):
+        err(COVERAGE, f"namespace {namespace} has no coverage rule (#3665)")
 
     # B. every probed image is named by some glob.
     # ponytail: fnmatch, not Kyverno's globbing. These patterns are a literal
@@ -232,7 +273,8 @@ def main():
     if FAILED:
         return 1
     print(
-        f"ok  {len(prefixes)} signature glob(s) agree with the coverage mirror; "
+        f"ok  {len(prefixes)} signature glob(s), {len(signatures)} signature rule(s), "
+        f"{len(coverage)} coverage rule(s), {len(coverage_namespaces)} namespace(s) agree; "
         f"all {len(images)} probed image(s) are named by one; the canary is named by none"
     )
     return 0
