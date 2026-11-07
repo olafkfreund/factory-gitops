@@ -176,3 +176,53 @@ spec:
   containers:
     - {name: a, image: "ghcr.io/someoneelse/odin:v1"}
     - {name: b, image: "docker.io/olafkfreund/odin:v1"}
+---
+# Factory#3665: per-namespace coverage rules and ephemeralContainers coverage.
+apiVersion: v1
+kind: Pod
+metadata: {name: gateway-uncovered-pfactory, namespace: gateway}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/pfactory@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: factory-uncovered-fides-server, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/fides-server@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-uncovered-aifactory, namespace: fides}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:sha-1234567"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-reporter-uncovered-port443, namespace: fides-reporter}
+spec:
+  containers: [{name: c, image: "ghcr.io:443/olafkfreund/fides-k8s-reporter:latest"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: gateway-covered-aifactory, namespace: gateway}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory:sha-1234567"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-covered-server, namespace: fides}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/fides-server:a7f0738a98c185cecd42c647045c8beade1643ac"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: fides-reporter-covered-reporter, namespace: fides-reporter}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/fides-k8s-reporter:latest"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-in-ephemeralcontainer, namespace: factory}
+spec:
+  containers: [{name: c, image: "busybox:1.36"}]
+  ephemeralContainers: [{name: debug, image: "ghcr.io/olafkfreund/not-a-rule:1"}]

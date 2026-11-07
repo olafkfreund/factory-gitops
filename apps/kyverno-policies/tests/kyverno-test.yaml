@@ -60,3 +60,41 @@ results:
       - covered-skillai-both
       - thirdparty-out-of-scope
       - lookalikes-not-ours
+  # Factory#3665: factory mirror excludes fides-* and catches ephemeralContainers
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-by-a-signature-rule
+    kind: Pod
+    result: fail
+    resources:
+      - factory-uncovered-fides-server
+      - uncovered-in-ephemeralcontainer
+  # Factory#3665: gateway mirror rejects non-gateway images
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-gateway
+    kind: Pod
+    result: fail
+    resources:
+      - gateway-uncovered-pfactory
+  # Factory#3665: gateway mirror skips covered gateway images
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-gateway
+    kind: Pod
+    result: skip
+    resources:
+      - gateway-covered-aifactory
+  # Factory#3665: fides mirror rejects non-fides images and port-qualified registry
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-fides
+    kind: Pod
+    result: fail
+    resources:
+      - fides-uncovered-aifactory
+      - fides-reporter-uncovered-port443
+  # Factory#3665: fides mirror skips covered fides and fides-reporter images
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-fides
+    kind: Pod
+    result: skip
+    resources:
+      - fides-covered-server
+      - fides-reporter-covered-reporter
