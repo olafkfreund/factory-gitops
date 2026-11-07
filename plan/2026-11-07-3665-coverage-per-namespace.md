@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: olafkfreund/Factory#3665
 spec: spec/2026-11-07-3665-coverage-per-namespace.md
 coders:
