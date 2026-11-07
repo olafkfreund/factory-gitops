@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 314
 spec: spec/2026-11-07-314-key-rotation-policy.md
 coders:
