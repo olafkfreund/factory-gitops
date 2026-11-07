@@ -13,7 +13,9 @@ that needs one (`apps/minio`, `apps/postgres`, `apps/cfactory-auth`,
 
 1. The plaintext value lives in **agenix** in the nixos_config repo, edited on
    p510 with `scripts/manage-secrets.sh edit <name>`. agenix encrypts it to the
-   host's age key; the ciphertext (`*.age`) is what is committed to nixos_config.
+   recipient set (one user key plus the p510 and p620 host keys — see
+   [Decryption-key custody](#decryption-key-custody)); the ciphertext (`*.age`)
+   is what is committed to nixos_config.
 2. On cluster bootstrap, a script on p510 decrypts the agenix secret and runs
    `kubectl create secret ...` to materialise it in etcd.
 3. From then on the Secret lives only in etcd (base64, **not encrypted** — see
@@ -21,8 +23,9 @@ that needs one (`apps/minio`, `apps/postgres`, `apps/cfactory-auth`,
 
 Correcting the record: there is **no SOPS and no sealed-secrets** in this repo
 today, despite claims elsewhere in the program. The real mechanism is agenix
-(host key) + out-of-band `kubectl create secret`. This doc is written against
-that reality.
+(encrypted to the recipient set: one user key plus the p510 and p620 host keys;
+see [Decryption-key custody](#decryption-key-custody)) + out-of-band
+`kubectl create secret`. This doc is written against that reality.
 
 Consequences:
 
@@ -32,7 +35,8 @@ Consequences:
   whose key drifts from what a consumer expects fails silently (this exact class
   of bug bit the KEDA scaler — see `apps/keda/scaledobjects/triggerauthentication.yaml`).
 - Only **one** secret rotates automatically (the Claude OAuth cred, via the
-  cred-broker CronJob). Everything else is manual.
+  cred-broker CronJob). Everything else is manual, on the schedule in
+  [Rotation policy](#rotation-policy).
 
 ## Inventory
 
@@ -41,7 +45,7 @@ All are namespace `factory` and seeded via agenix on p510 unless noted.
 
 | Secret | Keys | Consumers | Rotation owner / mechanism |
 |--------|------|-----------|----------------------------|
-| `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
+| `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_JWT_SECRET, {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, CFACTORY_CREDENTIAL_KEY, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
 | `minio-creds` | S3_ACCESS_KEY, S3_SECRET_KEY | minio, minio bucket-init, pfactory, tfactory, aifactory, backups | Manual (agenix). Rotate = recreate + bounce minio and every consumer. |
 | `minio-kms` (new, this PR) | MINIO_KMS_SECRET_KEY | minio, minio bucket-init | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; rotation is re-encrypt, not drop-in. |
 | `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory (mounted) | AUTOMATIC — cred-broker CronJob (`apps/cred-broker`) refreshes the Claude OAuth token every 4h. Others manual. |
@@ -181,6 +185,112 @@ General shape for the manual (agenix) secrets:
 
 - **oauth2-proxy-\*** cookie-secret: must be a 16/24/32-byte value; regenerate
   with `openssl rand -base64 32 | head -c 32`, then restart the proxy.
+
+## Rotation policy
+
+| Class | Credentials | Max age | How it rotates |
+|---|---|---|---|
+| JWT signing secrets | `{P,T,AI}FACTORY_JWT_SECRET` | 365d | Plain swap and bounce. Every session in that service is logged out. |
+| External API keys/tokens | `GITHUB_TOKEN`, `OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `GEMINI_API_KEY`, `CONTEXT7_KEY`, `LANGCHAIN_API_KEY`, `RAPIDAPI_KEY`, `OLLAMA_API_KEY`, `ghcr-pull` | 365d, or the provider's expiry if sooner | Swap, bounce, then revoke the old key at the provider. |
+| Shared service tokens | `APP_API_TOKEN`, `CFACTORY_READ_KEY`, `cfactory-api-keys` | 365d | Shared by several callers and verifiers (e.g. `APP_API_TOKEN` across all three factories). Find every consumer with `grep -rn <KEY> apps/`, swap the token in all of them in one window, then bounce. |
+| OIDC client secrets | `{P,T,AI}FACTORY_OIDC_CLIENT_SECRET`, `oauth2-proxy-*` client-secret | 365d | Regenerate in Keycloak (the issuer) first, then swap and bounce. |
+| Proxy cookie secrets | `oauth2-proxy-*` cookie-secret | 365d | Swap and bounce. Every proxy session is logged out. |
+| Outbound auth to another system | `otel-otlp-auth`, `observe-root` | 365d | Change the credential on the receiving service first, then swap and bounce. |
+| SSH identity | `odin-ssh-key` | 365d | Generate a new key pair, authorize the new public key at the destination, swap and bounce, then remove the old public key at the destination. |
+| DB / object-store creds | `POSTGRES_PASSWORD` + the three `factory-db-*` (one atomic group), `minio-creds` | 365d | Existing per-secret runbook. |
+| HMAC keys | `AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY` | 365d | Swap on both pfactory and aifactory in one window. |
+| HMAC keys | `CFACTORY_AUDIT_HMAC_SECRET` | **compromise only** | The audit chain is HMAC'd with one unkeyed secret (`CFactory/apps/backend/cfactory/config.py`), so a swap makes every earlier entry unverifiable. Scheduled rotation waits on a key-id'd chain (follow-up, not here). |
+| Asymmetric signing | `PFACTORY_CONTRACT_SIGNING_KEY__<KID>` | 365d | **New kid, never overwrite.** Order: (1) add the new seed to `factory-secrets` under the new kid; (2) deploy the new pubkey `TFACTORY_CONTRACT_PUBKEY_PFACTORY__<NEW>` to the verifier, next to the old one; (3) point pfactory's env at the new seed and `PFACTORY_CONTRACT_SIGNING_KID` (a manifest PR); (4) confirm a new contract verifies; (5) delete the old seed. Keep the old pubkey while any contract signed with it may still need verifying. |
+| Data-encryption roots | `KMS_FERNET_KEY` (aifactory) | 365d | Envelope: `python -m server.crypto rotate-root` with `KMS_FERNET_KEY_NEW` set re-wraps the data keys, then the env is flipped (AIFactory `server/crypto/__main__.py`). |
+| Data-encryption roots | `CFACTORY_CREDENTIAL_KEY` | 365d | Multi-key: prepend `<new-id>:<key>,`, keeping old ids listed until records are re-wrapped (`cfactory/config.py`). |
+| Data-encryption roots | `minio-kms` KEK | **compromise only** | Single-key mode can't hold old and new at once (`docs/encryption-at-rest.md`), so there's no scheduled rotation until KES. On compromise, the emergency path (untested, needs downtime): stop writers, `mc mirror` both buckets out to a local plaintext copy while the old KEK is live, swap `minio-kms` and restart MinIO, mirror back so every object is re-encrypted under the new KEK, verify, then shred the copy. Listed as an operational dependency, not a rehearsed procedure. |
+| Claude OAuth | `factory-cli-creds`, `CLAUDE_CODE_OAUTH_TOKEN` | n/a | Automated by cred-broker. Referenced only; unchanged. |
+
+Triggers that force an immediate rotation, whatever the age: suspected or
+confirmed leak (including a value seen in a log, an annotation or a
+`last-applied-configuration`); compromise or decommission of an agenix
+recipient that could decrypt it (see [Decryption-key custody](#decryption-key-custody));
+departure of anyone who held it; a provider notice. A compromise-only row still
+rotates on these triggers. It just has no schedule.
+
+## Rotation ledger
+
+Each row below is one rotation unit (an individual key in `factory-secrets`, a
+standalone Secret such as `oauth2-proxy-*`, or an atomic group rotated together
+like `POSTGRES_PASSWORD + factory-db-*`). Rows with `Last rotated` set to
+`unknown` are measured from the policy start date (`2026-11-07`). A row's
+deadline is `(Last rotated, or 2026-11-07 for unknown) + Max age`, or `Expires`
+if earlier; it is overdue when `today > deadline` (`none` means compromise-only,
+no scheduled deadline unless `Expires` is set). Update the row in the same
+change window as the rotation; removing a row needs a PR that says why. Checked
+weekly by `.github/workflows/secret-rotation-due.yml` via
+`scripts/rotation-ledger-check.py`.
+
+<!-- rotation-ledger:start -->
+| Credential | Max age (days) | Last rotated | Expires |
+| --- | --- | --- | --- |
+| `PFACTORY_JWT_SECRET` | 365 | unknown | - |
+| `TFACTORY_JWT_SECRET` | 365 | unknown | - |
+| `AIFACTORY_JWT_SECRET` | 365 | unknown | - |
+| `GITHUB_TOKEN` | 365 | unknown | - |
+| `OPENAI_API_KEY` | 365 | unknown | - |
+| `OPENAI_COMPATIBLE_API_KEY` | 365 | unknown | - |
+| `GEMINI_API_KEY` | 365 | unknown | - |
+| `CONTEXT7_KEY` | 365 | unknown | - |
+| `LANGCHAIN_API_KEY` | 365 | unknown | - |
+| `RAPIDAPI_KEY` | 365 | unknown | - |
+| `OLLAMA_API_KEY` | 365 | unknown | - |
+| `ghcr-pull` | 365 | unknown | - |
+| `APP_API_TOKEN` | 365 | unknown | - |
+| `CFACTORY_READ_KEY` | 365 | unknown | - |
+| `cfactory-api-keys` | 365 | unknown | - |
+| `PFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
+| `TFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
+| `AIFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
+| `oauth2-proxy-cfactory` | 365 | unknown | - |
+| `oauth2-proxy-observe` | 365 | unknown | - |
+| `oauth2-proxy-odin` | 365 | unknown | - |
+| `observe-root` | 365 | unknown | - |
+| `otel-otlp-auth` | 365 | unknown | - |
+| `odin-ssh-key` | 365 | unknown | - |
+| `POSTGRES_PASSWORD + factory-db-*` | 365 | unknown | - |
+| `minio-creds` | 365 | unknown | - |
+| `AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY` | 365 | unknown | - |
+| `PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10` | 365 | unknown | - |
+| `KMS_FERNET_KEY` | 365 | unknown | - |
+| `CFACTORY_CREDENTIAL_KEY` | 365 | unknown | - |
+| `CFACTORY_AUDIT_HMAC_SECRET` | none | unknown | - |
+| `minio-kms` | none | unknown | - |
+<!-- rotation-ledger:end -->
+
+## Decryption-key custody
+
+Secrets in `nixos_config` are encrypted with agenix to the recipient set
+`allUsers ++ [ p510 p620 ]` (one user key plus two host keys). No key material
+or fingerprints belong in this repo.
+
+- **p510 identities:** the operator user SSH key (`~/.ssh/id_ed25519`) plus the
+  host ed25519 and RSA keys (`/etc/ssh/ssh_host_*_key`).
+- **p620 identities:** host SSH keys only.
+- **Loss of one identity:** recoverable as long as any remaining recipient key
+  survives — update `secrets.nix` and re-key with `agenix -r`.
+- **Loss of all identities:** before any cluster rebuild, a recovery window
+  remains through the live Kubernetes Secrets still present in etcd
+  (`kubectl --context factory -n factory get secret ... -o yaml`), which can be
+  used to re-seed agenix under new recipient keys. If that window closes, every
+  `factory-secret-*.age` is unreadable and the MinIO KEK, and with it every
+  encrypted object, is gone.
+- **Compromise of an identity:** remove the compromised recipient from
+  `secrets.nix`, run `agenix -r`, **and** rotate every secret value that
+  recipient could ever decrypt. Re-keying alone is not enough because git
+  history in `nixos_config` retains the old ciphertext.
+- **Identity rotation:** recipient keys rotate on immediate-rotation triggers,
+  host reinstall, or host decommission, with no fixed schedule.
+- **Offline backup:** keep an offline backup of at least one decrypting identity
+  outside the cluster hosts. This repo cannot verify that one exists; the
+  operator must confirm it.
+- **MinIO KEK (`minio-kms`):** for object-encryption KEK custody and limits, see
+  [`docs/encryption-at-rest.md`](encryption-at-rest.md#key-custody-the-kek).
 
 ## Re-seeding the Claude OAuth credential
 
