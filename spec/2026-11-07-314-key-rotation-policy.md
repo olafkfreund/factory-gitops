@@ -13,21 +13,25 @@ Everything lands in factory-gitops. No manifest, Secret or nixos_config change.
 ### 1. Rotation policy (`docs/secrets-management.md`, new section "Rotation policy")
 
 One table, one row per class. Every class gets the same scheduled maximum age,
-**365 days**, unless its row says otherwise. One number to remember, and it
-matches the common annual ISO/SOC 2 control expectation.
+**365 days**, unless its row says otherwise. It's the operator's policy choice:
+one number to remember, reviewed when a regulated tenant arrives.
 
 | Class | Credentials | Max age | How it rotates |
 |---|---|---|---|
 | JWT signing secrets | `{P,T,AI}FACTORY_JWT_SECRET` | 365d | Plain swap and bounce. Every session in that service is logged out. |
 | External API keys/tokens | `GITHUB_TOKEN`, `OPENAI_API_KEY`, `OPENAI_COMPATIBLE_API_KEY`, `GEMINI_API_KEY`, `CONTEXT7_KEY`, `LANGCHAIN_API_KEY`, `RAPIDAPI_KEY`, `OLLAMA_API_KEY`, `ghcr-pull` | 365d, or the provider's expiry if sooner | Swap, bounce, then revoke the old key at the provider. |
-| Internal API keys / OIDC / proxy | `APP_API_TOKEN`, `CFACTORY_READ_KEY`, `cfactory-api-keys`, `{P,T,AI}FACTORY_OIDC_CLIENT_SECRET`, `oauth2-proxy-*`, `observe-root`, `otel-otlp-auth`, `odin-ssh-key` | 365d | Swap and bounce. For OIDC client secrets, regenerate in Keycloak first. |
+| Shared service tokens | `APP_API_TOKEN`, `CFACTORY_READ_KEY`, `cfactory-api-keys` | 365d | Shared by several callers and verifiers (e.g. `APP_API_TOKEN` across all three factories). Find every consumer with `grep -rn <KEY> apps/`, swap the token in all of them in one window, then bounce. |
+| OIDC client secrets | `{P,T,AI}FACTORY_OIDC_CLIENT_SECRET`, `oauth2-proxy-*` client-secret | 365d | Regenerate in Keycloak (the issuer) first, then swap and bounce. |
+| Proxy cookie secrets | `oauth2-proxy-*` cookie-secret | 365d | Swap and bounce. Every proxy session is logged out. |
+| Outbound auth to another system | `otel-otlp-auth`, `observe-root` | 365d | Change the credential on the receiving service first, then swap and bounce. |
+| SSH identity | `odin-ssh-key` | 365d | Generate a new key pair, authorize the new public key at the destination, swap and bounce, then remove the old public key at the destination. |
 | DB / object-store creds | `POSTGRES_PASSWORD` + the three `factory-db-*` (one atomic group), `minio-creds` | 365d | Existing per-secret runbook. |
 | HMAC keys | `AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY` | 365d | Swap on both pfactory and aifactory in one window. |
 | HMAC keys | `CFACTORY_AUDIT_HMAC_SECRET` | **compromise only** | The audit chain is HMAC'd with one unkeyed secret (`CFactory/apps/backend/cfactory/config.py`), so a swap makes every earlier entry unverifiable. Scheduled rotation waits on a key-id'd chain (follow-up, not here). |
-| Asymmetric signing | `PFACTORY_CONTRACT_SIGNING_KEY__<KID>` | 365d | **New kid, never overwrite.** Add the new seed and its public key under a new kid, switch `PFACTORY_CONTRACT_SIGNING_KID`, then remove the old pubkey once no contract signed with it is in flight. |
+| Asymmetric signing | `PFACTORY_CONTRACT_SIGNING_KEY__<KID>` | 365d | **New kid, never overwrite.** Order: (1) add the new seed to `factory-secrets` under the new kid; (2) deploy the new pubkey `TFACTORY_CONTRACT_PUBKEY_PFACTORY__<NEW>` to the verifier, next to the old one; (3) point pfactory's env at the new seed and `PFACTORY_CONTRACT_SIGNING_KID` (a manifest PR); (4) confirm a new contract verifies; (5) delete the old seed. Keep the old pubkey while any contract signed with it may still need verifying. |
 | Data-encryption roots | `KMS_FERNET_KEY` (aifactory) | 365d | Envelope: `python -m server.crypto rotate-root` with `KMS_FERNET_KEY_NEW` set re-wraps the data keys, then the env is flipped (AIFactory `server/crypto/__main__.py`). |
 | Data-encryption roots | `CFACTORY_CREDENTIAL_KEY` | 365d | Multi-key: prepend `<new-id>:<key>,`, keeping old ids listed until records are re-wrapped (`cfactory/config.py`). |
-| Data-encryption roots | `minio-kms` KEK | **compromise only** | Single-key mode can't hold old and new at once (`docs/encryption-at-rest.md`). Scheduled rotation needs KES first (future work there). |
+| Data-encryption roots | `minio-kms` KEK | **compromise only** | Single-key mode can't hold old and new at once (`docs/encryption-at-rest.md`), so there's no scheduled rotation until KES. On compromise, the emergency path (untested, needs downtime): stop writers, `mc mirror` both buckets out to a local plaintext copy while the old KEK is live, swap `minio-kms` and restart MinIO, mirror back so every object is re-encrypted under the new KEK, verify, then shred the copy. Listed as an operational dependency, not a rehearsed procedure. |
 | Claude OAuth | `factory-cli-creds`, `CLAUDE_CODE_OAUTH_TOKEN` | n/a | Automated by cred-broker. Referenced only; unchanged. |
 
 Triggers that force an immediate rotation, whatever the age: suspected or
@@ -40,24 +44,34 @@ just has no schedule.
 ### 2. Rotation ledger (same doc, section "Rotation ledger")
 
 A markdown table between `<!-- rotation-ledger:start -->` and
-`<!-- rotation-ledger:end -->`, with columns
-`Credential | Max age (days) | Last rotated`. One row per credential, or per
-atomic group (the Postgres row). `Max age` is an integer or `none`
-(compromise only). `Last rotated` is `YYYY-MM-DD` or `unknown`. Every row
+`<!-- rotation-ledger:end -->`, with exactly the columns
+`Credential | Max age (days) | Last rotated | Expires`. One row per
+credential, or per atomic group (the Postgres row). `Max age` is an integer
+from 1 to 3650, or `none` (compromise only). `Last rotated` is `YYYY-MM-DD` or
+`unknown`. `Expires` is an optional provider-side expiry (`YYYY-MM-DD`, or `-`).
+The row is due at the earlier of the two deadlines. Removing a row is a
+reviewed PR that has to say why. Every row
 starts as `unknown`: no rotation history is recorded anywhere we can read.
 Updating a row is a one-line commit, so git is the rotation audit trail the
 doc says is missing today.
 
 ### 3. Checker (`scripts/rotation-ledger-check.py`, stdlib Python)
 
-- Parses the ledger block. Fails (exit 1) on: a missing block, an empty
-  ledger, a malformed row, an invalid or future date, a non-integer max age
-  other than `none`, or a duplicate credential.
-- A row is overdue when `today > last_rotated + max_age`. An `unknown` row is
-  measured from the policy start `2026-11-07` (a constant in the script and
-  stated in the doc), so it falls due 2027-11-07. That gives a defined
-  deadline, and the alarm doesn't fire on day one.
-- `none` rows are validated but never overdue.
+- Parses the ledger block. Fails (exit 1) on: not exactly one start marker
+  followed by one end marker, a header that doesn't match exactly, an empty
+  ledger, a row with the wrong number of cells, a strict-`YYYY-MM-DD`
+  violation, a future `Last rotated`, a max age outside 1–3650 or not
+  `none`, a duplicate credential, or `none` on a credential outside the
+  script's allowlist (`CFACTORY_AUDIT_HMAC_SECRET`, `minio-kms`). That last
+  rule stops `none` being used to silence an ordinary key.
+- Deadline = `last_rotated + max_age` (an `unknown` row is measured from the
+  policy start `2026-11-07`, a constant in the script and stated in the doc),
+  or `Expires` if that's earlier. A row is overdue when `today > deadline`. So
+  an unknown 365d row is due 2027-11-07 and first fails on 2027-11-08, which
+  gives a defined deadline without failing on day one.
+- `none` rows are validated but never overdue on age. An `Expires` date
+  still applies.
+- `--validate-only` checks the structure without the age check.
 - Prints one line per overdue row and exits 1. Otherwise prints a count and
   exits 0.
 - `--self-test` runs assert-based cases offline (same convention as the
@@ -67,9 +81,11 @@ doc says is missing today.
 ### 4. Workflow (`.github/workflows/secret-rotation-due.yml`)
 
 `schedule` (weekly, Monday), `workflow_dispatch`, and `pull_request` limited
-to the doc, the script and the workflow. Steps: checkout, then
-`python3 scripts/rotation-ledger-check.py --self-test`, then
-`python3 scripts/rotation-ledger-check.py docs/secrets-management.md`. A red
+to the doc, the script and the workflow. Steps: checkout,
+`python3 scripts/rotation-ledger-check.py --self-test`, then the ledger
+check. It runs with `--validate-only` on `pull_request` (time makes a row
+overdue, a PR doesn't; same reasoning as `image-pin-freshness.yml`) and in
+full on schedule and dispatch. A red
 scheduled run emails the owner. No issue is auto-filed, matching the reasoning
 in `image-pin-freshness.yml`. `permissions: contents: read`. No secrets.
 
@@ -82,9 +98,11 @@ in `image-pin-freshness.yml`. `permissions: contents: read`. No secrets.
   the host ed25519/rsa keys. p620 = host keys only.
 - Loss: losing one identity is recoverable from another recipient. Re-key with
   `agenix -r` from a machine that still decrypts. Losing all of them makes
-  every `factory-secret-*.age` unreadable. The live cluster keeps running, but
-  a rebuild can't re-seed, and the `minio-kms` KEK (and so every encrypted
-  object) is gone. Requirement: keep at least one identity backed up off-host
+  every `factory-secret-*.age` unreadable. The live Secrets (including
+  `minio-kms` in etcd and in MinIO's env) still hold plaintext copies, so that
+  is a recovery window: before any cluster rebuild or delete, mint a new
+  identity, read the live values back and re-encrypt them. If that window
+  closes, the KEK and every encrypted object are gone. Requirement: keep at least one identity backed up off-host
   and offline. The repo can't verify that this backup exists; the operator
   confirms it.
 - Leak or compromise of an identity: remove that recipient from `secrets.nix`,
@@ -109,6 +127,10 @@ to point at the new policy.
   consumer bounce, provider-side revocation, or re-encryption, and JWT
   rotation logs everyone out. That's a lot of machinery for one operator, and
   it would touch live state this task must not touch.
+- **A hard-coded expected credential list in the checker.** It would be a
+  second source of truth that drifts from the doc. Row removal is caught in
+  PR review instead, and the `none` allowlist covers the silent-exemption
+  case.
 - **A review-date alarm only.** Codex's intent review confirmed it can stay
   green while credentials are overdue. Rejected for per-row max-age checks.
 - **Using nixos_config `.age` git log as "last rotated".** One file covers
@@ -137,9 +159,13 @@ to point at the new policy.
 ## Verification
 
 - `python3 scripts/rotation-ledger-check.py --self-test` passes. Its cases:
-  valid ledger, overdue dated row, overdue unknown row (today past
-  2027-11-07), `none` row never overdue, future date, malformed date,
-  duplicate, missing block.
+  valid ledger; dated row on its deadline (passes) and the day after (fails);
+  unknown row on 2027-11-07 (passes) and 2027-11-08 (fails); an `Expires`
+  earlier than the age deadline; an allowlisted `none` row never overdue; a
+  `none` row not on the allowlist (fails); a future date; a malformed date;
+  max age 0; a duplicate; a missing block, a repeated block and reversed
+  markers; a wrong header; an empty ledger; `--validate-only` ignoring an
+  overdue row.
 - `python3 scripts/rotation-ledger-check.py docs/secrets-management.md`
   exits 0 today.
 - `actionlint` (if available) and the repo's existing workflow checks pass on
