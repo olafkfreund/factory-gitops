@@ -79,9 +79,11 @@ Decisions, in runbook order:
    version id; an inventory of versions and delete markers; and the object
    tags, because the `factory-artifacts` lifecycle rules filter on the `role`
    tag and a filesystem copy does not keep tags.
-4. **Verify the export by content.** A SHA-256 manifest of the staged files
-   must equal a SHA-256 manifest computed from a second, independent read of
-   every object from MinIO (`mc cat | sha256sum`). `mc diff` is not used as
+4. **Verify the export by content,** current objects and noncurrent versions
+   separately. A SHA-256 manifest of the staged files must equal a SHA-256
+   manifest computed from a second, independent read from MinIO
+   (`mc cat | sha256sum`, by version id for noncurrent versions). Object keys
+   that cannot be staged safely as file paths stop the procedure. `mc diff` is not used as
    evidence: it compares names and sizes. Any difference stops the procedure.
 5. **Cut over.** Scale MinIO to zero. Leave the old PVC untouched. Point the
    Deployment at a new, empty PVC, set `minio-kms` to the new KEK, start
@@ -104,9 +106,11 @@ Decisions, in runbook order:
 
 Stated properties:
 
-- **Rollback** is available through step 7: scale MinIO down, point it back
-  at the old PVC with the old KEK. The point of no return is deleting the old
-  PVC in step 8, not a step in the middle.
+- **Rollback** without data loss is available through step 6: scale MinIO
+  down, point it back at the old PVC with the old KEK. Once writers resume in
+  step 7, going back loses what was written since, so from then on rollback is
+  a decision with a stated loss. Deleting the old PVC in step 8 ends the
+  option.
 - **No backup or evidence data is lost.** Current objects are restored and
   verified by checksum. Noncurrent versions are preserved in the staging
   archive for their retention period; they are not restored into the bucket,
@@ -167,7 +171,7 @@ the ones with many per-bucket commands, where retyping causes mistakes.
   (c) every bucket appears in every per-bucket step, and the steps come out in
   the order export, verify export, restore, verify restore;
   (d) the printed plan contains no `kubectl`, no `mc rm`, no `mc rb` and no
-  `KEK`;
+  key variable or key placeholder;
   (e) the script's imports, read with `ast`, are within the allowlist;
   (f) bad `--alias` and `--staging` values are rejected.
 
