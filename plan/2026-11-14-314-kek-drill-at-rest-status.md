@@ -316,6 +316,16 @@ option.
    encryption check; decide on Redis/Keycloak volumes (risk acceptance or node
    LUKS); decide on FIPS 140 scope; decide on KES. The epic stays open.
 
+## Deviations
+
+- Step 2: the paragraph on the `local-path` provisioner (old lines 24-26) was
+  kept under the status table with the path corrected, instead of being
+  replaced. It states the constraint the rest of the doc works within.
+- Step 2: the runbook also says to run each printed fragment from a file with
+  `bash`, and lists the tools the fragments need (`mc`, `jq`, `sha256sum`).
+- Step 1: tags are exported with `mc tag list --json` and re-applied as
+  `key=value&key=value`; still marked UNPROVEN in the output.
+
 ## Tests
 
 In the factory-gitops worktree. Exit 0 unless noted; a `grep` that is
