@@ -16,8 +16,11 @@ A second kustomization, `apps/backups/offsite/`, holding:
   schedule `15 3 * * *` (one hour after `postgres-backup` at 02:15 UTC).
 - `offsite-copy.sh`: the job's script, as a real file so it can be tested.
 - `kustomization.yaml`: `namespace: factory`, `resources: [cronjob.yaml]`, and a
-  `configMapGenerator` that turns `offsite-copy.sh` into the ConfigMap the
-  CronJob mounts.
+  `configMapGenerator` that turns `offsite-copy.sh` into the ConfigMap
+  `postgres-backup-offsite-script` the CronJob mounts, with
+  `disableNameSuffixHash: true`. A hashed name would make Argo CD prune the old
+  ConfigMap on a script change while a Job created earlier may still need it
+  for a retry pod.
 - `test.sh`: runs `offsite-copy.sh` against a stub `mc` (no network).
 
 `apps/backups/manifests/kustomization.yaml` is **not** changed, so nothing in
@@ -78,9 +81,13 @@ The key names are the ones factory-gitops#70 used.
 3. Find the newest source dump: the last name, sorted, matching
    `factory-cluster-*.sql.gz` under `factory-backups/postgres/`. The names carry
    a UTC timestamp, so name order is age order. None found: fail.
-4. Freshness: parse the timestamp from the name; fail if it is older than
-   `MAX_AGE_SECONDS` (default 93600, 26h: the 24h RPO plus slack). This is what
-   stops a run from "verifying" an old dump when `postgres-backup` has stopped.
+4. Freshness: parse the timestamp from the name; fail if it does not parse,
+   if it is more than 300s in the future, or if it is older than
+   `MAX_AGE_SECONDS` (default 43200, 12h). This job runs an hour after the
+   dump, so tonight's dump is about 1h old and last night's is about 25h old:
+   the limit has to sit below 25h, or a night where `postgres-backup` failed
+   would still "verify" yesterday's dump. A future-dated name is rejected
+   because it would sort last and win the selection on every later run.
 5. `mc mirror` source prefix to `<bucket>/postgres/` at the destination, without
    `--remove` and without `--overwrite`: nothing at the destination is deleted
    or replaced, and dumps the local 14-day lifecycle expires stay there.
@@ -93,7 +100,7 @@ The job only reads from the source bucket.
 
 ### How the copy is verifiable
 
-- Per run: steps 4 and 6. A success means a dump no older than 26h is at the
+- Per run: steps 4 and 6. A success means tonight's dump is at the
   destination, byte-identical and a valid gzip.
 - Over time: `job-watchdog` already records every CronJob in `factory` to the
   `job_health` stream and opens an issue on `failing`, `stale` or
@@ -134,7 +141,9 @@ Not in this change. The dumps go to the destination as they are in MinIO
 TLS and at rest by the destination's own encryption. The pinned image has no
 `openssl`, `gpg` or `age`, so encrypting before upload means another image and
 a key to manage and to have at hand during a restore. If the owner wants it,
-that is a follow-up; choosing the p510 destination avoids the question.
+that is a follow-up. A destination on the owner's own machine keeps the stored
+copy in the owner's custody, but whether plain dumps are acceptable there is
+still the owner's decision.
 
 ## Alternatives rejected
 
@@ -168,20 +177,24 @@ that is a follow-up; choosing the p510 destination avoids the question.
 - A cluster compromise exposes the destination key. A key that cannot delete,
   plus versioning or object lock, keeps the old copies safe; that is on the
   destination's configuration, not this job.
-- `configMapGenerator` appends a content hash to the ConfigMap name, so a
-  script change rolls a new ConfigMap and Argo CD prunes the old one. Expected.
+- With a fixed ConfigMap name, a script change reaches a retry pod of a Job
+  that started under the old script. Both are the same job's script, a day
+  apart at most; accepted.
 
 ## Verification
 
-- `apps/backups/offsite/test.sh` passes: happy path; stale dump; no dump;
-  corrupt destination copy; empty destination copy; `http://` endpoint. Run in
-  CI by a small workflow.
+- `apps/backups/offsite/test.sh` passes: happy path; stale dump (25h old);
+  future-dated name; unparsable name; no dump; corrupt destination copy; empty
+  destination copy; `http://` endpoint. It runs **inside the pinned image**
+  (`docker run`, image reference read from `cronjob.yaml`), locally and in a
+  small CI workflow, so the shell and `date` under test are the ones the job
+  uses, not the runner's.
 - `kustomize build apps/backups/offsite` renders a CronJob and a ConfigMap, and
   `kubeconform` accepts them (also done by `manifest-validate.yml`).
 - `kustomize build apps/backups/manifests` output is byte-identical before and
   after the change. That is the proof Argo CD has nothing new to sync.
 - With `- ../offsite` added locally (not committed), `kustomize build
-  apps/backups/manifests` renders the CronJob with the hashed ConfigMap name.
+  apps/backups/manifests` renders the CronJob and the ConfigMap.
 - After the owner enables it: first run succeeds, the log line shows the
   verified object, and `job_health` reports `ok` for `postgres-backup-offsite`.
   A restore from the off-cluster copy is then recorded on Factory#3681.
