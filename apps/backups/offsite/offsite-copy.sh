@@ -1,0 +1,55 @@
+#!/bin/sh
+set -euo pipefail
+
+fail() {
+  printf 'offsite-copy: FAIL: %s\n' "$1" >&2
+  exit 1
+}
+
+case "${OFFSITE_S3_ENDPOINT:-}" in
+  https://*) ;;
+  *) fail 'destination endpoint must use https://' ;;
+esac
+for value in "${S3_ACCESS_KEY:-}" "${S3_SECRET_KEY:-}" "${OFFSITE_S3_BUCKET:-}" \
+  "${OFFSITE_S3_ACCESS_KEY:-}" "${OFFSITE_S3_SECRET_KEY:-}"; do
+  [ -n "$value" ] || fail 'missing required credential or bucket'
+done
+
+SCRATCH=${SCRATCH:-/scratch}
+MAX_AGE_SECONDS=${MAX_AGE_SECONDS:-43200}
+case "$MAX_AGE_SECONDS" in
+  ''|*[!0-9]*) fail 'invalid MAX_AGE_SECONDS' ;;
+esac
+export MC_CONFIG_DIR="$SCRATCH/.mc"
+mc alias set fac "${SOURCE_ENDPOINT:-http://minio.factory.svc.cluster.local:9000}" \
+  "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1 || fail 'source alias failed'
+mc alias set off "$OFFSITE_S3_ENDPOINT" "$OFFSITE_S3_ACCESS_KEY" \
+  "$OFFSITE_S3_SECRET_KEY" >/dev/null 2>&1 || fail 'destination alias failed'
+
+name="$(mc ls fac/factory-backups/postgres/ | \
+  awk '$NF ~ /^factory-cluster-.*\.sql\.gz$/ { print $NF }' | sort | tail -n 1)" || fail 'source listing failed'
+[ -n "$name" ] || fail 'no dump found'
+timestamp=${name#factory-cluster-}
+timestamp=${timestamp%.sql.gz}
+case "$timestamp" in
+  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) ;;
+  *) fail 'invalid dump timestamp' ;;
+esac
+formatted="$(printf '%s\n' "$timestamp" | awk '{ printf "%s-%s-%s %s:%s:%s", substr($0,1,4), substr($0,5,2), substr($0,7,2), substr($0,10,2), substr($0,12,2), substr($0,14,2) }')" || fail 'invalid dump timestamp'
+stamp="$(date -u -d "$formatted" +%s 2>/dev/null)" || fail 'invalid dump timestamp'
+now="$(date -u +%s)" || fail 'current time unavailable'
+age=$((now - stamp))
+[ "$age" -ge -300 ] || fail 'dump is future-dated'
+# The limit must stay below 25h: yesterday's dump is 25h old at this job's start.
+[ "$age" -le "$MAX_AGE_SECONDS" ] || fail 'dump is stale'
+
+mc mirror fac/factory-backups/postgres/ "off/$OFFSITE_S3_BUCKET/postgres/" || fail 'mirror failed'
+# shortcut: reads the whole newest dump back each night, fine at MB size; compare provider checksums when dumps reach GBs
+mc cat "off/$OFFSITE_S3_BUCKET/postgres/$name" > "$SCRATCH/readback.gz" || fail 'destination read-back failed'
+[ -s "$SCRATCH/readback.gz" ] || fail 'destination dump is empty'
+gzip -t "$SCRATCH/readback.gz" 2>/dev/null || fail 'destination dump is invalid gzip'
+destination_hash="$(sha256sum "$SCRATCH/readback.gz" | cut -d ' ' -f 1)" || fail 'destination hash failed'
+source_hash="$(mc cat "fac/factory-backups/postgres/$name" | sha256sum | cut -d ' ' -f 1)" || fail 'source read-back failed'
+[ "$destination_hash" = "$source_hash" ] || fail 'destination hash differs from source'
+bytes="$(wc -c < "$SCRATCH/readback.gz" | awk '{ print $1 }')" || fail 'byte count failed'
+printf 'offsite-copy: OK name=%s bytes=%s sha256=%s age_seconds=%s\n' "$name" "$bytes" "$destination_hash" "$age"
