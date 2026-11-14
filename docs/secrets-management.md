@@ -47,7 +47,7 @@ All are namespace `factory` and seeded via agenix on p510 unless noted.
 |--------|------|-----------|----------------------------|
 | `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_JWT_SECRET, {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, CFACTORY_CREDENTIAL_KEY, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
 | `minio-creds` | S3_ACCESS_KEY, S3_SECRET_KEY | minio, minio bucket-init, pfactory, tfactory, aifactory, backups | Manual (agenix). Rotate = recreate + bounce minio and every consumer. |
-| `minio-kms` (new, this PR) | MINIO_KMS_SECRET_KEY | minio, minio bucket-init | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; compromise-only rotation, see [Rotation policy](#rotation-policy). |
+| `minio-kms` | MINIO_KMS_SECRET_KEY | minio | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; compromise-only rotation, see [Rotation policy](#rotation-policy). |
 | `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory (mounted) | AUTOMATIC — cred-broker CronJob (`apps/cred-broker`) refreshes the Claude OAuth token every 4h. Others manual. |
 | `factory-db-pfactory` | DATABASE_URL | pfactory | Manual (agenix). Derived from POSTGRES_PASSWORD; rotate together. |
 | `factory-db-tfactory` | DATABASE_URL | tfactory | Manual (agenix). As above. |
@@ -203,7 +203,7 @@ General shape for the manual (agenix) secrets:
 | Asymmetric signing | `PFACTORY_CONTRACT_SIGNING_KEY__<KID>` | 365d | **New kid, never overwrite.** Order: (1) add the new seed to `factory-secrets` under the new kid; (2) deploy the new pubkey `TFACTORY_CONTRACT_PUBKEY_PFACTORY__<NEW>` to the verifier, next to the old one; (3) point pfactory's env at the new seed and `PFACTORY_CONTRACT_SIGNING_KID` (a manifest PR); (4) confirm a new contract verifies; (5) delete the old seed. Keep the old pubkey while any contract signed with it may still need verifying. |
 | Data-encryption roots | `KMS_FERNET_KEY` (aifactory) | 365d | Envelope: `python -m server.crypto rotate-root` with `KMS_FERNET_KEY_NEW` set re-wraps the data keys, then the env is flipped (AIFactory `server/crypto/__main__.py`). |
 | Data-encryption roots | `CFACTORY_CREDENTIAL_KEY` | 365d | Multi-key: prepend `<new-id>:<key>,`, keeping old ids listed until records are re-wrapped (`cfactory/config.py`). |
-| Data-encryption roots | `minio-kms` KEK | **compromise only** | Single-key mode can't hold old and new at once (`docs/encryption-at-rest.md`), so there's no scheduled rotation until KES. On compromise, the emergency path (untested, needs downtime): stop writers, `mc mirror` both buckets out to a local plaintext copy while the old KEK is live, keep the old KEK value aside, swap `minio-kms` and restart MinIO, empty both buckets (`mc mirror` skips objects that already exist, so the old ciphertext must go), mirror the copy back so every object is written under the new KEK, verify object counts and spot-read objects, then shred the copy and the old KEK. Listed as an operational dependency, not a rehearsed procedure. |
+| Data-encryption roots | `minio-kms` KEK | **compromise only** | Single-key mode can't hold old and new at once, so there's no scheduled rotation until KES. On compromise, follow the emergency runbook (untested, needs downtime) in [`encryption-at-rest.md`](encryption-at-rest.md#kek-compromise-emergency-re-encryption-untested). |
 | Claude OAuth | `factory-cli-creds`, `CLAUDE_CODE_OAUTH_TOKEN` | n/a | Automated by cred-broker. Referenced only; unchanged. |
 
 Triggers that force an immediate rotation, whatever the age: suspected or
@@ -409,11 +409,11 @@ external store becomes a requirement.
 
 ### Concrete first migration candidate
 
-Migrate **`minio-kms`** (the new secret this PR introduces) first:
+Migrate **`minio-kms`** (the MinIO KEK) first:
 
-- It has exactly one key and two consumers — the smallest possible blast radius,
+- It has exactly one key and one consumer — the smallest possible blast radius,
   so a botched migration is trivially recoverable.
-- It is brand new, so there is no established rotation habit to disrupt.
+- It has no scheduled rotation, so there is no rotation habit to disrupt.
 - It proves the whole SOPS-in-ArgoCD path end to end (encrypt, commit, decrypt
   on sync, pod picks it up) on a secret whose failure mode is contained to MinIO,
   before touching the god-secret `factory-secrets`.

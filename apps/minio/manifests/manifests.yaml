@@ -28,7 +28,7 @@
 #
 # The KMS master key (the KEK) is a SEPARATE out-of-band Secret `minio-kms`, key
 # MINIO_KMS_SECRET_KEY, format `<key-name>:<base64 32-byte key>`. The operator
-# seeds it ONCE, before first sync (the minio pod and the Job both reference it):
+# seeds it ONCE, before first sync (the minio pod references it):
 #
 #   kubectl -n factory create secret generic minio-kms \
 #     --from-literal=MINIO_KMS_SECRET_KEY="factory-kek-1:$(openssl rand -base64 32)"
