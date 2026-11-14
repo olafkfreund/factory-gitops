@@ -364,11 +364,13 @@ spec:
             # than split-brain per process (PFactory#755).
             - { name: PFACTORY_REPLICA_COUNT, value: "4" }
             - { name: PFACTORY_REQUIRE_SHARED_STORE, value: "1" }
-            # DB pool caps (#303; values from AIFactory spec 2026-10-30-1963):
-            # 3 + 1 + 1 + relay 3 = 8 per pod, so 4 pods (32) plus AIFactory (24),
+            # DB pool caps (#303; ~9 per pod as AIFactory spec 2026-10-30-1963 asks):
+            # 4 + 1 + 1 + relay 3 = 9 per pod, so 4 pods (36) plus AIFactory (24),
             # TFactory (16 + ~15 verify dispatches) and KEDA (3) fit in the shared
             # Postgres's 97 usable connections. The image default is 19 per pod.
-            - { name: DB_POOL_SIZE, value: "2" }
+            # On "QueuePool limit" / TimeoutError in the logs, raise max_connections
+            # on Postgres first; there is no room left to raise these.
+            - { name: DB_POOL_SIZE, value: "3" }
             - { name: DB_MAX_OVERFLOW, value: "1" }
             - { name: JOBSTORE_DB_POOL_SIZE, value: "1" }
             - { name: JOBSTORE_DB_MAX_OVERFLOW, value: "0" }
