@@ -18,17 +18,23 @@ and still open: seeding the Secret, and whether the gateway's egress may be
 
 Today, after the owner seeds a Secret, a second manifest PR is still needed
 before anything reads it. The manifests can reference the Secret now, safely,
-so that seeding it is the only step left on the configuration side.
+which removes that PR from the path. What stays with the owner afterwards is
+listed under Open questions.
 
 ## Proposed outcome
 
 - The gateway Deployment names its upstream URL and reads the upstream key
-  and client token from a Secret in `gateway`, referenced as optional.
+  and client token from a Secret in `gateway`, each key referenced by name
+  and as optional. The upstream is Ollama Cloud (`https://ollama.com`), the
+  destination CFactory's copilot already calls directly today; the epic's
+  stage 1 moves that call behind the gateway.
 - While the Secret is absent the gateway is exactly as today: Pods Ready,
   `/healthz` 200, chat 503.
 - Once the owner creates the Secret and restarts the Deployment, the gateway
   authenticates callers. It still cannot reach an upstream until the egress
-  decision is made and applied.
+  decision is made and applied in a further manifest PR; until then an
+  authenticated chat call waits for the upstream timeout and fails with 502.
+  No service calls the gateway in that window.
 - The exact Secret name and keys, and the egress options with a
   recommendation, are written down for the owner.
 
@@ -36,8 +42,10 @@ so that seeding it is the only step left on the configuration side.
 
 - `apps/model-gateway/manifests/manifests.yaml` (Argo app `model-gateway`,
   namespace `gateway`, cluster on p620).
-- No other app. The CFactory Deployment is not changed: its flag stays off
-  (CFactory slug `2026-11-14-1959-copilot-gateway-flag`).
+- No other app. The CFactory Deployment is not changed. CFactory has no
+  gateway setting on `dev` yet; one is being added, default off, under the
+  CFactory slug `2026-11-14-1959-copilot-gateway-flag`. Its status probe
+  will use `/healthz`, because the gateway has no `/v1/models`.
 
 ## Constraints
 
@@ -47,11 +55,27 @@ so that seeding it is the only step left on the configuration side.
 - The rollout must not be able to stall or take the gateway down while the
   Secret is missing.
 - No egress change: that is the owner's decision. Egress stays DNS-only.
+- Individual `secretKeyRef` entries, never `envFrom`: a Secret key must not
+  be able to set an arbitrary environment variable or override the upstream.
+- An optional reference also hides a missing or misspelled key: the Pod
+  starts and the gateway stays 503 (no client token) or calls the upstream
+  with no key (no upstream key). The owner steps must include a check.
+- CI `manifest-validate` must stay green; the stage 0 comment in
+  `apps/model-gateway/application.yaml` must stop saying "no env, no Secret".
 - Image pin and Kyverno scope are untouched.
 
 ## Open questions
 
 For the owner, tracked on Factory#1959, not blocking this change:
 
-1. Seed the gateway Secret (name and keys in the spec).
-2. Egress: `0.0.0.0/0:443`, or something narrower.
+1. Seed the gateway Secret (name and keys in the spec), without Argo
+   tracking labels or annotations (the app prunes), then restart the
+   Deployment: env from a Secret is read at start only.
+2. Seed the same client token in namespace `factory` for CFactory; a
+   `secretKeyRef` cannot cross namespaces.
+3. Confirm the upstream destination, Ollama Cloud.
+4. Egress. A NetworkPolicy here matches IP ranges, not host names, so the
+   choices are TCP 443 to `0.0.0.0/0` minus the private, link-local and
+   cluster ranges, a pinned provider range that breaks when the provider's
+   addresses change, or an egress proxy. Plain `0.0.0.0/0:443` with no
+   exceptions would also open the Kubernetes API and the LAN.
