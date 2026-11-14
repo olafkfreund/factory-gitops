@@ -1,4 +1,4 @@
-# Model gateway stage 0 (Factory#1959) — Deployment, Service, PDB, NetworkPolicies.
+# Model gateway stage 1 (Factory#1959) — Deployment (configured from an optional Secret), Service, PDB, NetworkPolicies.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -33,6 +33,26 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # Secret `model-gateway-secrets` (this namespace) is owner-seeded, never in git.
+          # `optional`: a missing Secret leaves chat answering 503 instead of stalling the
+          # rollout. Restart the Deployment after seeding or rotating it. Block style is
+          # deliberate: the `secrets` CI scan does not see flow style. The URL is a literal
+          # so a Secret edit cannot redirect the provider key.
+          env:
+            - name: GATEWAY_UPSTREAM_URL
+              value: "https://ollama.com"
+            - name: GATEWAY_UPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: model-gateway-secrets
+                  key: GATEWAY_UPSTREAM_API_KEY
+                  optional: true
+            - name: GATEWAY_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: model-gateway-secrets
+                  key: GATEWAY_CLIENT_TOKEN
+                  optional: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -112,7 +132,8 @@ spec:
         - protocol: TCP
           port: 8080
 ---
-# DNS only: no upstream egress until stage 1 configures one.
+# DNS only: an upstream is named but not reachable. Upstream egress is an owner decision
+# (Factory#1959); it is added as its own policy by a later PR.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

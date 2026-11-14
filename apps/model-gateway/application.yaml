@@ -1,6 +1,7 @@
-# Model gateway, stage 0 (Factory#1959) — unconfigured: no env, no Secret, no
-# provider key. It serves /healthz and answers chat requests 503 until stage 1
-# configures an upstream.
+# Model gateway, stage 1 (Factory#1959) — configured from the optional Secret
+# `model-gateway-secrets` (owner-seeded, not in git). It serves /healthz and
+# answers chat requests 503 until that Secret exists; it has no upstream
+# egress yet.
 #
 # Own Application and namespace (`gateway`), not part of the `aifactory`
 # kustomization: the gateway is a separate trust boundary with its own
