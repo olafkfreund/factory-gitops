@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 314
 spec: spec/2026-11-14-314-kek-drill-at-rest-status.md
 coders:
