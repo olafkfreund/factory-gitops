@@ -540,7 +540,7 @@ spec:
             # 12-Jobs-per-module path let a transient dispatch error flip stability
             # to ERROR, downgrading accept->flag). Keep in lockstep with newTag on
             # every CD bump.
-            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-7c2154d" }
+            - { name: TFACTORY_IMAGE, value: "ghcr.io/olafkfreund/tfactory:sha-bdbae27" }
             # PORTAL_UI_IMAGE pins the runner image the portal-ui browser Job
             # runs (portal_testing/dispatch.py). TFactory#886: nothing built that
             # image for the first five weeks of its life, so `:latest` -- the
@@ -563,7 +563,7 @@ spec:
             # is rebuilt only when its inputs change, so it lags the backend tag
             # and that is correct. It must always name a commit whose
             # portal_testing/ is the one intended to run.
-            - { name: PORTAL_UI_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-9a880c9@sha256:e9c247bda0ca501467cb5cef2aeea67ef08e42619a7190a2d32ed0dc147d3c17" }
+            - { name: PORTAL_UI_IMAGE, value: "ghcr.io/olafkfreund/tfactory-runner-portal-ui:sha-d917a58@sha256:f3aa6d69cbb102fc9a4e2b5d029fee55d9fbd9cba75ca1ba7d70173998f6c5a0" }
             # RFC-0016 #466 / RFC-0017: Job-native verify orchestration.
             # FLIP #1 (2026-06-21) REVERTED — verify_dispatch was present but NOT
             # WIRED (nothing called verify_exec_mode), so the flip was inert.
@@ -778,6 +778,8 @@ spec:
             - { name: home-local, mountPath: /home/nonroot/.local }
           readinessProbe: { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /api/health, port: 3103 }, initialDelaySeconds: 30, periodSeconds: 20 }
+          # Liveness waits until boot (migration lock wait up to 300s + migration) answers, at most 360s (factory-gitops#323).
+          startupProbe:   { httpGet: { path: /api/health, port: 3103 }, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 36 }
           resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 8Gi } }
       volumes:
         - { name: data,      persistentVolumeClaim: { claimName: tfactory-data } }
