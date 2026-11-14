@@ -8,173 +8,264 @@ intent: intent/2026-11-14-314-kek-drill-at-rest-status.md
 
 ## Design
 
-Four changes, three in factory-gitops and one in Factory. Nothing touches the
-cluster, a Secret or nixos_config.
+Five changes in factory-gitops, one in Factory, one comment on the epic.
+Nothing touches the cluster, a Secret or nixos_config.
 
 ### D1. `docs/encryption-at-rest.md`: status of record
 
 Replace the section "What is encrypted today: nothing at rest" with
-"Status (verified 2026-11-14)": one table, one row per layer, with columns
-Layer / State / How verified. Rows and states are the ones in the approved
-intent: MinIO SSE (configured for new writes on three buckets; existing objects
-not evidenced), KEK custody (documented; offline identity backup unconfirmed),
-Postgres (unencrypted, risk-accepted R-014), other `local-path` volumes
-(unencrypted, R-003 open), etcd Secrets (unencrypted, no `--secrets-encryption`),
-node disk (no LUKS, owner check 2026-10-24), application-level keys
-(`KMS_FERNET_KEY`, `CFACTORY_CREDENTIAL_KEY`: exist, see the rotation policy).
+"Status as of 2026-11-14": one table, one row per layer, with columns
+Layer / State / Evidence. Every evidence cell starts with its kind and date,
+as in the approved intent: **Live** (read-only `kubectl get/describe`,
+2026-11-14), **Repo** (a file here), or **Record** (an issue, PR or risk entry
+this repo cannot re-verify, with its own date). The heading does not say
+"verified".
+
+Rows: MinIO SSE (configured for new writes on three buckets; existing objects
+and versions not evidenced); KEK custody (documented; agenix copy and offline
+identity backup are Record/unconfirmed); key-rotation policy and ledger (Repo);
+Postgres (unencrypted, risk-accepted R-014, Record); other `local-path` volumes
+(unencrypted, R-003 open); etcd Secrets (unencrypted: no `--secrets-encryption`
+in the server node args, Live); node disk (no LUKS: owner host check
+2026-10-24, Record); application-level keys (`KMS_FERNET_KEY`,
+`CFACTORY_CREDENTIAL_KEY`: documented in the rotation policy, not checked
+live); FIPS 140 (nothing asserted; owner decision); KES / external KMS (not
+deployed; MinIO uses its built-in static single-key mode).
 
 Below the table, one paragraph states the limit plainly: while etcd and the
 disk are unencrypted, the KEK is on the same host as the ciphertext, so SSE
 protects a copied bucket or PVC blob, not a seized host.
 
-Mechanical corrections in the rest of the file: three buckets everywhere
-(`factory-evidence` added), "shipped in this PR" becomes "shipped in
-factory-gitops#71", and the storage path is given as p620
-`/mnt/code/k3d/storage` with the note that it comes from the owner's host
-check of 2026-10-24. The etcd and LUKS runbooks name p510 as the host to
-deploy; those lines get a one-line note that the host must be confirmed, and
-are otherwise left alone, because which host runs the bootstrap cannot be
-verified from this repo.
+Then two short lists: the read-only commands that produced the Live rows, and
+the owner checks still open (the full list in D6). The existing-object check
+is a full enumeration (`mc stat --versions --recursive --json` over each
+bucket, delete markers excluded), not a sample.
 
-Add the read-only commands that produced the "Live" evidence, so the table can
-be re-verified, and the owner command that checks existing objects
-(`mc stat` on a sample of old objects and versions per bucket).
+Mechanical corrections in the rest of the file: three buckets everywhere;
+"shipped in this PR" becomes a neutral "shipped" with links to
+factory-gitops#71 only where the text is about the two original buckets; the
+storage path is given as p620 `/mnt/code/k3d/storage` and labelled as the
+owner's host check of 2026-10-24. The etcd and LUKS runbooks get, as their
+first step, "confirm which host runs the cluster and the secret bootstrap";
+their `p510` commands are marked as examples until then.
 
-### D2. `docs/encryption-at-rest.md`: numbered KEK emergency runbook
+### D2. `docs/encryption-at-rest.md`: KEK emergency runbook
 
 New section "KEK compromise: emergency re-encryption (UNTESTED)", replacing
-"Rotating the KEK". The decisions:
+"Rotating the KEK". The design is a **cutover to a fresh volume**: MinIO is
+never started with a new KEK on top of data written under the old one, and
+nothing is deleted until the end.
 
-- **Scope:** all three buckets. The bucket list in the runbook is the list the
-  manifest encrypts.
-- **Object versions are not carried over, and that is stated as a decision.**
-  `mc mirror` copies current versions only. Before anything is deleted the
-  operator lists every noncurrent version and delete marker
-  (`mc ls --versions --recursive`) into the incident record, so what is given
-  up (up to 7 days on `factory-backups`, 30 days of tamper-recovery history on
-  `factory-evidence`) is recorded rather than silently lost.
-- **Writers paused first:** the three factories' S3 writers, CronJob
-  `postgres-backup` and CronJob `evidence-collector` (suspend, then wait for
-  running Jobs to finish). The runbook names them; it does not change them.
-- **Plaintext copy on encrypted or RAM-backed storage** (`tmpfs` or a LUKS
-  volume), never on the plain node disk, because `shred` is not reliable on
-  SSD/CoW filesystems.
-- **Integrity check before the point of no return:** `mc diff` between each
-  bucket and its copy must be empty, and object counts must match, before the
-  buckets are emptied.
-- **Rollback point:** up to and including the KEK swap, restoring the old
-  `minio-kms` value and restarting MinIO returns to the starting state.
-  Emptying the buckets (`mc rm --recursive --versions --force`) is the point of
-  no return; after it the copy is the only data.
-- **After mirror-back:** `mc diff` empty again, counts match, `mc stat` on a
-  sample shows SSE-S3, a Postgres backup object is downloaded and `gunzip -t`
-  passes, and the bucket settings are re-asserted by re-running the
-  `minio-create-bucket` Job (ArgoCD sync of `minio`).
-- **Old KEK retired last:** only after those checks pass and writers are back;
-  then the copy is destroyed, the agenix value is replaced, and the ledger row
-  for `minio-kms` is updated.
-- **Rehearsal:** a short subsection says how to rehearse on a throwaway MinIO
-  (a local container with its own KEK and dummy objects, including overwritten
-  objects so versions exist), and gives the drill-record fields: date,
-  operator, MinIO and mc versions, steps run, checks and results, time taken,
-  open limitations. The section stays titled UNTESTED until a record is
-  linked there.
+Decisions, in runbook order:
+
+1. **Prepare the new KEK first.** If the compromise came through an agenix
+   identity, remove that recipient and re-key before anything else
+   (`secrets-management.md`, custody section). Generate the new KEK with a
+   **new key name** (`factory-kek-2:...`), store it in agenix beside the old
+   one, and confirm it decrypts. Key values are only ever handled through
+   agenix and a file under `/dev/shm` fed to `kubectl patch`, never typed
+   into a command line.
+2. **Quiesce.** Pause ArgoCD auto-sync for `minio` and every app that writes
+   to S3 (they have `selfHeal`), pause the KEDA scalers, scale the S3 writers
+   to zero and suspend CronJobs `postgres-backup` and `evidence-collector`;
+   wait for running Jobs to end. The runbook says to find every writer with
+   `grep -rln 'factory-artifacts\|factory-backups\|factory-evidence' apps/`
+   rather than trusting a fixed list. Lifecycle expiry keeps running inside
+   MinIO; objects it removes during the window were already due to expire.
+3. **Export under the old KEK** to persistent encrypted staging (a LUKS
+   volume with room for the data; not `tmpfs`, which a reboot would empty,
+   and not the plain node disk). Exported per bucket: current objects
+   (`mc mirror`); every noncurrent version, each to a path that carries its
+   version id; an inventory of versions and delete markers; and the object
+   tags, because the `factory-artifacts` lifecycle rules filter on the `role`
+   tag and a filesystem copy does not keep tags.
+4. **Verify the export by content.** A SHA-256 manifest of the staged files
+   must equal a SHA-256 manifest computed from a second, independent read of
+   every object from MinIO (`mc cat | sha256sum`). `mc diff` is not used as
+   evidence: it compares names and sizes. Any difference stops the procedure.
+5. **Cut over.** Scale MinIO to zero. Leave the old PVC untouched. Point the
+   Deployment at a new, empty PVC, set `minio-kms` to the new KEK, start
+   MinIO, and confirm the key in use is the new key name
+   (`mc admin kms key status`). Run the `minio-create-bucket` Job **before**
+   restoring, so encryption, versioning and lifecycle are in force for every
+   restored object.
+6. **Restore and verify.** Mirror the current objects back, re-apply the tags
+   from the inventory, and recompute the SHA-256 manifest from the new MinIO;
+   it must equal the staged manifest. The newest Postgres backup passes
+   `gunzip -t`. Restart MinIO once more and repeat the read check on a sample,
+   which proves the running pod really holds the new key.
+7. **Resume** writers, KEDA and ArgoCD sync.
+8. **Retire, last and separately.** After a soak period the owner sets
+   (suggested: one successful nightly backup and one evidence run), delete the
+   old PVC, remove the old KEK from agenix and update the `minio-kms` ledger
+   row. The staged noncurrent versions of `factory-backups` (7 days) and
+   `factory-evidence` (30 days) stay on the encrypted staging volume until
+   their retention would have expired, then the staging volume is destroyed.
+
+Stated properties:
+
+- **Rollback** is available through step 7: scale MinIO down, point it back
+  at the old PVC with the old KEK. The point of no return is deleting the old
+  PVC in step 8, not a step in the middle.
+- **No backup or evidence data is lost.** Current objects are restored and
+  verified by checksum. Noncurrent versions are preserved in the staging
+  archive for their retention period; they are not restored into the bucket,
+  so in-bucket version history restarts. The runbook says this in one
+  sentence so it is a decision, not a surprise.
+- **Cost:** downtime for every S3 consumer, and disk for the old PVC, the new
+  PVC and the staging copy at once.
+- **Unproven assumptions**, listed in the runbook as things the rehearsal must
+  settle before it can lose the UNTESTED label: the exact `mc` flags for
+  exporting versions and tags on the pinned image; that `mc admin kms key
+  status` reports the key name in single-key mode; how the PVC switch is done
+  under ArgoCD (a manifest PR versus a paused-sync patch).
+
+**Rehearsal** subsection: how to rehearse on a throwaway MinIO (a local
+container at the pinned digest with its own KEK, dummy objects, overwritten
+objects so versions exist, tagged objects), and the drill-record fields:
+date, operator, MinIO and mc versions, steps run, each check and its result,
+time taken, deviations, open limitations. The section keeps UNTESTED in its
+title until a record is linked there.
 
 `docs/secrets-management.md` then points at this runbook instead of carrying
-its own copy: the rotation-policy cell for `minio-kms` is shortened to
-"compromise only; emergency path (untested) in
-`encryption-at-rest.md#kek-compromise-emergency-re-encryption-untested`", the
-inventory row drops "new, this PR" and "minio bucket-init" (the Job uses only
-`minio-creds`), and "the new secret this PR introduces" is reworded.
+its own copy. The rotation-policy cell for `minio-kms` becomes "compromise
+only; emergency path (untested) in `encryption-at-rest.md`". The inventory row
+drops "new, this PR" and "minio bucket-init" (the Job uses only
+`minio-creds`). The ESO section's "two consumers", "brand new" and "the new
+secret this PR introduces" are corrected. The comment in
+`apps/minio/manifests/manifests.yaml` line 31 ("the minio pod and the Job both
+reference it") is corrected to the pod only; no other manifest change.
 
 ### D3. `scripts/minio-kek-drill.py`: print-only rehearsal aid
 
 A Python script in the style of `scripts/rotation-ledger-check.py` (standard
-library only, `--self-test`).
+library only, `--self-test`). It covers only the data steps (3, 4 and 6):
+the ones with many per-bucket commands, where retyping causes mistakes.
 
-- `minio-kek-drill.py [--alias NAME]` prints the runbook's steps as numbered
-  shell commands for that `mc` alias (default `drill`), one block per step,
-  for all three buckets, with the stop conditions as comments.
-  `--alias` is validated against `[A-Za-z0-9_-]+`.
-- It has no option that executes anything. It imports no `subprocess`, `os`
-  process functions, `socket` or HTTP module, reads no environment variable and
-  no file except, in `--self-test`, the MinIO manifest. Key values appear only
-  as the placeholders `<OLD_KEK>` and `<NEW_KEK>`.
-- `--self-test` asserts: (a) the script's bucket list equals the set of
-  buckets in `mc encrypt set sse-s3 fac/<bucket>` lines of
-  `apps/minio/manifests/manifests.yaml`; (b) the printed plan has the
-  destructive step after the integrity check and before the mirror-back, and
-  retires the old KEK last; (c) the script's own source contains none of the
-  forbidden imports; (d) a bad `--alias` is rejected.
-- The runbook in D2 is the readable source; the script exists so the commands
-  for a given alias are copy-exact and so (a) is machine-checked. The runbook
-  says to generate the commands with the script rather than retyping them.
+- `minio-kek-drill.py [--alias NAME] [--staging DIR]` prints a bash fragment
+  per step for all three buckets. Each fragment starts with
+  `set -euo pipefail` and its gates fail closed (a checksum mismatch is a
+  failing command, not a comment).
+- It prints **no `kubectl` command, no key placeholder and no command that
+  deletes bucket data.** The cluster steps (1, 2, 5, 7, 8) are prose in the
+  runbook, so a rehearsal on a local container cannot paste a live-cluster
+  command from this script.
+- `--alias` must match `^[A-Za-z][A-Za-z0-9_]*$` (default `drill`);
+  `--staging` must be an absolute path without shell metacharacters (default
+  `/mnt/kek-staging`).
+- It has no option that executes anything. Its imports are limited to
+  `argparse`, `ast`, `pathlib`, `re`, `sys`. It reads no environment variable.
+  It opens files only in `--self-test`: its own source, the MinIO manifest and
+  `docs/encryption-at-rest.md`.
+- `--self-test` asserts, with in-memory mutation cases in the style of the
+  ledger checker:
+  (a) the script's bucket list equals the buckets the manifest creates
+  (`mc mb`) and equals the buckets it encrypts (`mc encrypt set sse-s3`), so a
+  bucket that is created but not encrypted fails too;
+  (b) each of those buckets is named in the runbook section of
+  `docs/encryption-at-rest.md`;
+  (c) every bucket appears in every per-bucket step, and the steps come out in
+  the order export, verify export, restore, verify restore;
+  (d) the printed plan contains no `kubectl`, no `mc rm`, no `mc rb` and no
+  `KEK`;
+  (e) the script's imports, read with `ast`, are within the allowlist;
+  (f) bad `--alias` and `--staging` values are rejected.
+
+What the self-test does not prove, and the runbook says so: that the commands
+are right for the pinned `mc`. Only the rehearsal does.
 
 ### D4. CI
 
 `.github/workflows/secret-rotation-due.yml` gets one step,
-`python3 scripts/minio-kek-drill.py --self-test`, and three more `paths:`
-entries (`scripts/minio-kek-drill.py`, `apps/minio/manifests/manifests.yaml`,
-`docs/encryption-at-rest.md`). No new workflow.
+`python3 scripts/minio-kek-drill.py --self-test`, placed before "Check the
+ledger" so an overdue ledger row on the weekly run does not skip it, and three
+more `paths:` entries (`scripts/minio-kek-drill.py`,
+`apps/minio/manifests/manifests.yaml`, `docs/encryption-at-rest.md`). No new
+workflow.
 
 ### D5. Factory `docs/compliance/policies/encryption-key-mgmt.md`
 
-A dated "Status update 2026-11-14" block under "Current state", and edits to
-the lines that are now false: the MinIO paragraph ("started with no
-server-side encryption"), "Net: no data-at-rest encryption exists on any
-store", "No key-management system ... no KMS resource", and gaps 2, 6 and 7.
-Gaps are annotated, not deleted: 2 "partly closed: SSE-S3 on three buckets,
-existing-object coverage not evidenced, emergency re-encryption untested";
-6 "closed for agenix custody (documented), offline identity backup
-unconfirmed"; 7 "policy and overdue check in place, rotation itself manual".
-No acceptance-criteria checkbox is ticked: each still lacks part of its
-evidence, and the note next to it says which part. Separate PR in Factory,
-opened after the factory-gitops PR merges so its links resolve.
+A dated "Status update 2026-11-14" block under "Current state", using the same
+Live / Repo / Record labels, and corrections to the sentences that no longer
+describe the system:
+
+- MinIO: SSE-S3 is configured on three buckets with MinIO's built-in static
+  single-key mode. This is **not** a KMS service; "no key-management system"
+  stays true and is reworded to say exactly that.
+- "Net: no data-at-rest encryption exists on any store" becomes: object
+  content in MinIO is encrypted for new writes; every volume and etcd are not.
+- Gaps are annotated, not deleted: gap 2 "partly addressed: SSE-S3 configured,
+  existing-object coverage not evidenced, emergency re-encryption untested";
+  gap 6 "partly addressed: agenix custody is documented in factory-gitops;
+  offline identity backup and bootstrap host unconfirmed; no dual control";
+  gap 7 "partly addressed: rotation policy and overdue check exist; rotation
+  is manual".
+- No acceptance-criteria checkbox is ticked; each gets a note saying which
+  part of its evidence is missing.
+
+Separate PR in Factory, opened after the factory-gitops PR merges so that its
+links to the docs and to these three artifacts resolve.
+
+### D6. Comment on Factory#314
+
+One comment with the status table and the owner actions, each one line:
+enable k3s `--secrets-encryption`; rehearse the KEK runbook and file the drill
+record; confirm an offline backup of a decrypting identity; confirm which host
+runs the secret bootstrap; run the existing-object encryption check; decide on
+Redis/Keycloak volumes (risk acceptance or node LUKS); decide on FIPS 140
+scope; decide on KES. The epic stays open.
 
 ## Alternatives rejected
 
-- **A script with a real `--execute` mode guarded by flags.** One wrong
-  context and it empties the evidence bucket. The owner's instruction is
-  dry-run only.
-- **Preserve versions by replicating to a second MinIO with a new KEK and
-  cutting over.** It keeps history, but it needs a second MinIO, replication
-  setup and a service cutover: more to go wrong in an emergency on a
-  single-node cluster. Recorded as the path to take with KES.
-- **Run the rehearsal on a local throwaway MinIO in this change.** It would
-  give a first drill record, but the instruction for this round is a script
-  that only prints, and a drill record should name a human operator.
+- **In-place swap: empty the buckets, change the KEK, mirror back** (the path
+  in the current doc, and the first draft of this spec). Both reviewers
+  showed it has a window where the staging copy is the only data, and that
+  MinIO started with a new key over old-key data may not start or list at
+  all. The fresh-volume cutover removes both.
+- **A second MinIO running in parallel with bucket replication.** Keeps
+  versions and tags natively and needs no plaintext staging, but adds a second
+  service, replication setup and a client cutover in the middle of an
+  incident. Recorded as the better path once KES exists.
+- **A script with a real `--execute` mode guarded by flags.** The owner's
+  instruction is dry-run only, and one wrong context is too expensive.
+- **Run the rehearsal on a local throwaway MinIO in this change.** The
+  instruction for this round is a script that only prints, and a drill record
+  should name a human operator.
 - **Add an `mc encrypt info` read-back assertion to the bucket Job.** Worth
-  doing, but the exact output of the pinned `mc` build cannot be confirmed
-  without running it, and a wrong match fails the PostSync hook on the live
-  cluster. Listed as a follow-up.
-- **Bash for the script.** The repo's existing checker is Python with a
-  self-test; a second style buys nothing.
-- **A new workflow file.** The existing rotation workflow already covers
-  these docs.
+  doing, but the output of the pinned `mc` cannot be confirmed without
+  running it, and a wrong match fails the PostSync hook on the live cluster.
+  Follow-up.
+- **Bash for the script; a new workflow file.** The repo already has a Python
+  checker with a self-test and a workflow that covers these docs.
 - **Tick the policy checkboxes that are "mostly" met.** An assessor tests the
   whole sentence.
 
 ## Risks
 
-- The runbook is still untested when this merges. A wrong `mc` flag in it
-  would surface only in a rehearsal. Mitigation: the title says UNTESTED, the
-  rehearsal is the first owner action, and the reviewers check each command
-  against `mc` documentation.
-- `mc rm --recursive --versions --force` is in a document. Mitigation: it is
-  printed for a named alias, default `drill`, never run by anything here.
-- The host statements (p510 vs p620) stay partly unverified; the doc says so.
-- No runtime risk: docs, one script that only prints, one CI step.
+- The runbook is untested when this merges, and three of its assumptions are
+  listed as unproven. Mitigation: the title says UNTESTED, the rehearsal is
+  the first owner action, and the old PVC is kept until the end, so a wrong
+  command costs downtime, not data.
+- Commands printed by the script can still be pasted against the wrong alias.
+  Mitigation: it prints nothing that deletes bucket data and no cluster
+  command; the worst case is an unwanted read or an upload into a bucket.
+- Staging holds plaintext. Mitigation: LUKS volume, destroyed at the end.
+- The host statements (p510 or p620) stay unconfirmed; the docs say so.
+- Runtime risk of this change itself: none beyond a comment edit in the MinIO
+  manifest, which does not alter the rendered resources.
 
 ## Verification
 
-- `python3 scripts/minio-kek-drill.py --self-test` passes; changing the bucket
-  list in a copy of the manifest makes it fail.
-- `python3 scripts/minio-kek-drill.py` prints all three buckets and exits 0;
-  `--alias 'a;b'` exits non-zero.
+- `python3 scripts/minio-kek-drill.py --self-test` passes, including its
+  mutation cases (a manifest with a bucket created but not encrypted, a
+  runbook missing a bucket, a forbidden import, a plan containing `mc rm`).
+- `python3 scripts/minio-kek-drill.py` exits 0 and its output names all three
+  buckets; `--alias=-rf` and `--alias 'a;b'` exit non-zero.
+- `bash -n` accepts the printed fragments.
 - `python3 scripts/rotation-ledger-check.py --validate-only docs/secrets-management.md`
-  still passes (the ledger block is untouched).
-- `grep -n 'nothing at rest\|this PR\|both buckets' docs/encryption-at-rest.md docs/secrets-management.md`
-  returns nothing.
-- Every relative link and anchor added resolves (checked by hand; mkdocs build
-  if the repo's CI runs one).
-- CI on the PR is green.
+  still passes.
+- `grep -n 'nothing at rest\|this PR\|both buckets\|two consumers\|brand new\|both reference'`
+  over the two docs and the MinIO manifest returns nothing, and every
+  remaining `/mnt/img_pool` or two-bucket mention has been reviewed by hand.
+- `kustomize build apps/minio/manifests` output is unchanged against `main`.
+- Added links and anchors resolve; CI on both PRs is green.
