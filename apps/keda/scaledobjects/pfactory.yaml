@@ -14,12 +14,10 @@ metadata:
 spec:
   scaleTargetRef:
     name: pfactory
-  # TEMPORARY (#303 soak): forces a second pod so the 2-replica path sees real
-  # traffic before the ceiling goes to 4. Revert on 2026-11-02 (3-day window).
-  minReplicaCount: 2
-  # 2 first (#273); 4 only after a week at 2 with no anomalies. Must equal
+  minReplicaCount: 1
+  # 2 first (#273), 4 after a week at 2 with no anomalies (#303). Must equal
   # PFACTORY_REPLICA_COUNT in apps/pfactory/manifests/manifests.yaml.
-  maxReplicaCount: 2
+  maxReplicaCount: 4
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
