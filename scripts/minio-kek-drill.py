@@ -24,15 +24,19 @@ def staging_arg(value):
     return value.rstrip("/") or "/"
 
 
-def render(alias="drill", staging="/mnt/kek-staging"):
+STEPS = (("3", "export"), ("4", "verify export"), ("6a", "restore"), ("6b", "verify restore"))
+
+
+def render(alias="drill", staging="/mnt/kek-staging", only=None):
     sections = []
-    for step, name in (("3", "export"), ("4", "verify export"),
-                       ("6a", "restore"), ("6b", "verify restore")):
+    for step, name in STEPS:
+        if only and step != only:
+            continue
         blocks = []
         for bucket in BUCKETS:
             root = f"{staging}/current/{bucket}"
             inventory = f"{staging}/inventory/{bucket}"
-            versions = f"{staging}/noncurrent/{bucket}"
+            versions = f"{staging}/versions/{bucket}"
             source = f"{alias}/{bucket}"
             if step == "3":
                 block = f'''# UNPROVEN: settle in rehearsal: version inventory fields and flags.
@@ -49,30 +53,36 @@ mc ls --recursive --json "{source}" | jq -rs '
 ' > "{inventory}.keys"
 mkdir -p "{root}" "{versions}"
 mc mirror "{source}" "{root}"
-# UNPROVEN: settle in rehearsal: version selection and mc cat flag.
-jq -c 'select(.type == "file" and .isLatest == false and .isDeleteMarker != true)' "{inventory}.versions.json" |
+# Every version is exported, current ones too: the selection must not depend
+# on a "latest" field. UNPROVEN: settle in rehearsal: mc cat flag.
+jq -c 'select(.type == "file" and .isDeleteMarker != true)' "{inventory}.versions.json" |
 while IFS= read -r record; do
   key=$(jq -r '.key' <<< "$record")
   version=$(jq -r '.versionId' <<< "$record")
   case "$version" in ''|.|..|*/*|*$'\\n'* ) echo "unsafe version id" >&2; exit 1;; esac
   case "$key" in /*|*/|*$'\\n'*) echo "unsafe object key" >&2; exit 1;; esac
-  mkdir -p "{versions}/$version/$(dirname "$key")"
-  mc cat --version-id "$version" "{source}/$key" > "{versions}/$version/$key"
+  mkdir -p "{versions}/$version/$(dirname -- "$key")"
+  mc cat --version-id "$version" "{source}/$key" > "{versions}/$version/$key" < /dev/null
 done
+# Every current key has at least one version, so an empty or short selection
+# (for example a JSON field named differently on this mc) must stop here.
+staged_versions=$(find "{versions}" -type f | wc -l)
+current_keys=$(wc -l < "{inventory}.keys")
+[ "$staged_versions" -ge "$current_keys" ] || {{ echo "version export is short: $staged_versions files for $current_keys keys" >&2; exit 1; }}
 : > "{inventory}.tags.jsonl"
 while IFS= read -r key; do
   # UNPROVEN: settle in rehearsal: tag list output format.
-  mc tag list --json "{source}/$key" | jq -c --arg key "$key" '{{key:$key,tags:(.tagset // {{}})}}' >> "{inventory}.tags.jsonl"
+  mc tag list --json "{source}/$key" < /dev/null | jq -c --arg key "$key" '{{key:$key,tags:(.tagset // {{}})}}' >> "{inventory}.tags.jsonl"
 done < "{inventory}.keys"
 jq -s . "{inventory}.tags.jsonl" > "{inventory}.tags.json"'''
             elif step == "4":
                 block = f'''find "{root}" -type f -print0 | sort -z |
 while IFS= read -r -d '' file; do
-  hash=$(sha256sum "$file" | cut -d ' ' -f 1)
+  hash=$(sha256sum < "$file" | cut -d ' ' -f 1)
   printf '%s  %s\\n' "$hash" "${{file#"{root}/"}}"
 done | LC_ALL=C sort > "{inventory}.current.staged.sha256"
 while IFS= read -r key; do
-  hash=$(mc cat "{source}/$key" | sha256sum | cut -d ' ' -f 1)
+  hash=$(mc cat "{source}/$key" < /dev/null | sha256sum | cut -d ' ' -f 1)
   printf '%s  %s\\n' "$hash" "$key"
 done < "{inventory}.keys" | LC_ALL=C sort > "{inventory}.current.source.sha256"
 cmp "{inventory}.current.staged.sha256" "{inventory}.current.source.sha256"
@@ -81,18 +91,19 @@ while IFS= read -r -d '' file; do
   relative="${{file#"{versions}/"}}"
   version="${{relative%%/*}}"
   key="${{relative#*/}}"
-  hash=$(sha256sum "$file" | cut -d ' ' -f 1)
+  hash=$(sha256sum < "$file" | cut -d ' ' -f 1)
   printf '%s  %s  %s\\n' "$hash" "$version" "$key"
-done | LC_ALL=C sort > "{inventory}.noncurrent.staged.sha256"
+done | LC_ALL=C sort > "{inventory}.versions.staged.sha256"
 # UNPROVEN: settle in rehearsal: version inventory fields and mc cat flag.
-jq -c 'select(.type == "file" and .isLatest == false and .isDeleteMarker != true)' "{inventory}.versions.json" |
+jq -c 'select(.type == "file" and .isDeleteMarker != true)' "{inventory}.versions.json" |
 while IFS= read -r record; do
   key=$(jq -r '.key' <<< "$record")
   version=$(jq -r '.versionId' <<< "$record")
-  hash=$(mc cat --version-id "$version" "{source}/$key" | sha256sum | cut -d ' ' -f 1)
+  hash=$(mc cat --version-id "$version" "{source}/$key" < /dev/null | sha256sum | cut -d ' ' -f 1)
   printf '%s  %s  %s\\n' "$hash" "$version" "$key"
-done | LC_ALL=C sort > "{inventory}.noncurrent.source.sha256"
-cmp "{inventory}.noncurrent.staged.sha256" "{inventory}.noncurrent.source.sha256"'''
+done | LC_ALL=C sort > "{inventory}.versions.source.sha256"
+cmp "{inventory}.versions.staged.sha256" "{inventory}.versions.source.sha256"
+[ "$(wc -l < "{inventory}.versions.source.sha256")" -ge "$(wc -l < "{inventory}.keys")" ] || {{ echo "version manifest is short" >&2; exit 1; }}'''
             elif step == "6a":
                 block = f'''mc mirror "{root}" "{source}"
 jq -c '.[] | select(.tags != {{}})' "{inventory}.tags.json" |
@@ -100,21 +111,28 @@ while IFS= read -r record; do
   key=$(jq -r '.key' <<< "$record")
   tags=$(jq -r '.tags | to_entries | map("\\(.key)=\\(.value)") | join("&")' <<< "$record")
   # UNPROVEN: settle in rehearsal: tag set argument format.
-  mc tag set "{source}/$key" "$tags"
+  mc tag set "{source}/$key" "$tags" < /dev/null
 done'''
             else:
                 block = f'''find "{root}" -type f -print0 | sort -z |
 while IFS= read -r -d '' file; do
-  hash=$(sha256sum "$file" | cut -d ' ' -f 1)
+  hash=$(sha256sum < "$file" | cut -d ' ' -f 1)
   printf '%s  %s\\n' "$hash" "${{file#"{root}/"}}"
 done | LC_ALL=C sort > "{inventory}.current.staged.sha256"
 while IFS= read -r key; do
-  hash=$(mc cat "{source}/$key" | sha256sum | cut -d ' ' -f 1)
+  hash=$(mc cat "{source}/$key" < /dev/null | sha256sum | cut -d ' ' -f 1)
   printf '%s  %s\\n' "$hash" "$key"
 done < "{inventory}.keys" | LC_ALL=C sort > "{inventory}.current.restored.sha256"
-cmp "{inventory}.current.staged.sha256" "{inventory}.current.restored.sha256"'''
+cmp "{inventory}.current.staged.sha256" "{inventory}.current.restored.sha256"
+cmp "{inventory}.current.source.sha256" "{inventory}.current.restored.sha256"
+while IFS= read -r key; do
+  mc tag list --json "{source}/$key" < /dev/null | jq -c --arg key "$key" '{{key:$key,tags:(.tagset // {{}})}}'
+done < "{inventory}.keys" > "{inventory}.tags.restored.jsonl"
+cmp "{inventory}.tags.jsonl" "{inventory}.tags.restored.jsonl"'''
             blocks.append(f"# {bucket}\n{block}")
-        setup = f'mkdir -p "{staging}/inventory"\n' if step == "3" else ""
+        setup = {"3": f'set -o noclobber  # a re-run must not overwrite the inventory\nmkdir -p "{staging}/inventory"\n',
+                 "6a": "# Run only after the cutover (runbook step 5), against the NEW MinIO.\n",
+                 "6b": "# Run only after step 6a, against the NEW MinIO.\n"}.get(step, "")
         sections.append(f"# step {step}: {name}\nset -euo pipefail\n{setup}" + "\n\n".join(blocks))
     return "\n\n".join(sections) + "\n"
 
@@ -158,16 +176,20 @@ def self_test():
         return 1
 
     printed = render()
+    alias_ = "drill"
+
     def check_fragments(output):
         headings = re.findall(r"^# step (\S+):", output, re.M)
         fragments = re.split(r"(?=^# step \S+:)", output, flags=re.M)[1:]
         return (headings == ["3", "4", "6a", "6b"] and
                 all(fragment.splitlines()[1] == "set -euo pipefail" for fragment in fragments) and
-                all(all(bucket in fragment for bucket in BUCKETS) for fragment in fragments))
+                all(all(f'{alias_}/{bucket}' in fragment for bucket in BUCKETS) for fragment in fragments))
 
     assert check_fragments(printed)
     assert not check_fragments(printed.replace("# step 6a:", "# step 5:", 1))
-    forbidden = ("kubectl", "mc rm", "mc rb", "MINIO_KMS", "<OLD", "<NEW")
+    assert not check_fragments(printed.replace(f"drill/{BUCKETS[2]}", "drill/other"))
+    assert render(only="4").count("# step ") == 1 and "# step 4:" in render(only="4")
+    forbidden = ("kubectl", "mc rm", "mc rb", "--remove", "--overwrite", "MINIO_KMS", "<OLD", "<NEW")
     def safe_output(output):
         return all(word not in output for word in forbidden)
 
@@ -203,11 +225,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--alias", type=alias_arg, default="drill")
     parser.add_argument("--staging", type=staging_arg, default="/mnt/kek-staging")
+    parser.add_argument("--step", choices=[step for step, _ in STEPS], help="print one step only")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
-    print(render(args.alias, args.staging), end="")
+    print(render(args.alias, args.staging, args.step), end="")
     return 0
 
 

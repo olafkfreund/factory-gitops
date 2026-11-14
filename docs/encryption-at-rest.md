@@ -138,7 +138,8 @@ written under the old one, and nothing is deleted until the last step.
 
 The per-bucket commands for steps 3, 4 and 6 come from
 `python3 scripts/minio-kek-drill.py --alias <alias> --staging <dir>`, which
-only prints them. Do not retype them. Save each step's fragment to a file and
+only prints them. Do not retype them. Print one step at a time with
+`--step 3`, `--step 4`, `--step 6a` or `--step 6b`, save it to a file and
 run it with `bash` (each fragment sets `set -euo pipefail`, which would close
 an interactive shell on the first failed check). The fragments need `mc`, `jq`
 and `sha256sum` on the machine that holds the staging volume. The script
@@ -158,14 +159,16 @@ leading or trailing `/`); handle those objects by hand.
    Lifecycle expiry keeps running; what it removes was due to expire anyway.
 3. **Export under the old KEK** to persistent encrypted staging (a LUKS
    volume; not `tmpfs`, not the plain node disk). Per bucket: current objects
-   (`mc mirror`); every noncurrent version, to a path carrying its version id;
+   (`mc mirror`); every version, current and noncurrent, to a path carrying its
+   version id;
    an inventory of versions and delete markers; and the object tags (the
    `factory-artifacts` lifecycle rules filter on the `role` tag).
-4. **Verify the export by content**, for current objects and for noncurrent
-   versions separately: a SHA-256 manifest of the staged files must equal a
+4. **Verify the export by content**, for current objects and for the
+   per-version archive separately: a SHA-256 manifest of the staged files must equal a
    SHA-256 manifest from a second, independent read from MinIO
-   (`mc cat | sha256sum`; for noncurrent versions `mc cat --version-id`, with
-   the version id in each manifest line). `mc diff` is not evidence. Any
+   (`mc cat | sha256sum`; for the version archive `mc cat --version-id`, with
+   the version id in each manifest line). The archive must hold at least one
+   file per current key, so an export that silently selected nothing fails. `mc diff` is not evidence. Any
    difference stops the procedure.
 5. **Cut over.** Scale MinIO to zero and leave the old PVC untouched. Run the
    Deployment on a new empty PVC with `minio-kms` set to the new KEK, start it,

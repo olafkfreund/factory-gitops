@@ -326,6 +326,14 @@ option.
 - Step 1: tags are exported with `mc tag list --json` and re-applied as
   `key=value&key=value`; still marked UNPROVEN in the output.
 
+- Step 1, after the final review: the script exports **every** version by
+  version id to `<staging>/versions/<bucket>` (not only noncurrent ones to
+  `noncurrent/`), because selecting noncurrent versions depended on a JSON
+  field that may not exist, and an empty selection passed its own check. A
+  count gate (at least one staged version per current key) now fails an empty
+  export. Also added: `--step` to print one step, `set -o noclobber` in
+  step 3, a tag comparison and a tie-back to the step 4 manifest in step 6b.
+
 ## Tests
 
 In the factory-gitops worktree. Exit 0 unless noted; a `grep` that is
