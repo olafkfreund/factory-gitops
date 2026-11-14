@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 3681
 spec: spec/2026-11-14-3681-offsite-backup-copy.md
 coders:
