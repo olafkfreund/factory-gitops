@@ -132,6 +132,17 @@ Kyverno v1.18.2 (cluster and CLI). CLI for local runs:
 
 4. (lead, no file edits) Tests, mutation checks, and other suites (see Tests).
 
+5. `docs/image-signature-admission.md` (deviation, added 2026-11-14; lead, a
+   single-file docs edit below the handoff threshold). #327 changed no docs, so
+   the page still said coverage applies in `factory` or `gateway` only. Carry
+   over the docs commit of the superseded factory-gitops#318 (`899e3b4`): the
+   four-namespace scope and the rule/namespace/covered-repos table. Correct
+   what review confirmed wrong in it: `pods/ephemeralcontainers` is matched
+   (spec, design section 1), so only "namespaces with no group" stays out of
+   scope; `fides` had no coverage rule before, not a false "covered"; and drift
+   is caught by the agree script, not `kyverno test`.
+   Verify: the table's rule names and namespaces equal the manifest's.
+
 ## Tests
 
 - `python3 apps/kyverno-policies/assert-signature-lists-agree.py` → `ok`.
