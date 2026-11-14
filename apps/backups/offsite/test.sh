@@ -3,7 +3,7 @@ set -euo pipefail
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-script_dir=${0%/*}
+script_dir=$(dirname "$0")
 mkdir -p "$tmp/bin"
 cat > "$tmp/bin/mc" <<'EOF'
 #!/bin/sh
@@ -73,6 +73,10 @@ run_case() {
     *) printf 'valid backup\n' | gzip > "$source_dir/$name" ;;
   esac
   case "$case_name" in
+    happy)
+      # An older dump and a key that sorts last: the newest matching name must win.
+      printf 'old backup\n' | gzip > "$source_dir/factory-cluster-$(date -u -d "@$((now - 864000))" +%Y%m%dT%H%M%SZ).sql.gz"
+      printf 'notes\n' > "$source_dir/zzz-notes.txt" ;;
     corrupt) printf 'different backup\n' | gzip > "$target_dir/$name" ;;
     empty) : > "$target_dir/$name" ;;
     invalid_gzip) cp "$source_dir/$name" "$target_dir/$name" ;;

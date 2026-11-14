@@ -30,7 +30,8 @@ so a full restore is one `psql` feed.
 - RPO (max data loss): <= 24h. Backups run once daily; a failure between two runs
   loses at most one day of control-plane state (job_states and the per-service
   tables). Tighten by increasing the CronJob frequency or adding WAL archiving
-  (not implemented).
+  (not implemented). The off-cluster copy runs an hour after the dump, so a
+  restore from it can be up to 25h behind.
 - RTO (time to restore): target <= 1h for the Postgres restore below on the
   current single-node cluster (download + gunzip + psql of a few-GB dump). Actual
   time scales with dump size; measure it during the drill.
@@ -53,8 +54,8 @@ one hour after the dump. It does this, and fails the Job if any step fails:
 
 - Finds the newest `factory-cluster-*.sql.gz` in `factory-backups/postgres/` and
   checks that it is under 12h old and not future-dated.
-- Mirrors `factory-backups/postgres/` to the external bucket. It never deletes or
-  overwrites there.
+- Mirrors `factory-backups/postgres/` to `postgres/` in the external bucket. It
+  never deletes or overwrites there.
 - Reads the copy back and checks that it is not empty, passes `gzip -t`, and has
   the same sha256 as the source.
 
@@ -81,8 +82,18 @@ only after the Secret exists. Without it the pod sits in
 Check it: `kubectl -n factory logs job/<name>` shows an `offsite-copy: OK` line,
 and `job_health` for `postgres-backup-offsite` is green.
 
-Restore from the copy: get the object from the destination with `mc`, then follow
-"Restore: Postgres" from step 3.
+Restore from the copy: `restore.sh` only reads the in-cluster bucket, so it cannot
+use the copy yet. By hand: download the object from the destination with `mc`,
+quiesce the writers as in "Restore: Postgres" step 3, then feed it to Postgres
+with the same command `restore.sh` runs, from a pod that can reach `postgres`
+and has `PGPASSWORD` set:
+
+```
+gunzip -c factory-cluster-<ts>.sql.gz | psql -h postgres -U factory -d postgres -v ON_ERROR_STOP=1
+```
+
+This path has not been drilled. Read the role-password finding from the
+2026-08-10 drill (Factory#321) first.
 
 Still open:
 

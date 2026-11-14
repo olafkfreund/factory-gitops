@@ -110,7 +110,9 @@ reviewers:
    initContainer: labels `app: postgres-backup-offsite`, `schedule: "15 3 * * *"`,
    `concurrencyPolicy: Forbid`, `successfulJobsHistoryLimit: 3`,
    `failedJobsHistoryLimit: 10`, `startingDeadlineSeconds: 600`,
-   `backoffLimit: 2`, no `ttlSecondsAfterFinished`, `restartPolicy: Never`,
+   `backoffLimit: 2`, `activeDeadlineSeconds: 3600` (added after review: a hung
+   transfer to the destination would otherwise block every later run under
+   `Forbid`), no `ttlSecondsAfterFinished`, `restartPolicy: Never`,
    `enableServiceLinks: false`, `automountServiceAccountToken: false`, pod
    `securityContext` `runAsNonRoot: true`, `runAsUser: 65532`, `fsGroup: 65532`,
    `seccompProfile: RuntimeDefault`; container `command: ["/bin/sh", "/script/offsite-copy.sh"]`,
