@@ -333,6 +333,9 @@ option.
   count gate (at least one staged version per current key) now fails an empty
   export. Also added: `--step` to print one step, `set -o noclobber` in
   step 3, a tag comparison and a tie-back to the step 4 manifest in step 6b.
+- Step 5: the heading "Data at rest (none)" became "Data at rest (partial:
+  MinIO object content only)", because the lines under it no longer say
+  "none". The status line is line 6 of the file, not line 4.
 
 ## Tests
 
