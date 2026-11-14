@@ -1,0 +1,26 @@
+# Runs apps/backups/offsite/test.sh in the same image the CronJob uses.
+# No paths filter: it is quick, and a required check that does not run on a PR
+# leaves that PR blocked.
+name: backup offsite copy test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: offsite copy refuses bad copies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run test.sh in the CronJob image
+        run: |
+          image="$(grep -o 'cgr.dev/chainguard/minio-client[^ ]*' apps/backups/offsite/cronjob.yaml | head -n 1)"
+          test -n "$image" || { echo "no image found in cronjob.yaml" >&2; exit 1; }
+          docker run --rm -v "$PWD/apps/backups/offsite:/t:ro" --entrypoint /bin/sh "$image" /t/test.sh

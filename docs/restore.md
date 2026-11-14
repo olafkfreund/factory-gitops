@@ -17,6 +17,10 @@ Factory control plane (Factory#321, tracked under the compliance program #310).
   `factory-artifacts` bucket too, so an overwrite or delete of an evidence object
   leaves a recoverable prior version.
 
+- Off-cluster copy of the dumps: `apps/backups/offsite/` (CronJob
+  `postgres-backup-offsite`, 03:15 UTC). Off until enabled, see "Off-cluster
+  copy" below.
+
 The dump is a single plain-SQL file covering every database
 (`pfactory`, `tfactory`, `aifactory`, `cfactory`, `factory`) plus global roles,
 so a full restore is one `psql` feed.
@@ -35,25 +39,58 @@ so a full restore is one `psql` feed.
 
 - Not true disaster recovery yet. MinIO runs on the same cluster as Postgres, on
   an RWO `local-path` PVC pinned to one node (`apps/minio/manifests.yaml`). A node
-  or cluster loss takes the backups with the source. The off-cluster copy is the
-  required next step (see below).
+  or cluster loss takes the backups with the source. The off-cluster copy fixes
+  this for the Postgres dumps, but it is off until enabled (see below).
 - No point-in-time recovery. These are daily logical snapshots, not WAL
   archiving; you can only restore to a backup boundary, not an arbitrary moment.
 - Restore is not yet automated. The `restore.sh` helper is run deliberately by a
   human; there is no self-service restore.
 
-## Off-cluster follow-up (required to call this DR)
+## Off-cluster copy
 
-Pick one and schedule it off the cluster's failure domain:
+CronJob `postgres-backup-offsite` (`apps/backups/offsite/`) runs at 03:15 UTC,
+one hour after the dump. It does this, and fails the Job if any step fails:
 
-- `mc mirror --watch` (or a second CronJob) replicating `factory-backups` and
-  `factory-artifacts` to an external S3 target (AWS S3, Backblaze B2, another
-  MinIO on a different node/site).
-- MinIO bucket replication to a remote MinIO once a second site exists.
-- `restic`/`rclone` of the gzip objects to remote storage with its own retention.
+- Finds the newest `factory-cluster-*.sql.gz` in `factory-backups/postgres/` and
+  checks that it is under 12h old and not future-dated.
+- Mirrors `factory-backups/postgres/` to the external bucket. It never deletes or
+  overwrites there.
+- Reads the copy back and checks that it is not empty, passes `gzip -t`, and has
+  the same sha256 as the source.
 
-Until one of these is live, treat the "backups" as protection against accidental
-deletion and logical corruption only, not against losing the node.
+Destination requirements:
+
+- Private bucket, encryption at rest, versioning or object lock, and a lifecycle
+  rule.
+- A key scoped to that bucket that can list, read and write but not delete.
+
+Recommendation: a bucket at an S3-compatible provider outside the house, in the
+EU, for example Backblaze B2 or Hetzner Object Storage, with a lifecycle of about
+90 days. A MinIO on p510 is the fallback. It leaves the cluster host but does not
+survive losing the site.
+
+Secret `offsite-s3-creds` (namespace `factory`), keys: `OFFSITE_S3_ENDPOINT`
+(must start with `https://`), `OFFSITE_S3_BUCKET`, `OFFSITE_S3_ACCESS_KEY`,
+`OFFSITE_S3_SECRET_KEY`. Seed it the way `docs/secrets-management.md` describes,
+then add a row for it to that file's inventory and rotation ledger.
+
+Enable: add `- ../offsite` to `apps/backups/manifests/kustomization.yaml` in a PR,
+only after the Secret exists. Without it the pod sits in
+`CreateContainerConfigError`.
+
+Check it: `kubectl -n factory logs job/<name>` shows an `offsite-copy: OK` line,
+and `job_health` for `postgres-backup-offsite` is green.
+
+Restore from the copy: get the object from the destination with `mc`, then follow
+"Restore: Postgres" from step 3.
+
+Still open:
+
+- Dumps are not encrypted client-side. The pinned image has no `openssl`, `gpg`
+  or `age`. Adding one means another image and a key that must be at hand during
+  a restore. Owner's decision.
+- `factory-artifacts` has no off-cluster copy.
+- A restore from the off-cluster copy has not been drilled (Factory#3681).
 
 ## Restore: Postgres
 
@@ -121,9 +158,9 @@ depends on what happened:
 - Overwrite: same as above — list versions, copy the good version-id back over
   the key.
 
-- Whole-bucket loss (node gone): only recoverable from the off-cluster copy once
-  that follow-up is implemented. Until then, this case is unrecoverable — call it
-  out honestly in any DR sign-off.
+- Whole-bucket loss (node gone): the Postgres dumps are recoverable from the
+  off-cluster copy once it is enabled. `factory-artifacts` is not: it has no
+  off-cluster copy. Say so in any DR sign-off.
 
 ## Restore-verification checklist
 
@@ -148,5 +185,8 @@ Run after any Postgres restore, before returning the fleet to service:
       and recent `jobs`/`pods` show completions, not failures.
 - [ ] Today's object exists and is non-trivial in size:
       `mc ls fac/factory-backups/postgres/`.
+- [ ] The off-cluster job is succeeding (once enabled): `job_health` for
+      `postgres-backup-offsite`, and the newest Job log has an `offsite-copy: OK`
+      line.
 - [ ] Restore drill on a scratch namespace/database at least quarterly — an
       untested backup is not a backup.

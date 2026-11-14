@@ -18,8 +18,8 @@
 #
 # RESIDUAL DR GAP: MinIO lives on the SAME cluster (RWO local-path PVC, one node).
 # A backup that shares a failure domain with its source is not disaster recovery.
-# The off-cluster copy (mc mirror to an external S3 / restic to remote) is the
-# required next step — tracked in docs/restore.md "Off-cluster follow-up".
+# The off-cluster copy is in apps/backups/offsite/. It is off until enabled; see
+# docs/restore.md "Off-cluster copy".
 #
 # Retention: enforced by the bucket lifecycle rule (keep ~14 dailies), NOT by a
 # prune step here (apps/minio/manifests.yaml: `mc ilm rule add --expire-days 14`).
