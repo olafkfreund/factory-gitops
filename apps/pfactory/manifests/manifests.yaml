@@ -362,8 +362,20 @@ spec:
             # Replica ceiling (#273): must equal the ScaledObject's maxReplicaCount.
             # With >1 and no shared session store, the pod refuses to start rather
             # than split-brain per process (PFactory#755).
-            - { name: PFACTORY_REPLICA_COUNT, value: "2" }
+            - { name: PFACTORY_REPLICA_COUNT, value: "4" }
             - { name: PFACTORY_REQUIRE_SHARED_STORE, value: "1" }
+            # DB pool caps (#303; ~9 per pod as AIFactory spec 2026-10-30-1963 asks):
+            # 4 + 1 + 1 + relay 3 = 9 per pod, so 4 pods (36) plus AIFactory (24),
+            # TFactory (16 + ~15 verify dispatches) and KEDA (3) fit in the shared
+            # Postgres's 97 usable connections. The image default is 19 per pod.
+            # On "QueuePool limit" / TimeoutError in the logs, raise max_connections
+            # on Postgres first; there is no room left to raise these.
+            - { name: DB_POOL_SIZE, value: "3" }
+            - { name: DB_MAX_OVERFLOW, value: "1" }
+            - { name: JOBSTORE_DB_POOL_SIZE, value: "1" }
+            - { name: JOBSTORE_DB_MAX_OVERFLOW, value: "0" }
+            - { name: PLAN_SESSION_DB_POOL_SIZE, value: "1" }
+            - { name: PLAN_SESSION_DB_MAX_OVERFLOW, value: "0" }
             # Docs emit (PFactory#700): on approval, render the plan doc plus a
             # <slug>.run.json run signature and write them under the same PVC
             # (~/.pfactory/plan-docs), so an approved plan leaves a durable,
