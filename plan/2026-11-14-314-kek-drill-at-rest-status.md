@@ -72,9 +72,12 @@ until the end. Steps:
    (`mc mirror`); every noncurrent version to a path carrying its version id;
    an inventory of versions and delete markers; the object tags (the
    `factory-artifacts` lifecycle rules filter on the `role` tag).
-4. Verify the export by content: SHA-256 manifest of the staged files equals a
-   SHA-256 manifest from a second independent read of every object
-   (`mc cat | sha256sum`). `mc diff` is not evidence. Any difference stops.
+4. Verify the export by content, for current objects and for noncurrent
+   versions separately: a SHA-256 manifest of the staged files equals a
+   SHA-256 manifest from a second independent read from MinIO
+   (`mc cat | sha256sum`; for noncurrent versions `mc cat --version-id`, with
+   the version id in each manifest line). `mc diff` is not evidence. Any
+   difference stops.
 5. Cut over. Scale MinIO to zero. Old PVC untouched. Deployment on a new empty
    PVC, `minio-kms` set to the new KEK, start, confirm the key in use is the
    new key name (`mc admin kms key status`). Run `minio-create-bucket`
@@ -91,8 +94,11 @@ until the end. Steps:
    expired (`factory-backups` 7 days, `factory-evidence` 30 days), then the
    volume is destroyed.
 
-Properties to state: rollback is available through step 7 (old PVC + old KEK);
-the point of no return is deleting the old PVC in step 8. No backup or
+Properties to state: rollback without data loss is available through step 6
+(old PVC + old KEK, writers still paused). After writers resume in step 7,
+going back to the old PVC loses whatever was written since, so from step 7 on
+rollback is a decision with a stated loss. Deleting the old PVC in step 8 ends
+the rollback option altogether. No backup or
 evidence data is lost: current objects restored and checksum-verified,
 noncurrent versions kept in the staging archive, in-bucket version history
 restarts. Cost: downtime for all S3 consumers; disk for old PVC, new PVC and
@@ -108,9 +114,11 @@ option.
 ## Steps
 
 1. **New file `scripts/minio-kek-drill.py`** (coder: codex) → verify by
-   `python3 scripts/minio-kek-drill.py --self-test` (exit 0),
-   `python3 scripts/minio-kek-drill.py | bash -n` (exit 0), and
-   `python3 scripts/minio-kek-drill.py --alias=-rf; test $? -ne 0`.
+   `python3 scripts/minio-kek-drill.py > /tmp/plan.sh && bash -n /tmp/plan.sh`
+   (both exit 0) and `python3 scripts/minio-kek-drill.py --alias=-rf` (exits
+   non-zero). `--self-test` is expected to fail on assertion (b) only until
+   step 2 is done; it is the verification of step 2. Steps 1 and 2 may run in
+   parallel.
    - Style: follow `scripts/rotation-ledger-check.py` (shebang, docstring,
      `argparse`, a `self_test()` with in-memory cases, `main()` returning an
      exit code). Mark it executable like that file (`git ls-files -s scripts/`
@@ -132,8 +140,18 @@ option.
      `<staging>/inventory/<bucket>.tags.json`. Where the exact `mc` flag is
      one of the unproven assumptions, emit the best-known command and a
      `# UNPROVEN: settle in rehearsal` comment on the line above it.
-     Step 4 and 6b: build a sorted `sha256  key` manifest from the staged
-     files and one from `mc cat` of every object, and `cmp` them.
+     Step 4: two comparisons per bucket. Current objects: a sorted
+     `sha256  key` manifest of `<staging>/current/<bucket>` against one built
+     from `mc cat` of every current object; `cmp` them. Noncurrent versions: a
+     sorted `sha256  version-id  key` manifest of
+     `<staging>/noncurrent/<bucket>` against one built from
+     `mc cat --version-id`; `cmp` them. Step 6b: the current-object comparison
+     again, against the new MinIO.
+     Object keys: the first command of step 3 for each bucket lists every key
+     and **stops** (non-zero exit) if any key contains a newline, a `..` path
+     component, a leading `/` or a trailing `/`. The fragments do not try to
+     encode such keys; the runbook says to handle them by hand. All loops read
+     keys with `while IFS= read -r` and quote every expansion.
      Step 6a: `mc mirror` from `<staging>/current/<bucket>` into the bucket,
      then re-apply tags from the inventory.
    - Imports only `argparse`, `ast`, `pathlib`, `re`, `sys`. No environment
@@ -143,25 +161,30 @@ option.
    - `self_test()` asserts, with a failing mutation for each:
      (a) `set(BUCKETS)` equals the buckets in `mc mb --ignore-existing fac/<b>`
      lines and equals the buckets in `mc encrypt set sse-s3 fac/<b>` lines of
-     the manifest (mutation: a manifest text with a fourth `mc mb` bucket);
+     the manifest; the lines are indented (manifest lines 237, 241, 246 and
+     258-260), and each extracted set must be non-empty (mutations: a manifest
+     text with a fourth `mc mb` bucket; a manifest text with no match at all);
      (b) each bucket name occurs in the text of `docs/encryption-at-rest.md`
-     between the heading containing `KEK compromise` and the next `## ` heading
-     (mutation: a doc text with one bucket removed);
+     between the heading containing `KEK compromise` and the next heading of
+     the same or a higher level (mutation: a doc text with one bucket removed
+     from that section only, still present in the sections around it);
      (c) each bucket occurs in each of the four fragments, and the fragments
      are in the order above;
-     (d) the printed plan contains none of `kubectl`, `mc rm`, `mc rb`, `KEK`;
+     (d) the plan printed with the default arguments, and with a valid
+     non-default pair (`--alias lab2 --staging /srv/stage_1`), contains none of
+     `kubectl`, `mc rm`, `mc rb`, `MINIO_KMS`, `<OLD` or `<NEW`;
      (e) the imports, read with `ast.parse` of the script's source, are a
      subset of the allowlist (mutation: source text with `import subprocess`);
      (f) `-rf`, `a;b` and an empty string are rejected as alias; `relative`,
      `/a/../b` and `/a;b` are rejected as staging.
-   Traps: (b) fails until step 2 has added the runbook section, so run the
-   full self-test only after step 2; while working on step 1 alone, the other
-   assertions must pass. Never run `mc` or `kubectl`. Do not add a `--execute`
+   Traps: (b) fails until step 2 has added the runbook section; every other
+   assertion must pass on its own. Never run `mc` or `kubectl`. Do not add a `--execute`
    or `--run` flag. Do not stage or commit.
 
 2. **`docs/encryption-at-rest.md`** (coder: coder) → verify by
    `grep -n 'nothing at rest\|this PR' docs/encryption-at-rest.md` (no
-   output) and the step 1 self-test passing.
+   output, exit 1) and `python3 scripts/minio-kek-drill.py --self-test` (exit 0, once step 1
+   exists).
    - Lines 6-26 ("What is encrypted today: nothing at rest"): replace with
      "## Status as of 2026-11-14": the status table above (same rows, states
      and evidence labels), the limit paragraph, a "How the Live rows were
@@ -190,17 +213,21 @@ option.
      operator, MinIO and mc versions, steps run, each check and its result,
      time taken, deviations, open limitations. State that the section keeps
      UNTESTED in its title until a drill record is linked there. Name all
-     three buckets in this section. Because the heading is `###`, make sure
-     the self-test's "next `## ` heading" rule in step 1(b) still bounds it
-     (the next `## ` is "2. OPERATOR / NODE ACTION").
+     three buckets inside this `###` section itself (the self-test in step
+     1(b) reads only this section, up to the next `###` or `##`), so put the
+     rehearsal text under `####` headings or plain bold labels, not a new
+     `###`. State the rollback boundary as in the decisions above, and that
+     object keys the script refuses must be handled by hand.
    - Lines 104-111 ("Verifying it is on"): add `factory-evidence`.
    - Sections 2 and 3 (lines 124-261): add as the first step of each "confirm
      which host runs the cluster and the secret bootstrap (the storage was
      found on p620 on 2026-10-24; these commands were written for p510)", and
-     change `/mnt/img_pool/k3d/storage` to "the local-path storage directory
-     (`/mnt/code/k3d/storage` on p620 per the 2026-10-24 host check)" at
-     lines 204, 224, 230. Line 207: this mentions `apps/backups` and
-     `docs/restore.md`; leave those references as they are.
+     at line 204 (prose) change `/mnt/img_pool/k3d/storage` on p510 to "the
+     local-path storage directory (`/mnt/code/k3d/storage` on p620 per the
+     2026-10-24 host check)". Lines 224 (a `mount` command) and 230 (a Nix
+     attribute) are code: replace only the path string with
+     `/mnt/code/k3d/storage` so they stay valid. Lines 207 (`apps/backups`)
+     and 235 (`docs/restore.md`) reference the backup system; leave them.
    - Lines 263-272 ("Recommended sequencing"): item 1 becomes "Done: MinIO
      SSE-S3"; add "Rehearse the KEK emergency runbook" as the next item.
    Traps: do not edit `docs/restore.md` or anything under `apps/backups`
@@ -234,8 +261,8 @@ option.
    check). Do not stage or commit.
 
 4. **`.github/workflows/secret-rotation-due.yml`** (coder: coder) → verify by
-   `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/secret-rotation-due.yml'))"`
-   and by the PR's CI run.
+   the PR's CI run of this workflow (the lead also reads the diff; no local
+   YAML tooling is assumed).
    - `on.pull_request.paths`: add `scripts/minio-kek-drill.py`,
      `apps/minio/manifests/manifests.yaml`, `docs/encryption-at-rest.md`.
    - New step after "Self-test the checker before trusting it" and before
@@ -273,8 +300,9 @@ option.
      rotation policy and overdue check exist; rotation is manual."
    - Lines 89-98: tick nothing. Append to lines 90, 95 and 96 a short
      "(2026-11-14: <what is still missing>)" note.
-   - Line 4 status line: "Draft. MinIO SSE-S3 is configured; all other
-     at-rest controls are not implemented."
+   - Line 4 status line: "Draft. MinIO SSE-S3 is configured for new writes;
+     volume encryption (Postgres, Redis, Keycloak, MinIO), etcd Secret
+     encryption and a KMS are not implemented."
    Traps: Factory is a different repo with its own artifact folders; the
    artifacts for this task live in factory-gitops, so link them by full
    GitHub URL in the PR, not by relative path. Touch only this one file. Do
@@ -290,18 +318,19 @@ option.
 
 ## Tests
 
-In the factory-gitops worktree, all expected to exit 0 unless noted:
+In the factory-gitops worktree. Exit 0 unless noted; a `grep` that is
+expected to find nothing exits 1, which is the pass.
 
 ```
 python3 scripts/minio-kek-drill.py --self-test
-python3 scripts/minio-kek-drill.py | bash -n
-python3 scripts/minio-kek-drill.py | grep -c -E 'kubectl|mc rm|mc rb|KEK'   # prints 0
+python3 scripts/minio-kek-drill.py > /tmp/plan.sh && bash -n /tmp/plan.sh
+grep -c -E 'kubectl|mc rm|mc rb|MINIO_KMS|<OLD|<NEW' /tmp/plan.sh   # prints 0, exits 1
 python3 scripts/minio-kek-drill.py --alias=-rf        # non-zero
 python3 scripts/minio-kek-drill.py --alias 'a;b'      # non-zero
 python3 scripts/rotation-ledger-check.py --self-test
 python3 scripts/rotation-ledger-check.py --validate-only docs/secrets-management.md
 grep -n 'nothing at rest\|this PR\|both buckets\|two consumers\|brand new\|both reference' \
-  docs/encryption-at-rest.md docs/secrets-management.md apps/minio/manifests/manifests.yaml   # no output
+  docs/encryption-at-rest.md docs/secrets-management.md apps/minio/manifests/manifests.yaml   # no output, exits 1
 git diff main -- apps/minio/manifests/manifests.yaml   # one comment line only
 ```
 
