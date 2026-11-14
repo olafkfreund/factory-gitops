@@ -69,7 +69,9 @@ reviewers:
    `# shortcut: reads the whole newest dump back each night, fine at MB size; compare provider checksums when dumps reach GBs`
    and one line saying why the age limit must stay below 25h (this job runs 1h
    after the dump, so yesterday's dump is 25h old).
-   → verify by `shellcheck apps/backups/offsite/offsite-copy.sh` (no findings).
+   → verify by `shellcheck -s busybox apps/backups/offsite/offsite-copy.sh`
+   (no findings; the busybox dialect is needed because plain `sh` has no
+   `pipefail`).
    Traps: the sibling job's comment at `apps/backups/manifests/manifests.yaml:83-93`:
    `pipefail` is load-bearing, and `dash` has none, so never run this with
    Debian `sh`. Do not `echo` any credential. Do not stage or commit.
@@ -88,12 +90,14 @@ reviewers:
    unparsable name (`factory-cluster-garbage.sql.gz`); no dump; corrupt
    destination copy (pre-place a different valid gzip under the same name at
    the destination, which `mirror` will not replace); empty destination copy
-   (pre-place a 0-byte object); `http://` endpoint; older dumps already at the
+   (pre-place a 0-byte object); invalid gzip (the newest "dump" is the same
+   non-empty, non-gzip bytes at source and destination, so the hashes match and
+   only `gzip -t` can fail it); `http://` endpoint; older dumps already at the
    destination are still there after a run. Ends with `test.sh: N passed` and
    exits non-zero if any case failed. A test that ran zero cases must fail.
    → verify by running it in the pinned image:
    `docker run --rm -v "$PWD/apps/backups/offsite:/t:ro" --entrypoint /bin/sh <image> /t/test.sh`
-   and by `shellcheck apps/backups/offsite/test.sh`.
+   and by `shellcheck -s busybox apps/backups/offsite/test.sh`.
    Traps: the mount is read-only, so write only under `mktemp -d`. The
    container user is uid 65532. Do not stage or commit.
 
@@ -147,6 +151,10 @@ reviewers:
    covering: what the job does and verifies; destination requirements (private
    bucket, encryption at rest, versioning or object lock, a lifecycle rule,
    a key scoped to the bucket that can list, read and write but not delete);
+   the recommendation (a bucket at an S3-compatible provider outside the house,
+   in the EU, for example Backblaze B2 or Hetzner Object Storage, lifecycle
+   about 90 days; a MinIO on p510 is the fallback, which leaves the cluster
+   host but does not survive losing the site);
    the Secret `offsite-s3-creds` and its four keys (names only), seeded the way
    `docs/secrets-management.md` describes, and that the Secret then needs a row
    in that file's inventory and rotation ledger; the enable step (add
@@ -156,7 +164,9 @@ reviewers:
    job/<name>` shows the `offsite-copy: OK` line; `job_health` for
    `postgres-backup-offsite`); restoring from the copy (get the object from the
    destination with `mc`, then the existing "Restore: Postgres" steps from
-   step 3 on); and what is still open: dumps are not encrypted client-side,
+   step 3 on); and what is still open: dumps are not encrypted client-side
+   (the pinned image has no `openssl`, `gpg` or `age`; adding it means another
+   image and a key that must be at hand during a restore; owner's decision),
    `factory-artifacts` has no off-cluster copy, and a restore from the
    off-cluster copy has not been drilled (Factory#3681). Update "Whole-bucket
    loss" under "Restore: MinIO objects" (Postgres dumps recoverable from the
@@ -176,7 +186,7 @@ reviewers:
 
 ## Tests
 
-- `shellcheck apps/backups/offsite/*.sh`: clean.
+- `shellcheck -s busybox apps/backups/offsite/*.sh`: clean.
 - `docker run --rm -v "$PWD/apps/backups/offsite:/t:ro" --entrypoint /bin/sh <image> /t/test.sh`: all cases pass.
 - `kustomize build apps/backups/offsite`: a CronJob and a ConfigMap.
 - `kustomize build apps/backups/manifests | sha256sum` equals `origin/main`'s:
