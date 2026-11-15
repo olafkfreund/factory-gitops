@@ -161,3 +161,10 @@ to the template without the hook. No data or state is involved.
   count is 0. Fixed above.
 - Tests: the YAML sanity check uses `yq`, because PyYAML is not installed on
   the development host.
+- Step 2c: "killed by `timeout`" is `returncode in (-9, 124, 137)`, not
+  `(-9, 137)`. On the GitHub runner the control case ended with 124
+  (`window=open`, 9.9 s after the stop): that `timeout` reports its own
+  timed-out status. Found by the first CI run of PR #335.
+- Step 2c: the payload runs the script with fresh globals
+  (`exec(..., {'__name__': '__main__'})`), so a missing import in the script
+  cannot be masked by the payload's own `import os, sys, time` (agy review).

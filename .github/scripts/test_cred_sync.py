@@ -183,9 +183,14 @@ if [ "$#" -gt 0 ]; then
 fi
 kill -TERM 1
 """
+# How "timeout had to kill it" reaches us: GNU timeout -s KILL kills its own process
+# group (-9, or 137 through a wrapper); the GitHub runner's timeout exits 124.
+KILLED = (-9, 124, 137)
 payload = ("import os, sys, time; assert os.getpid() == 1; "
            "open(sys.argv[2] + '/started', 'w').close(); "
-           "time.sleep(float(sys.argv[3])); exec(open(sys.argv[1]).read())")
+           "time.sleep(float(sys.argv[3])); "
+           # Fresh globals: the script must not lean on this payload's imports.
+           "exec(open(sys.argv[1]).read(), {'__name__': '__main__'})")
 
 
 def stop_case(label, delay, wait, use_hook, limit):
@@ -206,7 +211,7 @@ def stop_case(label, delay, wait, use_hook, limit):
         window, hookrc, stop = marker("window"), marker("hookrc"), marker("stop")
         elapsed = exited - float(stop) if stop is not None else None
         if label == "early SIGTERM control":
-            ok = window == "open" and result.returncode in (-9, 137) and elapsed is not None and elapsed >= 6
+            ok = window == "open" and result.returncode in KILLED and elapsed is not None and elapsed >= 6
         elif label == "early SIGTERM with hook":
             ok = window == "open" and hookrc == "0" and result.returncode == 0 and elapsed is not None and elapsed < 8
         else:
