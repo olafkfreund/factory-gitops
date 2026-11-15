@@ -12,12 +12,20 @@ The script lives as an inline `args:` block scalar in three manifests, so
 nothing imported it and nothing ran it. This extracts it from all three, proves
 they are byte-identical (one engine, no drift), and exercises the real file I/O
 path of the one it loaded.
+
+factory-gitops#332: also exercise the container's preStop hook in a PID namespace.
+An early SIGTERM is lost by PID 1 until Python installs its handler; the hook
+must wait for that handler before allowing the stop signal through.
 """
 import ast
+import concurrent.futures
 import importlib.util
 import json
 import os
 import pathlib
+import re
+import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -120,6 +128,106 @@ _, _, why = run(creds(VALID), creds(OLDER))
 if cs.ts(VALID) not in why or cs.ts(OLDER) not in why:
     print("::error::the adoption log line no longer states both expiries")
     failures.append("adoption log line")
+
+
+def prestop(app):
+    lines = (REPO / "apps" / app / "manifests" / "manifests.yaml").read_text().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == "- name: cred-sync"]
+    if len(starts) != 1:
+        raise SystemExit(f"::error::expected one cred-sync container in {app}, found {len(starts)}")
+    indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+    item = []
+    for line in lines[starts[0] + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        item.append(line)
+    hooks = [line for line in item if line.strip().startswith("lifecycle:")]
+    if len(hooks) != 1:
+        raise SystemExit(f"::error::expected one cred-sync lifecycle in {app}, found {len(hooks)}")
+    match = re.search(r"preStop:\s*\{\s*exec:\s*\{\s*command:\s*(\[.*\])", hooks[0])
+    if not match:
+        raise SystemExit(f"::error::no inline cred-sync preStop command in {app}")
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"::error::invalid cred-sync preStop command in {app}: {error}") from error
+
+
+hooks = {app: prestop(app) for app in APPS}
+if len({tuple(command) for command in hooks.values()}) != 1:
+    raise SystemExit("::error::the three cred-sync preStop commands have drifted")
+hook = hooks[APPS[0]]
+sudo = []
+unshare = ["unshare", "-Urpf", "--kill-child", "--mount-proc"]
+probe = [*sudo, "timeout", "-s", "KILL", "5", *unshare, "true"]
+if subprocess.run(probe, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+    sudo = ["sudo", "-n"]
+    unshare = ["unshare", "-pf", "--kill-child", "--mount-proc"]
+    probe = [*sudo, "timeout", "-s", "KILL", "5", *unshare, "true"]
+    if subprocess.run(probe, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        raise SystemExit("::error::cannot run a PID namespace with unshare or sudo")
+
+driver = """\
+while [ ! -e "$1/started" ]; do sleep 0.05; done
+d=$1; wait=$2; shift 2
+sleep "$wait"
+if grep -Eq '^SigCgt:.*[4-7c-f][0-9a-f]{3}$' /proc/1/status; then
+    echo caught > "$d/window"
+else
+    echo open > "$d/window"
+fi
+date +%s.%N > "$d/stop"
+if [ "$#" -gt 0 ]; then
+    rc=0; "$@" || rc=$?
+    echo "$rc" > "$d/hookrc"
+fi
+kill -TERM 1
+"""
+payload = ("import os, sys, time; assert os.getpid() == 1; "
+           "open(sys.argv[2] + '/started', 'w').close(); "
+           "time.sleep(float(sys.argv[3])); exec(open(sys.argv[1]).read())")
+
+
+def stop_case(label, delay, wait, use_hook, limit):
+    with tempfile.TemporaryDirectory() as directory:
+        d = pathlib.Path(directory)
+        driver_path = d / "driver.sh"
+        driver_path.write_text(driver)
+        driver_args = ["sh", str(driver_path), str(d), str(wait), *(hook if use_hook else [])]
+        python_args = [sys.executable, "-u", "-c", payload, str(path), str(d), str(delay)]
+        command = " ".join(map(shlex.quote, driver_args)) + " & exec " + " ".join(map(shlex.quote, python_args))
+        result = subprocess.run([*sudo, "timeout", "-s", "KILL", str(limit),
+                                 *unshare, "sh", "-c", command],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        exited = time.time()
+        def marker(name):
+            file = d / name
+            return file.read_text().strip() if file.exists() else None
+        window, hookrc, stop = marker("window"), marker("hookrc"), marker("stop")
+        elapsed = exited - float(stop) if stop is not None else None
+        if label == "early SIGTERM control":
+            ok = window == "open" and result.returncode in (-9, 137) and elapsed is not None and elapsed >= 6
+        elif label == "early SIGTERM with hook":
+            ok = window == "open" and hookrc == "0" and result.returncode == 0 and elapsed is not None and elapsed < 8
+        else:
+            ok = hookrc == "0" and result.returncode == 0 and elapsed is not None and elapsed < 5
+        return ok, f"{label:31s} rc={result.returncode} window={window} hookrc={hookrc} stop-to-exit={elapsed}"
+
+
+stop_cases = (("early SIGTERM control", 3, 0, False, 10),
+              ("early SIGTERM with hook", 3, 0, True, 15),
+              ("ready handler with hook", 0, 0, True, 15),
+              ("delayed stop with hook", 0, 30, True, 45))
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    futures = [pool.submit(stop_case, *case) for case in stop_cases]
+    for case, future in zip(stop_cases, futures):
+        try:
+            ok, message = future.result()
+        except Exception as error:
+            ok, message = False, f"{case[0]}: {type(error).__name__}: {error}"
+        print(f"{'ok  ' if ok else 'FAIL'} {message}")
+        if not ok:
+            failures.append(case[0])
 
 if failures:
     # The dangerous direction is an adoption going green: that is a live
