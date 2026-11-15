@@ -27,6 +27,15 @@ reviewers:
 - The test goes into the existing `.github/scripts/test_cred_sync.py`, run by
   the existing `cred-sync guards` workflow. No new workflow, no new dependency
   (stdlib only, no PyYAML).
+- The harness runs the hook on the CI host, not in the image. The hook was
+  checked by hand in the pinned image with the pod's settings
+  (`docker run --read-only --user 65532:65532 --cap-drop ALL --cpus 0.1
+  --memory 64m`, then `docker exec` the hook, then `docker kill -s TERM`).
+  Repeat that check whenever the hook command changes.
+- One refinement of the spec's test design, same intent: the spec has the
+  driver wait for `/proc/1/comm` to start with `python`. The plan uses a marker
+  file that Python itself writes after asserting `os.getpid() == 1`. It proves
+  the same thing and also works where `python3` is a wrapper (NixOS).
 - Base branch `main`. No `kubectl` writes. Merging makes Argo CD roll all three
   Deployments; the PR body must say so.
 
@@ -64,20 +73,23 @@ reviewers:
       up to the first non-blank line whose indent is less than or equal to that
       line's indent (the end of the list item). Among them require exactly one
       line whose stripped text starts with `lifecycle:`; take
-      `re.search(r"command: (\[.*\])", line)` and `json.loads` it. Missing or
-      more than one: `SystemExit("::error::...")`. The three results must be
+      `re.search(r"preStop:\s*\{\s*exec:\s*\{\s*command:\s*(\[.*\])", line)`
+      and `json.loads` it. No such line, more than one, or no match (for
+      example a `postStart` or a multi-line form): `SystemExit("::error::...")`. The three results must be
       equal, else `SystemExit` (drift).
 
-   b. Namespace prefix, probed once with `true`:
-      `["unshare", "-Urpf", "--kill-child", "--mount-proc"]`, else
-      `["sudo", "-n"]` in front of `["unshare", "-pf", "--kill-child", "--mount-proc"]`.
-      Neither works: `SystemExit("::error::...")`. Never skip.
+   b. Two lists, `sudo` and `unshare`, probed once by running
+      `[*sudo, "timeout", "-s", "KILL", "5", *unshare, "true"]`:
+      first `sudo = []`, `unshare = ["unshare", "-Urpf", "--kill-child", "--mount-proc"]`;
+      else `sudo = ["sudo", "-n"]`, `unshare = ["unshare", "-pf", "--kill-child", "--mount-proc"]`.
+      Neither works: `SystemExit("::error::...")`. Never skip. `timeout` always
+      sits between the two, so under `sudo` it runs as root and can kill.
 
    c. One case = one temporary directory `d` and one process:
-      `[sudo -n] timeout -s KILL <limit> unshare ... sh -c '<driver> & exec <python> -u -c <payload> <script> <d> <delay>'`
+      `[*sudo, "timeout", "-s", "KILL", <limit>, *unshare, "sh", "-c", 'sh <driver file> <d> <wait> [hook argv...] & exec <python> -u -c <payload> <script> <d> <delay>']`
       (build the `sh -c` string with `shlex.quote`; `<python>` is
       `sys.executable`; stdout and stderr to `DEVNULL`).
-      - Payload: `import sys, time; open(sys.argv[2] + '/started', 'w').close(); time.sleep(float(sys.argv[3])); exec(open(sys.argv[1]).read())`.
+      - Payload: `import os, sys, time; assert os.getpid() == 1; open(sys.argv[2] + '/started', 'w').close(); time.sleep(float(sys.argv[3])); exec(open(sys.argv[1]).read())`.
         The marker proves PID 1 is Python; the sleep is the deterministic
         pre-handler window. `<script>` is the file the test already wrote
         (`path`).
@@ -86,15 +98,20 @@ reviewers:
         `open` or `caught` to `d/window` depending on whether
         `/proc/1/status` `SigCgt` has the SIGTERM bit; write `date +%s.%N` to
         `d/stop`; if hook argv was given, run it and write its exit status to
-        `d/hookrc`; then `kill -TERM 1`.
+        `d/hookrc` (no `set -e`: `rc=0; "$@" || rc=$?`); then `kill -TERM 1`.
       - The outer test waits for the process, notes `time.time()`, and reads
-        the markers. Exit status 137 means `timeout` had to kill it.
+        the markers. A marker that should exist and does not is a case failure,
+        not an exception. "Killed by `timeout`" means `returncode in (-9, 137)`:
+        measured, `subprocess` sees -9 because `timeout -s KILL` kills its own
+        process group; 137 is accepted in case `sudo` reports it that way.
 
-   d. Cases, run in parallel threads:
+   d. Cases, run in parallel with `concurrent.futures.ThreadPoolExecutor`;
+      each returns `(ok, message)` to the main thread, and an exception in a
+      case counts as its failure:
 
       | # | delay | wait | hook | limit | pass when |
       |---|---|---|---|---|---|
-      | 1 control | 3 | 0 | no | 8 | `window` is `open` and exit status is 137 (survived a lone SIGTERM) |
+      | 1 control | 3 | 0 | no | 10 | `window` is `open`, killed by `timeout`, and exit − stop ≥ 6 s (survived a lone SIGTERM for 6 s) |
       | 2 | 3 | 0 | yes | 15 | `window` is `open`, `hookrc` is 0, exit 0, exit − stop < 8 s |
       | 3 | 0 | 0 | yes | 15 | `hookrc` is 0, exit 0, exit − stop < 5 s |
       | 4 | 0 | 30 | yes | 45 | `hookrc` is 0, exit 0, exit − stop < 5 s |
@@ -116,11 +133,12 @@ reviewers:
 - `python3 .github/scripts/test_cred_sync.py` → every line `ok`, ends with
   `all guards hold`, exit 0.
 - Red check A (fails on today's manifests): `git stash` is banned, so run the
-  new test file against `origin/main`'s manifests in a scratch copy:
-  `git worktree` is not needed; copy the repo's `apps/` from
-  `git show origin/main:apps/pfactory/manifests/manifests.yaml` etc. into a
-  temporary tree next to the new test and run it → exits non-zero with the
-  "no preStop" error.
+  new test file against `origin/main`'s manifests in a scratch tree: put the
+  new test at `<scratch>/.github/scripts/test_cred_sync.py` (it finds the repo
+  root two levels up) and each
+  `git show origin/main:apps/<app>/manifests/manifests.yaml` at
+  `<scratch>/apps/<app>/manifests/manifests.yaml`, then run it → exits non-zero
+  with the "no preStop" error.
 - Red check B (the hook is what fixes it): case 1 is the permanent proof; it
   passes only when a lone SIGTERM in the window is lost.
 - `python3 -c "import yaml,sys; [list(yaml.safe_load_all(open(f))) for f in sys.argv[1:]]" apps/{aifactory,pfactory,tfactory}/manifests/manifests.yaml`
@@ -128,6 +146,9 @@ reviewers:
   and Kyverno checks).
 - CI on the PR: `cred-sync guards` and `manifest validation (blocking)` green.
   The first also proves the harness works on the GitHub runner.
+
+- After merge (owner, read-only): pods roll by Argo CD sync;
+  `kubectl get pod <pod> -o yaml` shows the hook on `cred-sync`.
 
 ## Rollback
 
