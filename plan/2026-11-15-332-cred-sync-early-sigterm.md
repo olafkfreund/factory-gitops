@@ -56,7 +56,7 @@ reviewers:
              lifecycle: { preStop: { exec: { command: ["sh", "-c", "until grep -Eq '^SigCgt:.*[4-7c-f][0-9a-f]{3}$' /proc/1/status; do sleep 0.1; done"] } } }
    ```
 
-   → verify by `grep -c "until grep -Eq '^SigCgt" apps/{aifactory,pfactory,tfactory}/manifests/manifests.yaml`
+   → verify by `grep -c "until grep -Eq '\^SigCgt" apps/{aifactory,pfactory,tfactory}/manifests/manifests.yaml`
    (1 each) and `python3 .github/scripts/test_cred_sync.py` (the existing guards
    still pass: the script block is unchanged and still ends where it did).
    Traps: line numbers are from `origin/main` at e49d6b4; match on the text, not
@@ -141,8 +141,8 @@ reviewers:
   with the "no preStop" error.
 - Red check B (the hook is what fixes it): case 1 is the permanent proof; it
   passes only when a lone SIGTERM in the window is lost.
-- `python3 -c "import yaml,sys; [list(yaml.safe_load_all(open(f))) for f in sys.argv[1:]]" apps/{aifactory,pfactory,tfactory}/manifests/manifests.yaml`
-  → parses (local sanity; CI's `manifest validation (blocking)` does the schema
+- `for a in aifactory pfactory tfactory; do yq 'select(.kind == "Deployment") | .spec.template.spec.containers[] | select(.name == "cred-sync") | .lifecycle' apps/$a/manifests/manifests.yaml; done`
+  → prints the hook three times (local sanity; CI's `manifest validation (blocking)` does the schema
   and Kyverno checks).
 - CI on the PR: `cred-sync guards` and `manifest validation (blocking)` green.
   The first also proves the harness works on the GitHub runner.
@@ -154,3 +154,10 @@ reviewers:
 
 Revert the PR's merge commit on `main`. Argo CD rolls the three Deployments back
 to the template without the hook. No data or state is involved.
+
+## Deviations
+
+- Step 1 check: the `^` in the `grep -c` pattern must be escaped (`\^`), or the
+  count is 0. Fixed above.
+- Tests: the YAML sanity check uses `yq`, because PyYAML is not installed on
+  the development host.

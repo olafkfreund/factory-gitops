@@ -217,6 +217,11 @@ spec:
 
               if __name__ == "__main__":
                   main()
+          # factory-gitops#332: as PID 1 this container drops a SIGTERM that arrives before
+          # the script installs its handler (about 1.7s at the 100m CPU limit), and the
+          # kubelet sends only one. So wait until PID 1 catches SIGTERM: SigCgt bit 0x4000,
+          # which makes the 4th hex digit from the right one of 4567cdef.
+          lifecycle: { preStop: { exec: { command: ["sh", "-c", "until grep -Eq '^SigCgt:.*[4-7c-f][0-9a-f]{3}$' /proc/1/status; do sleep 0.1; done"] } } }
           securityContext:
             allowPrivilegeEscalation: false
             # Stdlib-only inline script; every write goes to the /h/.claude
