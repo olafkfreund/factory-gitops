@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 332
 spec: spec/2026-11-15-332-cred-sync-early-sigterm.md
 coders:
