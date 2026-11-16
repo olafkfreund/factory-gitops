@@ -58,10 +58,11 @@ kubectl get node -o jsonpath='{.items[*].metadata.annotations.k3s\.io/node-args}
   reports every object as not encrypted, look at one raw line before believing it.
 
   ```bash
-  set -o pipefail
+  set -o pipefail; rc=0
   for b in factory-artifacts factory-backups factory-evidence; do
-    mc stat --versions --recursive --json "fac/$b" | python3 scripts/minio-sse-audit.py --bucket "$b"
+    mc stat --versions --recursive --json "fac/$b" | python3 scripts/minio-sse-audit.py --bucket "$b" || rc=1
   done
+  echo "audit rc=$rc"   # 0 only if all three buckets passed
   ```
 
   Objects written before SSE was on stay plaintext until rewritten. Rewriting is
@@ -356,7 +357,7 @@ Encrypt the filesystem that backs the k3s `local-path` provisioner
 1. **Host.** The storage was found on p620 on 2026-10-24 (`/mnt/code/k3d/storage` on `/dev/sdb1` ext4). Run the commands below on p620, and confirm first:
    `findmnt -T /mnt/code/k3d/storage` and `lsblk -f`. The secret bootstrap host is still an open owner check.
 
-2. **Back up everything first, and verify the copy.** Trigger a fresh Postgres backup (`apps/backups`), then copy off-cluster every object **and version** of `factory-artifacts`, `factory-backups` and `factory-evidence` (`mc mirror --preserve`; add `mc cp --versions` per object if versions matter) and the Postgres backup, plus the LUKS passphrase or key file in agenix. Verify with `mc diff` (or checksums) before step 3. Do not proceed on an unverified copy: PVC data is destroyed by this procedure, and an empty `factory-evidence` is not acceptable for audit. Restore the `minio-kms` KEK from agenix first, or the copied objects cannot be read.
+2. **Back up everything first, and verify the copy.** Trigger a fresh Postgres backup (`apps/backups`), then copy off-cluster every object **and version** of `factory-artifacts`, `factory-backups` and `factory-evidence` (current objects: `mc mirror --preserve`; versions: use the per-bucket export from `python3 scripts/minio-kek-drill.py --step 3`, whose version flags are UNPROVEN, since `mc cp` has `--version-id` only and `mirror` copies current objects) and the Postgres backup, plus the LUKS passphrase or key file in agenix. Verify with checksums of every exported version (`mc diff` covers current objects only) before step 3. Do not proceed on an unverified copy: PVC data is destroyed by this procedure, and an empty `factory-evidence` is not acceptable for audit. Restore the `minio-kms` KEK from agenix first, or the copied objects cannot be read.
 
 3. Drain the workloads:
 
