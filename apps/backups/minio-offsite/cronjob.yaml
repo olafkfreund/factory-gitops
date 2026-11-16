@@ -1,0 +1,77 @@
+################################################################################
+# Off-cluster copy of the MinIO buckets factory-artifacts and factory-evidence
+# (Factory#3691). Mirrors to the same external S3 target as the postgres copy
+# (Factory#3681), never deletes or overwrites there, then checks every source
+# object is present and equal. See Factory docs/compliance/dr-runbook.md.
+#
+# NOT DEPLOYED. Nothing references this directory. To enable it, create the
+# offsite-s3-creds Secret first (owner action, Factory#3681), then add
+# `- ../minio-offsite` to apps/backups/manifests/kustomization.yaml.
+# Not `suspend: true`: job-watchdog escalates a suspended, never-run CronJob to
+# critical.
+#
+# Secrets (names only):
+#   minio-creds:       S3_ACCESS_KEY, S3_SECRET_KEY
+#   offsite-s3-creds:  OFFSITE_S3_ENDPOINT, OFFSITE_S3_BUCKET,
+#                      OFFSITE_S3_ACCESS_KEY, OFFSITE_S3_SECRET_KEY
+################################################################################
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: minio-backup-offsite
+  namespace: factory
+  labels: { app: minio-backup-offsite }
+spec:
+  # 03:45 UTC: after the postgres off-site copy (03:15), before the restore drill (04:15).
+  schedule: "45 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Ten failed runs kept so a recurring failure can be read (Factory#381).
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # A hung transfer must end: with Forbid, an active Job blocks every later run.
+      activeDeadlineSeconds: 3600
+      # No ttlSecondsAfterFinished: it would reap failed Jobs and their logs (Factory#381).
+      template:
+        metadata: { labels: { app: minio-backup-offsite } }
+        spec:
+          # Never, not OnFailure: failed pods must stay readable (Factory#438).
+          restartPolicy: Never
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            fsGroup: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: copy
+              image: cgr.dev/chainguard/minio-client:latest-dev@sha256:b056b795d31828015aea061e3168267b0ba80590ba2d8f869e72ff77153a68e8
+              command: ["/bin/sh", "/script/minio-offsite.sh"]
+              env:
+                - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+                - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+                - { name: OFFSITE_S3_ENDPOINT, valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_ENDPOINT } } }
+                - { name: OFFSITE_S3_BUCKET, valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_BUCKET } } }
+                - { name: OFFSITE_S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_ACCESS_KEY } } }
+                - { name: OFFSITE_S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: offsite-s3-creds, key: OFFSITE_S3_SECRET_KEY } } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: scratch, mountPath: /scratch }
+                - { name: script, mountPath: /script, readOnly: true }
+              resources:
+                requests: { cpu: 20m, memory: 128Mi }
+                limits: { cpu: 500m, memory: 512Mi }
+          volumes:
+            - name: scratch
+              emptyDir: { sizeLimit: 1Gi }
+            - name: script
+              configMap:
+                name: minio-backup-offsite-script
+                defaultMode: 0555
