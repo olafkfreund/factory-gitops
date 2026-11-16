@@ -9,6 +9,7 @@ mkdir -p "$tmp/bin" "$tmp/s"
 cat > "$tmp/bin/mc" <<EOS
 #!/bin/sh
 [ "\$1" = alias ] && exit 0
+[ "\$1" = cat ] && [ -n "\${FAIL_CAT:-}" ] && exit 1
 [ "\$1" = encrypt ] && exit 0   # SSE-S3 needs a real server
 for a in "\$@"; do
   case "\$a" in fac/*) a="$tmp/root/\$a" ;; esac
@@ -58,4 +59,10 @@ check empty-bucket 'empty_bucket_factory-evidence'
 
 mk; MAX_OBJECT_BYTES=1 drill   # every object over the cap: nothing restored must be red
 check oversize-skipped 'no_objects_restored'
+mk; : > "$G/factory-evidence/2"; sed -i "s/^.*  factory-evidence/$(printf '' | sha256sum | cut -d' ' -f1)  factory-evidence/" "$G/MANIFEST.sha256"
+FAIL_CAT=1 drill   # a failed read of an empty object must not pass as its hash
+check failed-read 'restore_mismatch'
+
+mk; echo 0123456789 > "$G/factory-evidence/2"; MAX_OBJECT_BYTES=5 drill   # evidence object over cap, artifacts fine
+check bucket-without-sample 'no_sample_factory-evidence'
 echo "ALL PASS"

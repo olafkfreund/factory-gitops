@@ -5,7 +5,7 @@
 # bucket, and write $SCRATCH/result.json with the full-path rto_seconds.
 # Exits 0 whenever it could write the result; the last container turns the
 # verdict into the Job status.
-set -u
+set -u -o pipefail   # a failed mc cat must not hash as an empty object
 S=${SCRATCH:-/scratch}
 BACKUP=${BACKUP:-/backup}
 BUCKETS=${BUCKETS:-factory-artifacts factory-evidence}
@@ -49,6 +49,7 @@ run() {
       [ "$sz" -le "$MAX_OBJECT_BYTES" ] || continue
       printf '%s\n' "$line" >> "$S/sample"; n=$((n + 1))
     done < "$S/lines"
+    [ "$n" -gt 0 ] || add "no_sample_$b"   # every object over the size cap
   done
   while IFS= read -r line; do
     f="${line#*  }"
