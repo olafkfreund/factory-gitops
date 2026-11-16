@@ -15,7 +15,7 @@ reported like any other failed CronJob.
 
 Statuses in the `job_health` record (`kind = security_alert`, field `rule`): `ok`, `firing`,
 `error` (query failed; the run exits 1), `no_source` (the stream does not exist; never read as
-zero) and `not_configured` (`EGRESS_STREAM` empty).
+zero; for `auth_failure_spike` the run also exits 1, so job-watchdog reports the CronJob) and `not_configured` (`EGRESS_STREAM` empty).
 
 ```sql
 SELECT rule, status, count, threshold FROM "job_health"

@@ -4,7 +4,7 @@
 Every run evaluates both rules against OpenObserve, writes one `job_health` record per rule,
 opens one GitHub issue per firing rule while none is open (inert without GITHUB_TOKEN) and, if
 ALERT_WEBHOOK_URL is set, posts to it on every run in which a rule fires. Exits 1 if a rule
-errored or a delivery failed. Stdlib only. Never prints a value or str(exception).
+errored, the auth stream is missing or a delivery failed. Stdlib only. Never prints a value or str(exception).
 """
 
 import base64
@@ -158,8 +158,8 @@ def main():
     for rule, stream, where, threshold in rules:
         status, n = evaluate(rule, stream, where, threshold)
         eprint(f"{rule}: {status} n={n} threshold={threshold}")
-        if status == "error":
-            rc = 1
+        if status == "error" or (status == "no_source" and rule == "auth_failure_spike"):
+            rc = 1  # a missing auth stream must fail the CronJob so job-watchdog reports it
         if status == "firing":
             firing.append((rule, n, threshold))
         records.append({"_timestamp": ts, "source": "security-alerts", "kind": "security_alert",
