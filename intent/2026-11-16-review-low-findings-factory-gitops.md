@@ -23,17 +23,17 @@ author: olafkfreund
 - #341 refuted: the Claude CLI (2.1.325 binary) builds its stored credential object with
   `refreshTokenExpiresAt` next to `expiresAt`, and keeps it across refreshes. The broker reads only
   that key, accepts only an epoch-millisecond number, and its refresh keeps the other keys. A
-  setup-token has no refresh token, so the warning is simply inert there. Nothing to change.
+  setup-token has no refresh token, so the warning is simply inert there. Nothing to change. (Evidence: strings in the local claude binary; the secret itself was not read.)
 - #340 refuted: every consumer (`cred-broker`, `secret-rotation`, `endpoint-guard`,
   `restart-watchdog`, `job-watchdog`, `fleet-match`) already uses a single-key `secretKeyRef`;
   no `envFrom` of `factory-secrets` exists in `apps/`. The two CronJobs added in this wave
-  (cred-broker, secret-rotation) both use the token to open GitHub issues. Nothing to drop.
+  (cred-broker, secret-rotation) both use the token to open GitHub issues. Nothing to drop. Single-key injection still exposes the shared token's full scope, so narrowing it is an owner action.
   Owner action only: replace the shared token with a fine-grained one.
 
 ## Proposed outcome
 
 Re-syncing apps/minio succeeds with the STS user already attached, and a rotated STS key
-disables the previous aifactory-sts user. A CI test runs that hook block against a stub `mc`.
+disables the previous aifactory-sts user on a best-effort basis (a failure there does not fail the hook). A CI test runs that hook block against a stub `mc`.
 
 ## Affected users and systems
 
