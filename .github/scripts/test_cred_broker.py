@@ -208,7 +208,8 @@ def rrun(rexp, *, grant_ok, access_hours=3, token="t", runs=1):
         def __iter__(self): return iter(())
 
     def fake_urlopen(req, timeout=None, context=None):
-        if req.full_url.startswith("https://api.github.com"):
+        gh_prefix = "https://api.github.com"
+        if req.full_url.startswith(gh_prefix):
             gh.append(req.get_method())
             if req.get_method() == "GET":
                 return R(json.dumps(issues).encode())
