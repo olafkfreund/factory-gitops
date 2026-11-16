@@ -7,5 +7,6 @@ configMapGenerator:
   - name: postgres-backup-offsite-script
     files:
       - offsite-copy.sh
+      - fetch-age.sh
 generatorOptions:
   disableNameSuffixHash: true
