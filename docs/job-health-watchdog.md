@@ -232,3 +232,5 @@ hour after completion regardless of outcome, which silently overrode
 controller deletes the evidence an hour after it is produced. The history limits
 are the correct reaper because they are per-outcome: successes stay capped at 3,
 failures survive long enough to read.
+
+Security alert rules built on the same stream: `docs/security-alerts.md` (Factory#3688).
