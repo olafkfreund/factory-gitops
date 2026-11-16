@@ -113,6 +113,9 @@ jobs behave exactly as described above.
   destination is never re-encrypted or overwritten: it is checked for the age
   header and, if a `.sha256` file exists, for a matching hash.
 - The jobs cannot decrypt, so they check the ciphertext hash, not the content.
+- Known limit: `mc cp` has no create-only mode. The CronJob's `concurrencyPolicy: Forbid`
+  stops overlapping scheduled runs, but two hand-started Jobs could replace each
+  other's object. A versioned destination bucket (required above) keeps the older version.
 
 Owner steps (nothing here is done by an agent):
 
