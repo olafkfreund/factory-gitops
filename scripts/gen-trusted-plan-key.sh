@@ -21,6 +21,7 @@ gen() {
   echo "              PFACTORY_TRUSTED_PLAN_SIGNING_KEY__${kid^^} (pfactory)"
   echo "fingerprint:  $fp"
   echo "expiry:       pfactory/${kid,,}=$(date -u -d '+104 days' +%F)   (90 days + 14 overlap)"
+  echo "              make AIFACTORY_TRUSTED_PLAN_EXPIRY in apps/aifactory equal to this (manifest default: 2027-03-15)"
   echo "file:         $out (mode 600); seed both keys with agenix, then shred -u it"
 }
 
