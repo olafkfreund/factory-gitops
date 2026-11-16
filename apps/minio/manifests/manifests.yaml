@@ -314,7 +314,8 @@ spec:
               # rule is one we expect, with the day count we expect (Factory#3692: IDs alone
               # let a wrong Days value through). POSIX sh only: this image has no grep, sed
               # or awk, so the export is cut into rule objects by brace depth. A rule's Days
-              # must be followed by , or } so 3960 never satisfies 396.
+              # is matched as a whole key inside the Expiration object, so 3960 never
+              # satisfies 396 and extra keys beside Days do not matter.
               ilm_apply() {
                 b="$1"; doc="$2"; shift 2
                 printf '%s' "$doc" | mc ilm import "fac/$b"
@@ -331,8 +332,10 @@ spec:
                            for p in "$@"; do
                              case "$rule" in
                                *"\"ID\":\"${p%=*}\""*)
-                                 case "$rule" in
-                                   *"\"Expiration\":{\"Days\":${p#*=},"*|*"\"Expiration\":{\"Days\":${p#*=}}"*)
+                                 exp="${rule#*\"Expiration\":\{}"
+                                 case "$rule" in *"\"Expiration\":{"*) exp=",${exp%%\}*}," ;; *) exp="" ;; esac
+                                 case "$exp" in
+                                   *",\"Days\":${p#*=},"*)
                                           case "$done_ids" in
                                             *" ${p%=*} "*) echo "FATAL: $b rule '${p%=*}' exported twice" >&2
                                                            exit 1 ;;
