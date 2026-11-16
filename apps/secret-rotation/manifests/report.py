@@ -3,7 +3,8 @@
 
 Reads ONLY metadata: every GET asks for PartialObjectMetadata, so the API never sends
 a Secret value to this process. The owner stamps `rotation.factory.dev/rotated-at`
-(YYYY-MM-DD, the oldest evidenced last-rotated date among the credentials in that Secret)
+(YYYY-MM-DD, the oldest evidenced last-rotated date among the credentials in that Secret that have a scheduled
+interval; compromise-only keys such as CFACTORY_AUDIT_HMAC_SECRET do not count)
 after a rotation; see docs/secrets-management.md "Rotation age report".
 
 Emits one `job_health` record per Secret, opens one GitHub issue per overdue Secret

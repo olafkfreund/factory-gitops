@@ -228,7 +228,7 @@ for metadata only. Policy and owners: Factory
 [`docs/compliance/policies/key-rotation.md`](https://github.com/olafkfreund/Factory/blob/main/docs/compliance/policies/key-rotation.md).
 
 After a rotation, stamp the Secret with the **oldest evidenced last-rotated date among every
-credential still in it**, taken from the ledger rows (not necessarily today: rotating the oldest key
+credential still in it that has a scheduled interval** (not the compromise-only `CFACTORY_AUDIT_HMAC_SECRET`), taken from the ledger rows (not necessarily today: rotating the oldest key
 leaves the next-oldest as the stamp):
 
 ```bash
