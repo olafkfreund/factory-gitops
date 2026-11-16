@@ -61,6 +61,9 @@ assert "action = 'auth.failure'" in sqls[0]
 # missing stream is no_source, not ok, and not an error
 rc, rec, *_ = run({"audit_chain": 0, "egress_denied": http(404)}, egress="egress_denied")
 assert rc == 0 and rec["egress_anomaly"]["status"] == "no_source"
+# a missing AUTH stream fails the run (rc 1) so job-watchdog sees it; the record keeps no_source
+rc, rec, *_ = run({"audit_chain": http(404)})
+assert rc == 1 and rec["auth_failure_spike"]["status"] == "no_source"
 # configured egress fires at its default threshold of 1
 rc, rec, *_ = run({"audit_chain": 0, "egress_denied": 1}, egress="egress_denied")
 assert rec["egress_anomaly"]["status"] == "firing"

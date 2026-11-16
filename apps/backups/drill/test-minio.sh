@@ -65,4 +65,14 @@ check failed-read 'restore_mismatch'
 
 mk; echo 0123456789 > "$G/factory-evidence/2"; MAX_OBJECT_BYTES=5 drill   # evidence object over cap, artifacts fine
 check bucket-without-sample 'no_sample_factory-evidence'
+# The sample rotates: 10 objects, 3 per run. Same seed repeats; other seeds reach past the first three paths.
+mk; for i in 01 02 03 04 05 06 07 08 09 10; do echo "o$i" > "$G/factory-evidence/o$i"; echo "$(sha256sum < "$G/factory-evidence/o$i" | cut -d' ' -f1)  factory-evidence/o$i" >> "$G/MANIFEST.sha256"; done
+pick() { SAMPLE_COUNT=3 SAMPLE_SEED=$1 sh "$here/minio-drill.sh" >/dev/null; grep factory-evidence "$tmp/s/sample" | sort | tr '\n' ' '; }
+a="$(pick 1)"; [ "$a" = "$(pick 1)" ] || { echo "FAIL same seed gave another sample"; exit 1; }
+all="$a"; differs=no
+for s in 2 3 4 5 6; do p="$(pick $s)"; all="$all$p"; [ "$p" = "$a" ] || differs=yes; done
+[ "$differs" = yes ] || { echo "FAIL seeds do not change the sample"; exit 1; }
+printf '%s' "$all" | grep -Eq 'o(0[3-9]|10)' || { echo "FAIL sample never leaves the first paths"; exit 1; }
+check seeded-run '"sample_objects":4'
+echo "PASS sample rotates"
 echo "ALL PASS"
