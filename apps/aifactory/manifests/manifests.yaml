@@ -630,6 +630,7 @@ spec:
             # #688 OAuth / #689 provider env / #690 file-auth creds) → flipping the
             # build to Job-native. REVERT = re-comment this one line.
             - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
+            - { name: AIFACTORY_SPEC_BACKEND, value: "kubejob" }  # AIFactory#1932: spec creation runs as a Job (needs >= 3.11.0)
             # #690: file-auth CLI creds for the dispatched build Job — seeds the
             # factory-cli-creds secret into the Job pod via the seed-creds
             # initContainer (build_backend._inject_seed_creds). INERT until
