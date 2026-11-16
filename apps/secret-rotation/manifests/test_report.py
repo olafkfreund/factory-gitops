@@ -83,6 +83,12 @@ assert len(issues) == len(report.POLICY) - 1, titles  # minio-creds already has 
 assert not any("minio-creds" in t for t in titles)
 assert all("secret-rotation:" in i["body"] and i["labels"] == ["secret-rotation"] for i in issues)
 
+# 4b. a deleted/renamed Secret (404) opens an issue too, and still exits 0
+issues.clear()
+report.k8s_meta = lambda n: (_ for _ in ()).throw(http(404)) if n == "odin-ssh-key" else stamp(1)
+assert report.main(T) == 0
+assert len(issues) == 1 and "odin-ssh-key is missing" in issues[0]["title"], issues
+
 # 5. the REAL k8s_meta and emit with only the transport stubbed: Accept header, the no-values
 # guard, the emitted cronjob field and the OpenObserve failed-count check
 import json

@@ -7,7 +7,7 @@ a Secret value to this process. The owner stamps `rotation.factory.dev/rotated-a
 interval; compromise-only keys such as CFACTORY_AUDIT_HMAC_SECRET do not count)
 after a rotation; see docs/secrets-management.md "Rotation age report".
 
-Emits one `job_health` record per Secret, opens one GitHub issue per overdue Secret
+Emits one `job_health` record per Secret, opens one GitHub issue per overdue or missing Secret
 (cred-broker pattern, inert without GITHUB_TOKEN), exits 1 on an API or delivery failure.
 Stdlib only. Never prints a value.
 """
@@ -116,7 +116,9 @@ def gh(method, path, body=None):
 
 
 def alert(overdue):
-    """One issue per overdue Secret, once while it stays open. Never changes the exit code."""
+    """One issue per overdue or missing Secret, once while it stays open. Never changes the exit code.
+
+    overdue: (name, status, age, max_age); status is "overdue" or "missing" (deleted or renamed)."""
     if not os.environ.get("GITHUB_TOKEN"):
         eprint("alerting inert: no GITHUB_TOKEN")
         return
@@ -132,16 +134,23 @@ def alert(overdue):
                 raise
         open_bodies = [i.get("body") or "" for i in gh(
             "GET", f"/repos/{ALERT_REPO}/issues?state=open&labels={ALERT_LABEL}&per_page=100") or []]
-        for name, age, max_age in overdue:
+        for name, status, age, max_age in overdue:
             marker = f"<!-- secret-rotation:{name} -->"
             if any(marker in b for b in open_bodies):
                 eprint(f"alert: an open issue already exists for {name}")
                 continue
+            if status == "missing":
+                title = f"secret-rotation: {name} is missing from namespace {NS}"
+                what = (f"`factory/{name}` returned 404: it was deleted or renamed, so its rotation age cannot "
+                        f"be checked. Restore it, or update POLICY in report.py if the rename is intended.")
+            else:
+                title = f"secret-rotation: {name} is past its {max_age}-day rotation interval"
+                what = f"`factory/{name}` is {age} days past its last evidenced rotation (maximum {max_age})."
             new = gh("POST", f"/repos/{ALERT_REPO}/issues", {
-                "title": f"secret-rotation: {name} is past its {max_age}-day rotation interval",
+                "title": title,
                 "labels": [ALERT_LABEL],
                 "body": f"""{marker}
-`factory/{name}` is {age} days past its last evidenced rotation (maximum {max_age}).
+{what}
 
 Rotate it by the runbook ({RUNBOOK}), then stamp the Secret in the same window:
 `kubectl -n factory annotate secret {name} --overwrite {ANN}=<oldest-date>` (the oldest
@@ -186,7 +195,8 @@ def main(today=None):
     except Exception as e:  # noqa: BLE001
         eprint(f"emit: {type(e).__name__}")
         rc = 1
-    alert([(r["secret"], r["age_days"], r["max_age_days"]) for r in records if r["status"] == "overdue"])
+    alert([(r["secret"], r["status"], r["age_days"], r["max_age_days"]) for r in records
+           if r["status"] in ("overdue", "missing")])
     return rc
 
 

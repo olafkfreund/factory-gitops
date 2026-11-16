@@ -13,6 +13,10 @@ for a in "\$@"; do
   case "\$a" in fac/*) a="$tmp/root/\$a" ;; esac
   set -- "\$@" "\$a"; shift
 done
+[ "\$1" = find ] && [ -n "\${FAIL_FIND:-}" ] && exit 1
+[ "\$1" = cp ] && [ -n "\${FAIL_CP:-}" ] && exit 1
+# find returns newest FIRST, so a fetch.sh without its sort picks the oldest dump and fails below
+if [ "\$1" = find ]; then "$real_mc" "\$@" | sort -r; exit 0; fi
 exec "$real_mc" "\$@"
 EOS
 chmod +x "$tmp/bin/mc"
@@ -30,4 +34,11 @@ SCRATCH="$tmp/s1" sh "$here/fetch.sh" >/dev/null
 [ "$(cat "$tmp/s1/dump.name")" = factory-cluster-20260103T000000Z.sql.gz ] || { echo "FAIL newest not chosen"; exit 1; }
 [ "$(cat "$tmp/s1/dump.sql.gz")" = 20260103T000000Z ] && [ ! -f "$tmp/s1/result.json" ] || { echo "FAIL fetch content"; exit 1; }
 echo "PASS newest dump chosen"
+
+for f in FIND:fetch_list_failed CP:fetch_copy_failed; do
+  mkdir -p "$tmp/f${f%%:*}"
+  env "FAIL_${f%%:*}=1" SCRATCH="$tmp/f${f%%:*}" sh "$here/fetch.sh" >/dev/null 2>&1
+  grep -q "\"ok\":false.*${f#*:}" "$tmp/f${f%%:*}/result.json" || { echo "FAIL ${f#*:}"; cat "$tmp/f${f%%:*}/result.json"; exit 1; }
+  echo "PASS ${f#*:} is a not-ok result"
+done
 echo "ALL PASS"
