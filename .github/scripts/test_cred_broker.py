@@ -86,6 +86,98 @@ for days, rt, grant_ok, want_rc, want_outcome, want_patched, label in CASES:
     if not ok:
         failures.append(label)
 
+# --- Factory#3687: the early alert -------------------------------------------
+# Each case drives main() with a fake Anthropic + GitHub behind one urlopen and
+# asserts the EXACT list of GitHub calls, so an error swallowed inside alert()
+# cannot pass a "nothing was sent" check.
+import os
+
+
+def arun(hours_left, *, mode, token="t", existing=False, gh_fail=False, no_rt=False):
+    """mode: invalid_grant | http503 | network | badjson | noreply. hours_left None = no expiresAt."""
+    os.environ.pop("GITHUB_TOKEN", None)
+    if token:
+        os.environ["GITHUB_TOKEN"] = token
+    os.environ["ALERT_REPO"] = "o/r"
+    m = load()
+    oauth = {} if hours_left is None else {"expiresAt": int((time.time() + hours_left * 3600) * 1000)}
+    if not no_rt:
+        oauth["refreshToken"] = "rt-fake"
+    cred = {"claudeAiOauth": oauth}
+    gh_calls, posted = [], []
+
+    class R:
+        def __init__(self, d): self.d = d
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self.d
+        def __iter__(self): return iter(())
+
+    def fake_urlopen(req, timeout=None, context=None):
+        if "api.github.com" in req.full_url:
+            path = req.full_url.split("api.github.com", 1)[1]
+            gh_calls.append((req.get_method(), path))
+            if gh_fail:
+                raise urllib.error.HTTPError(req.full_url, 500, "x", {}, io.BytesIO(b"{}"))
+            if req.get_method() == "GET":
+                body = [{"body": m.ALERT_MARKER + " old"}] if existing else []
+                return R(json.dumps(body).encode())
+            if req.data:
+                posted.append(json.loads(req.data))
+            return R(b'{"number": 7}')
+        if mode == "network":
+            raise urllib.error.URLError("boom secret-payload")
+        if mode == "badjson":
+            return R(b"<html>")
+        if mode == "noreply":
+            return R(b'{"x": 1}')
+        code, text = (400, b'{"error":"invalid_grant"}') if mode == "invalid_grant" else (503, b"{}")
+        raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(text))
+
+    m.k8s = lambda method, path, body=None, content_type="application/json": (
+        {"data": {m.KEY: base64.b64encode(json.dumps(cred).encode()).decode()}} if method == "GET" else {})
+    outcomes = []
+    m.record = lambda outcome, detail, exp=None: outcomes.append(outcome)
+    m.urllib.request.urlopen = fake_urlopen
+    rc = m.main()
+    return rc, outcomes[-1] if outcomes else None, gh_calls, posted
+
+
+SEND = [("POST", "/repos/o/r/labels"), ("GET", "/repos/o/r/issues?state=open&labels=cred-broker&per_page=100"),
+        ("POST", "/repos/o/r/issues")]
+DEDUP = SEND[:2]
+# (hours_left, kwargs, want_rc, want_outcome, want_gh_calls, label)
+ALERT_CASES = (
+    (3, dict(mode="invalid_grant"), 3, "refresh-rejected:invalid_grant", SEND, "invalid_grant at 3h alerts"),
+    (3, dict(mode="invalid_grant", token=""), 3, "refresh-rejected:invalid_grant", [], "no token: inert, same exit"),
+    (3, dict(mode="invalid_grant", existing=True), 3, "refresh-rejected:invalid_grant", DEDUP, "open issue: no second one"),
+    (3, dict(mode="invalid_grant", gh_fail=True), 3, "refresh-rejected:invalid_grant", SEND[:1], "GitHub 500: exit unchanged"),
+    (3, dict(mode="http503"), 3, "refresh-rejected:http_503", SEND, "http 503 at 3h alerts"),
+    (50, dict(mode="http503"), 3, "refresh-rejected:http_503", [], "http 503 at 50h stays quiet"),
+    (None, dict(mode="http503"), 3, "refresh-rejected:http_503", SEND, "http 503, unknown expiry alerts"),
+    (3, dict(mode="network"), 3, "refresh-failed:network", SEND, "network at 3h alerts, exit 3"),
+    (50, dict(mode="network"), 3, "refresh-failed:network", [], "network at 50h stays quiet"),
+    (None, dict(mode="network"), 3, "refresh-failed:network", SEND, "network, unknown expiry alerts"),
+    (3, dict(mode="badjson"), 3, "refresh-failed:network", SEND, "non-JSON 200 alerts, exit 3"),
+    (3, dict(mode="noreply"), 4, "bad-refresh-response", SEND, "200 without tokens alerts, exit 4"),
+    (120, dict(mode="noreply"), 4, "bad-refresh-response", [], "200 without tokens at 120h quiet"),
+    (120, dict(mode="invalid_grant"), 3, "refresh-rejected:invalid_grant", SEND, "invalid_grant at 5d alerts"),
+    (800, dict(mode="invalid_grant"), 0, "not-applicable:long-lived-credential", [], "long-lived exemption: nothing"),
+    (120, dict(mode="http503", no_rt=True), 2, "no-refresh-token", SEND, "no refresh token, short runway alerts"),
+)
+for hours, kw, want_rc, want_outcome, want_gh, label in ALERT_CASES:
+    rc, outcome, gh_calls, posted = arun(hours, **kw)
+    ok = rc == want_rc and outcome == want_outcome and gh_calls == want_gh
+    if ok and want_gh == SEND:
+        body = posted[-1]["body"]
+        ok = (want_outcome in body and "access-expires-at" in body and "k3d-factory" in body
+              and "<!-- cred-broker:alert -->" in body and "secret-payload" not in body)
+    print(f"{'ok  ' if ok else 'FAIL'} alert: {label:40s} exit={rc} outcome={outcome} gh={len(gh_calls)}")
+    if not ok:
+        failures.append(label)
+        print(f"     want rc={want_rc} outcome={want_outcome} gh={want_gh}; got gh={gh_calls}")
+
+
 if failures:
     # The short-runway case going green would be the dangerous direction: it
     # means a genuine credential expiry no longer pages anyone.

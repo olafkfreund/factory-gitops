@@ -61,6 +61,7 @@ data:
 
     import base64
     import json
+    import os
     import re
     import ssl
     import sys
@@ -86,6 +87,14 @@ data:
     # refresh at all — worth saying out loud rather than reporting it as an
     # imminent outage.
     LONG_LIVED_DAYS = 30
+
+    # Factory#3687: raise a GitHub issue on the run that knows, not 8h later.
+    ALERT_REPO = os.environ.get("ALERT_REPO", "olafkfreund/Factory")
+    ALERT_WITHIN_HOURS = float(os.environ.get("ALERT_WITHIN_HOURS", "5"))
+    ALERT_LABEL = "cred-broker"
+    # Own marker, NOT job-watchdog's: the watchdog closes an issue it owns after one
+    # failed run (it needs 2 failures or 8.25h of staleness to see a problem).
+    ALERT_MARKER = "<!-- cred-broker:alert -->"
 
 
     def eprint(*a):
@@ -147,6 +156,103 @@ data:
             eprint(f"warn: could not record outcome on the Secret: {type(e).__name__}")
 
 
+    def within_window(exp_ms):
+        """True when the access token has ALERT_WITHIN_HOURS or less left, or expiry is unknown."""
+        return exp_ms is None or (exp_ms / 1000 - time.time()) / 3600 <= ALERT_WITHIN_HOURS
+
+
+    def alert(outcome, detail, exp_ms):
+        """Raise (once) a GitHub issue carrying what the owner needs to re-seed.
+
+        Best-effort and never changes the exit code. `detail` is a fixed string, never a
+        provider response body. Inert without GITHUB_TOKEN.
+        shortcut: a hand-started verify Job overlapping a scheduled one can open a second
+        issue; the CronJob's own retries run one after another, so they cannot.
+        """
+        token = os.environ.get("GITHUB_TOKEN", "")
+        if not token:
+            eprint("alerting inert: no GITHUB_TOKEN")
+            return
+
+        def gh(method, path, body=None):
+            req = urllib.request.Request(
+                f"https://api.github.com{path}",
+                data=None if body is None else json.dumps(body).encode(),
+                headers={
+                    "authorization": f"Bearer {token}",
+                    "accept": "application/vnd.github+json",
+                    "content-type": "application/json",
+                    "user-agent": "factory-cred-broker",
+                },
+                method=method,
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+            return json.loads(raw) if raw else None
+
+        try:
+            try:
+                gh("POST", f"/repos/{ALERT_REPO}/labels",
+                   {"name": ALERT_LABEL, "color": "b60205",
+                    "description": "Raised by cred-broker: credential needs a re-seed"})
+            except urllib.error.HTTPError as e:
+                if e.code != 422:  # 422 = already exists
+                    raise
+            open_issues = gh("GET", f"/repos/{ALERT_REPO}/issues?state=open&labels={ALERT_LABEL}&per_page=100") or []
+            if any(ALERT_MARKER in (i.get("body") or "") for i in open_issues):
+                eprint("alert: an open cred-broker issue already exists")
+                return
+            if exp_ms:
+                left = (exp_ms / 1000 - time.time()) / 3600
+                expiry = f"{iso(exp_ms)} ({left:.1f}h left)"
+            else:
+                expiry = "unknown"
+            ctx = "--context k3d-factory -n factory"
+            body = f"""{ALERT_MARKER}
+    The Claude OAuth credential in `factory/factory-cli-creds` could not be refreshed.
+
+    - last-outcome: `{outcome}`
+    - last-detail: `{detail}`
+    - access-expires-at: `{expiry}`
+
+    `refresh-rejected:invalid_grant` cannot succeed on retry: the refresh token is dead and a
+    human must re-seed it. Other outcomes may clear on their own; read `last-outcome` again
+    after the next run (every 4h) before re-seeding.
+
+    ## Re-seed (full procedure: docs/secrets-management.md)
+
+    1. On a machine with the CLI: `claude auth login` (not `setup-token`).
+    2. Patch `factory-cli-creds` (keep the value off the command line):
+       ```
+       kubectl {ctx} patch secret factory-cli-creds --type merge --patch-file /dev/stdin <<EOF
+       {{"data":{{"claude-credentials.json":"$(base64 -w0 ~/.claude/.credentials.json)"}}}}
+       EOF
+       ```
+    3. Patch the matching access token into `factory-secrets` key `CLAUDE_CODE_OAUTH_TOKEN`
+       (step 3 of the doc).
+    4. Verify:
+       ```
+       J=cred-broker-verify-$(date +%s)
+       kubectl {ctx} create job $J --from=cronjob/cred-broker
+       kubectl {ctx} wait --for=condition=complete job/$J --timeout=120s
+       kubectl {ctx} get secret factory-cli-creds -o jsonpath='{{.metadata.annotations.cred-broker\\.factory\\.dev/last-outcome}}{{"\\n"}}'
+       ```
+       Expect `ok`.
+    5. `kubectl {ctx} rollout restart deploy/pfactory deploy/tfactory deploy/aifactory`, then close this issue.
+
+    This issue stays open until closed by hand, and no second one is raised while it is open.
+    job-watchdog may open its own staleness issue for the same fault.
+    """
+            new = gh("POST", f"/repos/{ALERT_REPO}/issues", {
+                "title": f"cred-broker: Claude credential needs a re-seed ({outcome})",
+                "body": body,
+                "labels": [ALERT_LABEL],
+            })
+            eprint(f"ALERTED: opened {ALERT_REPO}#{new['number']}")
+        except Exception as e:  # noqa: BLE001
+            eprint(f"warn: could not raise the alert issue: {type(e).__name__}")
+
+
     def main() -> int:
         # 1. Read the current credential out of the Secret.
         sec = k8s("GET", f"/api/v1/namespaces/{NS}/secrets/{SECRET}")
@@ -198,6 +304,7 @@ data:
                 return 0
             eprint(f"FATAL: no refreshToken in the Secret — needs a human re-seed. {runway}")
             record("no-refresh-token", "Secret has no refreshToken", exp_ms)
+            alert("no-refresh-token", "Secret has no refreshToken", exp_ms)
             return 2
 
         # 2. Refresh (rotates both tokens).
@@ -260,6 +367,16 @@ data:
                     return 0
             code = "invalid_grant" if bad_grant else f"http_{e.code}"
             record(f"refresh-rejected:{code}", f"HTTP {e.code} {code}", exp_ms)
+            # invalid_grant cannot succeed on retry, so the first one already knows.
+            if bad_grant or within_window(exp_ms):
+                alert(f"refresh-rejected:{code}", f"HTTP {e.code} {code}", exp_ms)
+            return 3
+        except (OSError, ValueError) as e:
+            # Network error or a non-JSON 200. Never print str(e): it can carry payload.
+            eprint(f"FATAL: refresh failed: {type(e).__name__}. {runway}")
+            record("refresh-failed:network", type(e).__name__, exp_ms)
+            if within_window(exp_ms):
+                alert("refresh-failed:network", type(e).__name__, exp_ms)
             return 3
 
         at = tok.get("access_token")
@@ -267,6 +384,8 @@ data:
         if not at or expires_in is None:
             eprint(f"FATAL: unexpected refresh response keys: {sorted(tok)}. {runway}")
             record("bad-refresh-response", f"keys={sorted(tok)}"[:120], exp_ms)
+            if within_window(exp_ms):
+                alert("bad-refresh-response", f"keys={sorted(tok)}"[:120], exp_ms)
             return 4
 
         oauth["accessToken"] = at
@@ -338,6 +457,13 @@ spec:
               # Stock python; the script is stdlib-only so no custom image.
               image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
               command: ["python3", "/script/refresh.py"]
+              env:
+                # Factory#3687: optional, so a missing key leaves rotation working
+                # and only turns the early alert off.
+                - name: GITHUB_TOKEN
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN, optional: true } }
+                - name: ALERT_REPO
+                  value: olafkfreund/Factory
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
