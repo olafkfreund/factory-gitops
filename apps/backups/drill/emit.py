@@ -20,9 +20,9 @@ ok = bool(res["ok"])
 rec = {
     "_timestamp": int(__import__("time").time() * 1_000_000),
     "source": "restore-drill",
-    "kind": "restore_drill",
+    "kind": os.environ.get("DRILL_KIND", "restore_drill"),
     "namespace": os.environ.get("NAMESPACE", "factory"),
-    "cronjob": "postgres-restore-drill",
+    "cronjob": os.environ.get("CRONJOB", "postgres-restore-drill"),
     "status": "ok" if ok else "restore_failed",
     **res,
 }

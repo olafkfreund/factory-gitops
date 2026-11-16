@@ -37,4 +37,6 @@ assert rec["status"] == "ok" and rec["cronjob"] == "postgres-restore-drill" and 
 assert run({**base, "ok": False, "problems": ["x"]}) == 1 and got["body"][0]["status"] == "restore_failed"
 assert run(base, evidence_failed=True) == 1
 assert "evidence_upload_failed" in got["body"][0]["problems"]
+os.environ["CRONJOB"] = "minio-restore-drill"; os.environ["DRILL_KIND"] = "minio_restore_drill"
+assert run(base) == 0 and got["body"][0]["cronjob"] == "minio-restore-drill" and got["body"][0]["kind"] == "minio_restore_drill"
 print("ALL PASS")

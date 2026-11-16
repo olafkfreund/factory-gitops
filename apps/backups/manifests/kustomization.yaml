@@ -4,3 +4,4 @@ namespace: factory
 resources:
   - manifests.yaml
   - ../drill
+  - ../minio-local
