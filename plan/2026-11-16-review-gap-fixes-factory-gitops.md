@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 0
 spec: spec/2026-11-16-review-gap-fixes-factory-gitops.md
 coders:
