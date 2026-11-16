@@ -75,6 +75,9 @@ VERIFY_KEYS = {"imageReferences", "verifyDigest", "mutateDigest", "required",
 
 SIGNATURES = "apps/kyverno-policies/manifests/verify-factory-image-signatures.yaml"
 COVERAGE = "apps/kyverno-policies/manifests/require-first-party-signature-coverage.yaml"
+CATCHALL = "apps/kyverno-policies/manifests/report-first-party-image-outside-coverage-groups.yaml"
+# Cluster-owned namespaces the catch-all (#3701) leaves out on top of the covered ones.
+SYSTEM_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease"}
 PROBE = "apps/kyverno-runner-probe/manifests/manifests.yaml"
 
 
@@ -206,6 +209,31 @@ def mirror():
     return found
 
 
+def catchall_excluded():
+    """Namespaces the catch-all excludes; only one rule shape is accepted (#3701).
+
+    Anything else (a namespace in `match`, selectors, a second exclude clause)
+    could narrow what the rule reports without changing the set below, so it is
+    an error rather than something this check models.
+    """
+    rules = json.loads(yq(".spec.rules | tojson", CATCHALL))
+    if len(rules) != 1:
+        die(f"{CATCHALL} must hold exactly one rule (#3701)")
+    rule = rules[0]
+    match, exclude = rule.get("match"), rule.get("exclude")
+    if (match != {"any": [{"resources": {"kinds": ["Pod"]}}]}
+            or not isinstance(exclude, dict) or set(exclude) != {"any"}
+            or len(exclude["any"]) != 1
+            or set(exclude["any"][0]) != {"resources"}
+            or set(exclude["any"][0]["resources"]) != {"namespaces"}):
+        die(f"{CATCHALL}: match must be one Pod clause and exclude one `namespaces`-only clause (#3701)")
+    values = exclude["any"][0]["resources"]["namespaces"]
+    if not isinstance(values, list) or any(
+            not isinstance(n, str) or not NAMESPACE.fullmatch(n) for n in values):
+        die(f"{CATCHALL}: exclude namespaces must be literal names (#3701)")
+    return set(values)
+
+
 def probe():
     """DEFAULT_IMAGES and COVERAGE_CANARY out of the probe's embedded python."""
     src = yq('select(.kind == "ConfigMap") | .data["probe.py"]', PROBE)
@@ -254,6 +282,16 @@ def main():
     ):
         err(COVERAGE, f"namespace {namespace} has no coverage rule (#3665)")
 
+    # E. the catch-all excludes exactly the covered namespaces plus the system ones.
+    expected = REQUIRED_NAMESPACES | signature_namespaces | SYSTEM_NAMESPACES
+    excluded = catchall_excluded()
+    for namespace in sorted(excluded - expected):
+        err(CATCHALL, f"excludes {namespace}, which has no coverage group -- "
+            "first-party images there go unchecked (#3701)")
+    for namespace in sorted(expected - excluded):
+        err(CATCHALL, f"does not exclude {namespace}, so it double-reports a covered "
+            "or cluster-owned namespace (#3701)")
+
     # B. every probed image is named by some glob.
     # ponytail: fnmatch, not Kyverno's globbing. These patterns are a literal
     # prefix plus one trailing `*`, where the two agree exactly. Swap it if a
@@ -282,6 +320,7 @@ def main():
     print(
         f"ok  {len(prefixes)} signature glob(s), {len(signatures)} signature rule(s), "
         f"{len(coverage)} coverage rule(s), {len(coverage_namespaces)} namespace(s) agree; "
+        f"the catch-all excludes exactly those plus {len(SYSTEM_NAMESPACES)} system namespace(s); "
         f"all {len(images)} probed image(s) are named by one; the canary is named by none"
     )
     return 0

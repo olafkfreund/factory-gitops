@@ -1663,11 +1663,53 @@ Residual risks, named rather than implied away:
 - **Signatures attest provenance, not contents.** A verified signature proves the
   named workflow published the image. It says nothing about what is in it.
 
+## Catch-all for namespaces with no coverage group (Factory#3701)
+
+The signature policy and `require-first-party-signature-coverage` name four
+namespaces. `report-first-party-image-outside-coverage-groups`
+(`apps/kyverno-policies/manifests/report-first-party-image-outside-coverage-groups.yaml`)
+reports any `ghcr.io/olafkfreund/*` image on a Pod in any other namespace, in
+`containers`, `initContainers` and `ephemeralContainers`. In a namespace with no
+group every first-party image is uncovered, so the rule has no image list to
+keep in step.
+
+**Audit only: it reports, it never blocks.** It excludes `factory`, `gateway`,
+`fides` and `fides-reporter` (they have their own rules) and `kube-system`,
+`kube-public` and `kube-node-lease` (cluster-owned; a first-party image there
+would go unchecked). `assert-signature-lists-agree.py` (check E) fails CI if
+the exclude list drifts from the covered namespaces or takes any other shape.
+Like the coverage policy it has `failurePolicy: Ignore` and `background: true`,
+and reads only the Pod spec.
+
+Read it like the coverage policy: `fail` is a first-party image in a namespace
+with no group, `skip` is checked and clean.
+
+```bash
+kubectl get polr -A -o json | jq -r '.items[] | .metadata.namespace as $n | .results[]?
+  | select(.policy=="report-first-party-image-outside-coverage-groups" and .result=="fail")
+  | "\($n) \(.message)"'
+```
+
+A `fail` means: give the namespace a group (a `verifyImages` rule plus a
+coverage rule, and add the namespace to the exclude list in the same commit) or
+move the workload.
+
+**Flipping it to Enforce is the owner's decision.** Do it only after seven
+consecutive days with no `fail` row for this policy across a background scan
+and with the four covered namespaces unchanged. The flip is its own PR that
+sets `validationFailureAction: Enforce` and keeps `tests/` green
+(`kyverno test apps/kyverno-policies/tests`, CLI v1.18.2). After the owner
+syncs it, confirm the denial with
+`kubectl apply --dry-run=server` of a Pod carrying a first-party image in a
+throwaway namespace; that proof is only possible after the flip, because Audit
+admits the request. Roll back by reverting the flip commit. Enforce is off today.
+
 ## Notes
 
 - Scope is deliberately the four application namespaces (`factory`, `gateway`,
-  `fides`, `fides-reporter`) only. System namespaces
-  (`kube-system`, `argocd`, `kyverno`, ...) are never subject to this policy.
+  `fides`, `fides-reporter`) only. Other namespaces are
+  reported, not verified, by the Audit-only catch-all above; the Kubernetes
+  system namespaces are excluded from both.
 - `verifyDigest: false` / `mutateDigest: false` in the audit phase: we verify
   the signature but do not yet require digest-pinned references or rewrite tags
   to digests. Digest pinning is a separate hardening step that can ride along

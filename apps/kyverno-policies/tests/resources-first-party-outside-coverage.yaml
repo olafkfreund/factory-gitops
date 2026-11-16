@@ -1,0 +1,81 @@
+# Inputs for kyverno-test-first-party-outside-coverage.yaml (Factory#3701).
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-container, namespace: monitoring}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-initcontainer, namespace: monitoring}
+spec:
+  initContainers: [{name: i, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+  containers: [{name: c, image: "busybox:1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-ephemeral, namespace: monitoring}
+spec:
+  containers: [{name: c, image: "busybox:1"}]
+  ephemeralContainers: [{name: e, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-digest, namespace: monitoring}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/aifactory@sha256:0000000000000000000000000000000000000000000000000000000000000000"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: uncovered-variant, namespace: monitoring}
+spec:
+  containers: [{name: c, image: "GHCR.IO:443/olafkfreund/aifactory:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: thirdparty-other-namespace, namespace: monitoring}
+spec:
+  containers: [{name: c, image: "postgres:17"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: excluded-factory, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: excluded-gateway, namespace: gateway}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: excluded-fides, namespace: fides}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: excluded-fides-reporter, namespace: fides-reporter}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: excluded-kube-system, namespace: kube-system}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: excluded-kube-public, namespace: kube-public}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: excluded-kube-node-lease, namespace: kube-node-lease}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/some-future-service:v1"}]

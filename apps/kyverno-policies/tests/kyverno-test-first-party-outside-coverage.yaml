@@ -1,0 +1,40 @@
+# Kyverno CLI test for report-first-party-image-outside-coverage-groups (Factory#3701).
+#
+# Run with the same Kyverno CLI the cluster runs (v1.18.2):
+#
+#   kyverno test apps/kyverno-policies/tests -f kyverno-test-first-party-outside-coverage.yaml
+#
+# Excluded namespaces report `Excluded`, which satisfies `skip`; the `fail`
+# cases are what prove the rule evaluates (the CI #148 gate checks that).
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: report-first-party-image-outside-coverage-groups
+policies:
+  - ../manifests/report-first-party-image-outside-coverage-groups.yaml
+resources:
+  - resources-first-party-outside-coverage.yaml
+results:
+  - policy: report-first-party-image-outside-coverage-groups
+    rule: first-party-image-in-namespace-with-no-coverage-group
+    kind: Pod
+    result: fail
+    resources:
+      - uncovered-container
+      - uncovered-initcontainer
+      - uncovered-ephemeral
+      - uncovered-digest
+      - uncovered-variant
+  - policy: report-first-party-image-outside-coverage-groups
+    rule: first-party-image-in-namespace-with-no-coverage-group
+    kind: Pod
+    result: skip
+    resources:
+      - thirdparty-other-namespace
+      - excluded-factory
+      - excluded-gateway
+      - excluded-fides
+      - excluded-fides-reporter
+      - excluded-kube-system
+      - excluded-kube-public
+      - excluded-kube-node-lease
