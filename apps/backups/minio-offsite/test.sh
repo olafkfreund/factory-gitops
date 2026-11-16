@@ -10,6 +10,8 @@ cat > "$tmp/bin/mc" <<EOS
 #!/bin/sh
 [ "\$1" = alias ] && exit 0
 [ "\$1" = cat ] && [ -n "\${FAIL_CAT:-}" ] && exit 1
+[ "\$1" = ls ] && [ -n "\${FAIL_LS:-}" ] && exit 1
+[ "\$1" = cp ] && [ -n "\${CORRUPT_CP:-}" ] && { head -c 10 "\$2" > "$tmp/root/\$3"; exit 0; }
 for a in "\$@"; do
   case "\$a" in
     fac/*|off/*) a="$tmp/root/\$a" ;;
@@ -62,6 +64,8 @@ SCRATCH="$tmp/scratch"; AGE_BIN="$tmp/agebin/bin/age"; export SCRATCH AGE_BIN
 rm -rf "$R/off" "$R/fac"; mkdir -p "$R/off/bk" "$R/fac/factory-artifacts/a" "$R/fac/factory-evidence"
 echo one > "$R/fac/factory-artifacts/a/1"; echo two > "$R/fac/factory-artifacts/2"   # evidence stays empty
 day="$(date -u +%Y%m%d)"
+# S3 lists an unused prefix as empty; a local directory must exist to do the same.
+mkdir -p "$R/off/bk/minio/factory-artifacts/snapshots" "$R/off/bk/minio/factory-evidence/snapshots"
 snap="$R/off/bk/minio/factory-artifacts/snapshots/factory-artifacts-$day.tar.gz.age"
 OFFSITE_AGE_RECIPIENT=$RECIP sh "$here/minio-offsite.sh" >"$tmp/out" 2>&1 || { cat "$tmp/out"; echo "FAIL encrypted copy"; exit 1; }
 grep -q 'minio-offsite: OK bucket=factory-artifacts encrypted=age' "$tmp/out" || { echo "FAIL no OK line"; exit 1; }
@@ -72,6 +76,8 @@ mkdir -p "$tmp/restore"
 [ "$(sha256sum "$snap" | cut -d ' ' -f 1)" = "$(cut -d ' ' -f 1 "$snap.sha256")" ] || { echo "FAIL checksum file"; exit 1; }
 echo "PASS encrypted snapshot restores with the offline key"
 
+# A listing error must fail the run, never read as "no snapshot yet" and overwrite.
+if FAIL_LS=1 OFFSITE_AGE_RECIPIENT=$RECIP sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL listing error passed"; exit 1; fi
 before="$(sha256sum "$snap")"
 OFFSITE_AGE_RECIPIENT=$RECIP sh "$here/minio-offsite.sh" >/dev/null 2>&1 || { echo "FAIL retry"; exit 1; }
 [ "$before" = "$(sha256sum "$snap")" ] || { echo "FAIL retry rewrote the snapshot"; exit 1; }
@@ -87,6 +93,13 @@ rm "$snap.sha256"
 OFFSITE_AGE_RECIPIENT=$RECIP sh "$here/minio-offsite.sh" >"$tmp/out" 2>&1 || { echo "FAIL missing checksum must pass"; exit 1; }
 grep -q 'WARN no checksum file' "$tmp/out" || { echo "FAIL missing checksum did not warn"; exit 1; }
 echo "PASS checksum mismatch fails, missing checksum warns"
+
+# A truncated upload must fail the read-back.
+rm -f "$snap" "$snap.sha256"
+if CORRUPT_CP=1 OFFSITE_AGE_RECIPIENT=$RECIP sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL corrupted upload passed"; exit 1; fi
+rm -f "$snap" "$snap.sha256"
+OFFSITE_AGE_RECIPIENT=$RECIP sh "$here/minio-offsite.sh" >/dev/null 2>&1 || { echo "FAIL re-create after removal"; exit 1; }
+echo "PASS corrupted upload fails"
 
 echo plain > "$snap"
 if OFFSITE_AGE_RECIPIENT=$RECIP sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL headerless object passed"; exit 1; fi

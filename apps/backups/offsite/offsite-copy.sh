@@ -55,11 +55,9 @@ if [ -n "${OFFSITE_AGE_RECIPIENT:-}" ]; then
   [ -x "$AGE_BIN" ] || fail 'age binary missing (init container did not run)'
   mc cat "fac/factory-backups/postgres/$name" | gzip -t 2>/dev/null || fail 'source dump is invalid gzip'
   dest="off/$OFFSITE_S3_BUCKET/postgres"
-  # A prefix that does not exist yet may list as an error: then the bucket itself must list.
-  listing="$(mc ls "$dest/" 2>/dev/null)" || {
-    mc ls "off/$OFFSITE_S3_BUCKET/" >/dev/null 2>&1 || fail 'destination listing failed'
-    listing=
-  }
+  # Fail closed: a listing that errors must never read as "nothing there", or the
+  # upload below could replace an existing copy. S3 lists an unused prefix as empty.
+  listing="$(mc ls "$dest/")" || fail 'destination listing failed'
   has() { printf '%s\n' "$listing" | awk -v n="$1" '$NF == n { f = 1 } END { exit !f }'; }
   if has "$name.age"; then
     mc cat "$dest/$name.age" > "$SCRATCH/readback.age" || fail 'destination read-back failed'

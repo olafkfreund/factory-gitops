@@ -42,11 +42,9 @@ if [ -n "${OFFSITE_AGE_RECIPIENT:-}" ]; then
   for bucket in factory-artifacts factory-evidence; do
     dest="off/$OFFSITE_S3_BUCKET/minio/$bucket/snapshots"
     file="$bucket-$day.tar.gz.age"
-    # A prefix that does not exist yet may list as an error: then the bucket itself must list.
-    listing="$(mc ls "$dest/" 2>/dev/null)" || {
-      mc ls "off/$OFFSITE_S3_BUCKET/" >/dev/null 2>&1 || fail 'destination listing failed'
-      listing=
-    }
+    # Fail closed: a listing that errors must never read as "nothing there", or the
+    # upload below could replace an existing snapshot. S3 lists an unused prefix as empty.
+    listing="$(mc ls "$dest/")" || fail 'destination listing failed'
     has() { printf '%s\n' "$listing" | awk -v n="$1" '$NF == n { f = 1 } END { exit !f }'; }
     if has "$file"; then
       mc cat "$dest/$file" > "$SCRATCH/readback.age" || fail "read-back of $file failed"

@@ -14,6 +14,7 @@ case "$1" in
     ;;
   ls)
     [ "$#" -eq 2 ]
+    case "$2" in off/*) [ -z "${FAIL_LS:-}" ] || exit 1 ;; esac
     for file in "$STUB_ROOT/$2"*; do
       [ -f "$file" ] || continue
       printf '2026-01-01 00:00:00 1 %s\n' "${file##*/}"
@@ -194,6 +195,8 @@ before="$(sha256sum "$tmp/enc_retry/root/off/offsite-backups/postgres/"*.age | c
 cp "$tmp/bin/mc" "$tmp/bin/mc.real"
 sed 's|cp "\$2" "\$STUB_ROOT/\$3"|head -c 10 "$2" > "$STUB_ROOT/$3"|' "$tmp/bin/mc.real" > "$tmp/bin/mc"; chmod +x "$tmp/bin/mc"
 run_enc enc_corrupt 'destination hash differs from source'
+FAIL_LS=1 run_enc enc_ls_error 'destination listing failed'
+unset FAIL_LS
 cp "$tmp/bin/mc.real" "$tmp/bin/mc"
 printf 'test.sh: %s passed\n' "$passed"
 [ "$passed" -gt 0 ] && [ "$failed" -eq 0 ]
