@@ -1,0 +1,24 @@
+# Security alert rules (Factory#3688): a CronJob that evaluates auth-failure and egress rules
+# against OpenObserve, writes job_health and opens issues.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: security-alerts
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/security-alerts/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

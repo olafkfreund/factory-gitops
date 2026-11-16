@@ -1,0 +1,67 @@
+# Security alert rules (Factory#3688, R-009). Every 15 minutes: counts `auth.failure` rows in the
+# OpenObserve stream `audit_chain` and rows in the optional egress stream, writes one `job_health`
+# record per rule, opens one GitHub issue per firing rule and optionally posts to a webhook.
+# job-watchdog watches this CronJob like every other. Rules and limits: docs/security-alerts.md.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: security-alerts
+  namespace: factory
+  labels: { app: security-alerts }
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Ten failed runs kept so a recurring failure can be read (Factory#381).
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      # 0: a retry would write a second set of job_health records for one slot.
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        metadata: { labels: { app: security-alerts } }
+        spec:
+          # Never, not OnFailure: failed pods must stay readable (Factory#438).
+          restartPolicy: Never
+          enableServiceLinks: false
+          # No Kubernetes API access is needed.
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: alerts
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+              command: ["python3", "/script/alerts.py"]
+              env:
+                - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+                - { name: ALERT_REPO, value: olafkfreund/Factory }
+                - { name: AUTH_FAIL_THRESHOLD, value: "10" }
+                # Empty until the owner has an egress source (docs/security-alerts.md).
+                - { name: EGRESS_STREAM, value: "" }
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+                # Optional: without it the issues are off and the job_health records still flow.
+                - name: GITHUB_TOKEN
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN, optional: true } }
+                # Optional: the owner's paging webhook. Absent means no paging.
+                - name: ALERT_WEBHOOK_URL
+                  valueFrom: { secretKeyRef: { name: security-alert-webhook, key: url, optional: true } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - { name: script, mountPath: /script, readOnly: true }
+          volumes:
+            - name: script
+              configMap:
+                name: security-alerts-script
