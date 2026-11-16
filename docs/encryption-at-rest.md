@@ -21,7 +21,7 @@ re-verify, with its own date.
 | Node disk | No LUKS. | Record: owner host check 2026-10-24 (p620, `/mnt/code/k3d/storage` on `/dev/sdb1` ext4). |
 | Application-level keys | `KMS_FERNET_KEY` (aifactory), `CFACTORY_CREDENTIAL_KEY` (cfactory) documented; not checked live. | Repo: rotation policy in `docs/secrets-management.md`. |
 | FIPS 140 | Nothing asserted. Owner decision. | Record: Factory#314 scopes it to FedRAMP. |
-| KES / external KMS | Not deployed. MinIO uses its built-in static single-key mode. | Repo: MinIO manifest. |
+| KES / external KMS | Not deployed; decision to stay on the static key recorded 2026-11-16. | Repo: MinIO manifest; decision record below. |
 
 **Limit.** While etcd and the disk are unencrypted, the KEK is on the same
 host as the ciphertext. SSE protects a copied bucket or PVC blob, not a seized
@@ -51,12 +51,25 @@ kubectl get node -o jsonpath='{.items[*].metadata.annotations.k3s\.io/node-args}
   record (see "KEK compromise" below).
 - Confirm an offline backup of a decrypting agenix identity.
 - Confirm which host runs the secret bootstrap.
-- Check existing objects: a full enumeration with
-  `mc stat --versions --recursive --json` over each bucket, delete markers
-  excluded. Every entry must show SSE-S3.
+- Check existing objects with `scripts/minio-sse-audit.py`, once per bucket.
+  It only reads stdin, skips delete markers and fails closed (exit 1 for any
+  object that is not SSE-S3, exit 2 for empty, truncated or errored input).
+  The `mc` JSON shape is UNPROVEN until the first real run; if the script
+  reports every object as not encrypted, look at one raw line before believing it.
+
+  ```bash
+  set -o pipefail; rc=0
+  for b in factory-artifacts factory-backups factory-evidence; do
+    mc stat --versions --recursive --json "fac/$b" | python3 scripts/minio-sse-audit.py --bucket "$b" || rc=1
+  done
+  echo "audit rc=$rc"   # 0 only if all three buckets passed
+  ```
+
+  Objects written before SSE was on stay plaintext until rewritten. Rewriting is
+  a data operation of the same class as the KEK drill: the owner decides.
 - Decide on the Redis and Keycloak volumes (risk acceptance or node LUKS).
 - Decide on FIPS 140 scope.
-- Decide on KES.
+- Revisit KES when a trigger in the decision record holds.
 
 ## Threat model
 
@@ -216,12 +229,18 @@ each check and its result, time taken, deviations, and open limitations.
 
 This section keeps UNTESTED in its title until a drill record is linked here.
 
-#### Beyond the built-in KMS
+#### KES versus the static key (decision record, 2026-11-16)
 
-If the KEK inventory ever needs to grow (multiple named keys, automatic
-rotation), that is the point to graduate from the built-in KMS to a real KES +
-KMS backend. KES is not deployed; tracked as future work, not needed for the
-current gap.
+Decision: stay on the built-in static key (`MINIO_KMS_SECRET_KEY`); do not deploy KES yet.
+
+| | Static key (now) | KES + KMS backend |
+|---|---|---|
+| Key rotation | none scheduled; compromise cutover only (runbook above) | named keys, scheduled rotation |
+| Root of trust | one KEK Secret, agenix copy | a KMS backend (Vault, cloud KMS) with its own custody |
+| Moving parts | none | KES server, mTLS identity, the KMS, their upgrades and backups |
+| Failure mode | lose the KEK, lose the objects | lose KES or the KMS, lose the objects |
+
+Reasons: single node, one KEK, no requirement yet for scheduled KEK rotation. On one host KES adds a second service and a second key to lose without moving the root of trust off the machine. Revisit when any of these holds: a framework requires scheduled data-key rotation, a second named key is needed (per-tenant buckets), the cluster leaves a single node, or a KMS the owner already runs is available. Needs from the owner at that point: the KMS endpoint and credentials. The cutover from static key to KES is the same fresh-volume procedure as the KEK compromise runbook.
 
 ### Verifying it is on
 
@@ -335,18 +354,15 @@ Encrypt the filesystem that backs the k3s `local-path` provisioner
 (the local-path storage directory: `/mnt/code/k3d/storage` on p620 per the
 2026-10-24 host check).
 
-1. **Confirm which host runs the cluster and the secret bootstrap.** The
-   storage was found on p620 on 2026-10-24; the commands below were written
-   for p510. Adjust host names before running anything.
+1. **Host.** The storage was found on p620 on 2026-10-24 (`/mnt/code/k3d/storage` on `/dev/sdb1` ext4). Run the commands below on p620, and confirm first:
+   `findmnt -T /mnt/code/k3d/storage` and `lsblk -f`. The secret bootstrap host is still an open owner check.
 
-2. **Back up everything first.** Trigger a fresh Postgres backup
-   (`apps/backups`) and confirm the object is in `factory-backups`, then copy it
-   off-cluster. PVC data is destroyed by this procedure.
+2. **Back up everything first, and verify the copy.** Trigger a fresh Postgres backup (`apps/backups`), then copy off-cluster every object **and version** of `factory-artifacts`, `factory-backups` and `factory-evidence` (current objects: `mc mirror --preserve`; versions: use the per-bucket export from `python3 scripts/minio-kek-drill.py --step 3`, whose version flags are UNPROVEN, since `mc cp` has `--version-id` only and `mirror` copies current objects) and the Postgres backup, plus the LUKS passphrase or key file in agenix. Verify with checksums of every exported version (`mc diff` covers current objects only) before step 3. Do not proceed on an unverified copy: PVC data is destroyed by this procedure, and an empty `factory-evidence` is not acceptable for audit. Restore the `minio-kms` KEK from agenix first, or the copied objects cannot be read.
 
 3. Drain the workloads:
 
    ```bash
-   ssh p510
+   ssh p620
    sudo systemctl stop k3d-cluster-bootstrap   # or: kubectl -n factory scale deploy,statefulset --all --replicas=0
    ```
 
@@ -364,7 +380,7 @@ Encrypt the filesystem that backs the k3s `local-path` provisioner
    imperatively long-term): add the device to
    `boot.initrd.luks.devices."factory-data"` (or `environment.etc.crypttab`) with
    a key file under agenix, and a `fileSystems."/mnt/code/k3d/storage"` entry
-   depending on the mapper device. Deploy with `just quick-deploy p510`.
+   depending on the mapper device. Deploy with `just quick-deploy p620`.
 
 6. Restore data: bring the cluster back up
    (`sudo systemctl start k3d-cluster-bootstrap`), let ArgoCD re-sync the
