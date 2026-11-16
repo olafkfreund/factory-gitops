@@ -1,0 +1,21 @@
+# The aifactory-sts block of the MinIO PostSync hook is inline shell that nothing
+# else runs (#337). No paths filter, so a required check never goes missing.
+name: minio sts hook
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: aifactory-sts block is idempotent
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_minio_sts.py
