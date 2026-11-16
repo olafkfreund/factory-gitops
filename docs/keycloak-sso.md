@@ -246,7 +246,7 @@ Rollback:
 - Withdraw an assigned action from one user: admin console, Users, the user, Required user actions, remove "Configure OTP" only. Do not set `requiredActions=[]`: it also clears password-change and email-verification actions.
 - A locked-out user is recovered by the `master` realm admin (`KEYCLOAK_ADMIN_PASSWORD`), which this job never changes.
 
-Known limits: the array-append used by `enforce` (`-s 'requiredActions+=CONFIGURE_TOTP'`) has not been exercised against the pinned Keycloak 26.1 image, so the first `enforce` run is also its test (a failed update fails the job and the watchdog reports it). WebAuthn registration as an alternative second factor is a follow-up, and a declarative realm export (R-010's other half) is not covered.
+Known limits: this ladder guarantees that every enabled user **enrolls** an authenticator. It does not by itself add an OTP challenge to every GitHub-brokered login: a broker login that already has a Keycloak session or goes through the first-broker-login flow only sees the enrollment prompt once, and a post-broker-login flow with a conditional OTP step is not installed (tracked as a follow-up, R-010). Until then the upstream GitHub account's own MFA is the second factor for brokered users. The array-append used by `enforce` (`-s 'requiredActions+=CONFIGURE_TOTP'`) has not been exercised against the pinned Keycloak 26.1 image, so the first `enforce` run is also its test (a failed update fails the job and the watchdog reports it). WebAuthn registration as an alternative second factor is a follow-up, and a declarative realm export (R-010's other half) is not covered.
 
 ## Troubleshooting (hard-won)
 
