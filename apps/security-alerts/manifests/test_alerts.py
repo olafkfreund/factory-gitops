@@ -128,4 +128,39 @@ os.environ["GITHUB_TOKEN"] = "t"
 alerts.count = lambda sql: 50
 alerts.emit = lambda recs: True
 assert alerts.main() == 1
+
+# main() end to end with the REAL count() and emit(): only urlopen is stubbed, so the SQL
+# main() builds, the window arithmetic, hits parsing and the OpenObserve failed-count check run.
+import importlib
+importlib.reload(alerts)
+os.environ.update(OO_USER="u", OO_PASS="p")
+os.environ.pop("GITHUB_TOKEN", None)
+os.environ.pop("ALERT_WEBHOOK_URL", None)
+
+
+def wire(n, failed=0):
+    reqs = []
+
+    def urlopen(req, timeout=0):
+        reqs.append((req.full_url, json.loads(req.data)))
+        out = {"hits": [{"n": n}]} if "_search" in req.full_url else {"status": [{"successful": 1, "failed": failed}]}
+        return io.BytesIO(json.dumps(out).encode())
+    alerts.urllib.request.urlopen = urlopen
+    return reqs
+
+
+reqs = wire(10)
+assert alerts.main() == 0
+(url, body), (_, rec_body) = [r for r in reqs if "_search" in r[0]][0], [r for r in reqs if "_json" in r[0]][0]
+assert url.endswith("/api/default/_search?type=logs")
+assert body["query"]["sql"] == 'SELECT count(*) AS n FROM "audit_chain" WHERE action = \'auth.failure\''
+q = body["query"]
+assert q["end_time"] - q["start_time"] == alerts.WINDOW_S * 1_000_000 + 1_000_000
+assert {r["rule"]: r["status"] for r in rec_body}["auth_failure_spike"] == "firing"  # n parsed from hits
+assert {r["rule"]: r["count"] for r in rec_body}["auth_failure_spike"] == 10
+wire(9)
+assert alerts.main() == 0
+# a rejected record (failed > 0) fails the run
+wire(0, failed=1)
+assert alerts.main() == 1
 print("ok")

@@ -3,13 +3,14 @@ import base64, json, os, subprocess, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 got = {}
+reject = {"failed": 0}
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
         got["path"] = self.path
         got["auth"] = self.headers["authorization"]
         got["body"] = json.loads(self.rfile.read(int(self.headers["content-length"])))
-        out = json.dumps({"status": [{"successful": 1, "failed": 0}]}).encode()
+        out = json.dumps({"status": [{"successful": 1, "failed": reject["failed"]}]}).encode()
         self.send_response(200); self.send_header("content-length", str(len(out))); self.end_headers()
         self.wfile.write(out)
     def log_message(self, *a): pass
@@ -33,10 +34,14 @@ assert run(base) == 0
 assert got["path"] == "/api/default/job_health/_json"
 assert got["auth"] == "Basic " + base64.b64encode(b"u:p").decode()
 rec = got["body"][0]
+assert rec["source"] == "restore-drill" and rec["namespace"] == "factory"
 assert rec["status"] == "ok" and rec["cronjob"] == "postgres-restore-drill" and rec["rto_seconds"] == 42
 assert run({**base, "ok": False, "problems": ["x"]}) == 1 and got["body"][0]["status"] == "restore_failed"
 assert run(base, evidence_failed=True) == 1
 assert "evidence_upload_failed" in got["body"][0]["problems"]
 os.environ["CRONJOB"] = "minio-restore-drill"; os.environ["DRILL_KIND"] = "minio_restore_drill"
 assert run(base) == 0 and got["body"][0]["cronjob"] == "minio-restore-drill" and got["body"][0]["kind"] == "minio_restore_drill"
+# OpenObserve rejecting the record (failed > 0) must turn the Job red even when the drill was ok
+reject["failed"] = 1
+assert run(base) == 1
 print("ALL PASS")

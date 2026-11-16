@@ -40,8 +40,10 @@ WHERE kind = 'security_alert' ORDER BY _timestamp DESC
 
 - **Routing existing `job_health` failures to a pager.** Create an OpenObserve Destination for the
   same webhook (Alerts, Destinations), then an Alert on stream `job_health`, 15-minute frequency:
-  `SELECT count(*) AS n FROM "job_health" WHERE status IN ('failing','stale','never_succeeded','not_scheduled','suspended','firing','error','overdue')`, fire when
-  `n > 0`. Created in the OpenObserve UI, so it is not managed by Argo CD.
+  `SELECT count(*) AS n FROM "job_health" WHERE status NOT IN ('ok','due_soon','unstamped','not_configured','no_field','no_source')`, fire when
+  `n > 0`. The list names the healthy statuses, not the failing ones, so a status a watchdog or
+  CronJob adds later (`reconcile_stalled`, `restore_failed`, `missing`, ...) pages by default;
+  `test_alert_filter.py` checks that every known failing status matches. Created in the OpenObserve UI, so it is not managed by Argo CD.
 - **Known limit.** The auth rule reads what `audit-siem-forward` has delivered. That forwarder caps
   a run at 10,000 rows and reports success with a backlog, so a large backlog can push rows past the
   30-minute window. A forwarder-lag check is a follow-up.

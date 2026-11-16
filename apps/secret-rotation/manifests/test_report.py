@@ -82,4 +82,45 @@ titles = [i["title"] for i in issues]
 assert len(issues) == len(report.POLICY) - 1, titles  # minio-creds already has an open issue
 assert not any("minio-creds" in t for t in titles)
 assert all("secret-rotation:" in i["body"] and i["labels"] == ["secret-rotation"] for i in issues)
+
+# 5. the REAL k8s_meta and emit with only the transport stubbed: Accept header, the no-values
+# guard, the emitted cronjob field and the OpenObserve failed-count check
+import json
+import importlib
+import tempfile
+import ssl
+
+d = tempfile.mkdtemp()
+open(f"{d}/token", "w").write("tok")
+importlib.reload(report)
+report.SA = d
+ssl.create_default_context = lambda cafile=None: None
+sent = []
+
+
+def reply(obj):
+    def urlopen(req, timeout=0, context=None):
+        sent.append(req)
+        return io.BytesIO(json.dumps(obj).encode())
+    report.urllib.request.urlopen = urlopen
+
+
+reply({"metadata": {"annotations": {A: "2027-02-28"}}})
+assert report.k8s_meta("minio-creds") == {A: "2027-02-28"}
+assert sent[-1].get_header("Accept") == report.META and "PartialObjectMetadata" in sent[-1].get_header("Accept")
+for leak in ("data", "stringData"):
+    reply({"metadata": {}, leak: {"k": "dmFsdWU="}})
+    try:
+        report.k8s_meta("minio-creds")
+        raise SystemExit(f"{leak} was not refused")
+    except RuntimeError:
+        pass
+os.environ.update(OO_USER="u", OO_PASS="p")
+reply({"status": [{"successful": 1, "failed": 0}]})
+assert report.emit([{"a": 1}]) is True
+reply({"status": [{"successful": 0, "failed": 1}]})
+assert report.emit([{"a": 1}]) is False
+report.k8s_meta = lambda n: stamp(1)
+report.emit = lambda recs: emitted.append(recs) or True
+assert report.main(T) == 0 and {r["cronjob"] for r in emitted[-1]} == {"secret-rotation-report"}
 print("OK")
