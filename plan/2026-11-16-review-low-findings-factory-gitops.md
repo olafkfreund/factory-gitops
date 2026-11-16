@@ -13,7 +13,7 @@ reviewers:
 
 Approved decisions (from the spec): fix only #337; #340 and #341 are refuted with evidence
 and change nothing. In the MinIO STS block, make `policy attach` idempotent by accepting a
-failure only if `user info` shows exactly the `aifactory-sts` policy; best-effort disable
+failure only if `user info` shows exactly the `aifactory-sts` policy on its `PolicyName:` line; best-effort disable
 other users holding that policy. Shell uses `case` only (the image has no grep/sed/awk).
 
 ## Steps
@@ -25,7 +25,7 @@ other users holding that policy. Shell uses `case` only (the image has no grep/s
    existing `user add`; do not touch apps/security-alerts.
 2. `.github/scripts/test_minio_sts.py` and `.github/workflows/minio-sts-test.yml`: slice the block
    from the manifest, run under `sh -e` with a stub `mc` and only `cat` on PATH → verify by the
-   same command, and `TEST_SH="busybox sh"` once.
+   same command, and `TEST_SH="/abs/path/busybox sh"` once.
    Traps: workflow action pin copied from cred-broker-test.yml.
 
 ## Tests
