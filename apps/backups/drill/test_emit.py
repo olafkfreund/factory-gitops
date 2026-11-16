@@ -20,7 +20,8 @@ here = os.path.dirname(os.path.abspath(__file__))
 
 def run(result, evidence_failed=False):
     d = tempfile.mkdtemp()
-    json.dump(result, open(f"{d}/result.json", "w"))
+    with open(f"{d}/result.json", "w") as f:
+        json.dump(result, f)
     if evidence_failed:
         open(f"{d}/evidence.failed", "w").close()
     env = dict(os.environ, SCRATCH=d, OO_USER="u", OO_PASS="p",

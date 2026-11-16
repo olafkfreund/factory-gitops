@@ -11,7 +11,8 @@ import sys
 import urllib.request
 
 S = os.environ.get("SCRATCH", "/scratch")
-res = json.load(open(f"{S}/result.json"))
+with open(f"{S}/result.json") as f:
+    res = json.load(f)
 if os.path.exists(f"{S}/evidence.failed"):  # evidence upload failed: still report, still go red
     res["ok"] = False
     res["problems"] = res["problems"] + ["evidence_upload_failed"]
