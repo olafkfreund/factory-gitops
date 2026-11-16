@@ -1,0 +1,75 @@
+# Catch-all for first-party images in namespaces that have no coverage group
+# (Factory#3701).
+#
+# verify-factory-image-signatures and require-first-party-signature-coverage
+# name four namespaces: factory, gateway, fides, fides-reporter. A
+# ghcr.io/olafkfreund/* image anywhere else was admitted with no check and no
+# report row. In a namespace with no group EVERY first-party image is
+# uncovered, so there is nothing to mirror: this rule reports them all.
+#
+# AUDIT ONLY: reports, never blocks. Flipping it to Enforce is the owner's
+# decision after a clean week of PolicyReports; see "Catch-all for namespaces
+# with no coverage group" in docs/image-signature-admission.md.
+#
+# It is a separate policy, not a rule in the coverage policy, because
+# assert-signature-lists-agree.py requires every rule there to match literal
+# namespaces and mirror their signature globs. The `exclude` list below must
+# equal those namespaces plus the cluster-owned ones; the same script checks it.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: report-first-party-image-outside-coverage-groups
+  annotations:
+    policies.kyverno.io/title: Report First-Party Images Outside The Coverage Groups
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Reports any ghcr.io/olafkfreund image on a Pod in a namespace that has
+      no signature coverage group. AUDIT mode: reported, never denied.
+    # One standing row per Pod, as in the coverage policy.
+    pod-policies.kyverno.io/autogen-controllers: none
+spec:
+  validationFailureAction: Audit
+  failurePolicy: Ignore
+  webhookTimeoutSeconds: 30
+  # No registry call; reads the Pod spec only, so a background scan is free.
+  background: true
+  rules:
+    - name: first-party-image-in-namespace-with-no-coverage-group
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - factory
+                - gateway
+                - fides
+                - fides-reporter
+                - kube-system
+                - kube-public
+                - kube-node-lease
+      context:
+        - name: uncovered
+          variable:
+            jmesPath: >-
+              request.object.spec.[containers, initContainers, ephemeralContainers][].image
+              | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
+            default: []
+      preconditions:
+        all:
+          - key: "{{ uncovered | length(@) }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          NO COVERAGE GROUP (Factory#3701): {{ uncovered | join(', ', @) }}.
+          This namespace has no signature rule in verify-factory-image-signatures
+          and no rule in require-first-party-signature-coverage, so first-party
+          images here are admitted with no signature check. Give the namespace a
+          group (a verifyImages rule and a coverage rule) or move the workload.
+          See docs/image-signature-admission.md.
+        deny: {}
