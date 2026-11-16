@@ -3,9 +3,11 @@
 #
 #   kyverno test apps/kyverno-policies/tests -f kyverno-test-ephemeralcontainers-subresource.yaml
 #
-# This pins the engine's subresource matching offline. It cannot prove the live
-# webhook routes `kubectl debug` here; that is a manual check, see
-# docs/image-signature-admission.md ("Live check: kubectl debug").
+# This pins only that each rule's jmesPath reads `spec.ephemeralContainers`. The rules
+# match `kinds: [Pod]`, so the `values.subresources` block below does not change the
+# result (removing it still passes); it only declares the subresource for the CLI. The
+# offline suite does NOT prove that a `kubectl debug` request reaches these rules: that is
+# a manual live check, see docs/image-signature-admission.md ("Live check: kubectl debug").
 apiVersion: cli.kyverno.io/v1alpha1
 kind: Test
 metadata:

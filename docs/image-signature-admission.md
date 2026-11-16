@@ -615,7 +615,9 @@ Ephemeral containers (`kubectl debug`): each rule's jmesPath reads
 `fides-uncovered-in-ephemeralcontainer` tests pin that for the `factory`,
 `gateway` and `fides` rules (Factory#3701), and
 `kyverno-test-ephemeralcontainers-subresource.yaml` runs the three rules with the
-`pods/ephemeralcontainers` subresource declared. Kyverno applies `Pod` rules to
+`pods/ephemeralcontainers` subresource declared; the rules match `kinds: [Pod]`, so
+that declaration changes no result and the suite proves only the jmesPath, not the
+routing. Kyverno applies `Pod` rules to
 `pods/ephemeralcontainers` requests and the live webhooks register that
 subresource, but that routing has not been exercised against the live cluster:
 follow [Live check: kubectl debug](#live-check-kubectl-debug-factory3701).
