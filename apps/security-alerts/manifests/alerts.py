@@ -52,8 +52,17 @@ def count(sql):
     return int(hits[0]["n"]) if hits and hits[0].get("n") is not None else 0
 
 
+def _no_action_field(e):
+    """True only for OpenObserve's 'No field named action' schema error. Never prints the body."""
+    try:
+        err = json.loads(e.read())
+        return err.get("code") == 20004 and "No field named action" in err.get("message", "")
+    except Exception:  # noqa: BLE001  unreadable or malformed body stays an error
+        return False
+
+
 def evaluate(rule, stream, where, threshold):
-    """(status, n). 404 means the stream does not exist: never read as zero."""
+    """(status, n). 404 means the stream does not exist: never read as zero. no_field: see _no_action_field."""
     if not stream:
         return "not_configured", None
     sql = f'SELECT count(*) AS n FROM "{stream}"' + (f" WHERE {where}" if where else "")
@@ -62,6 +71,8 @@ def evaluate(rule, stream, where, threshold):
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return "no_source", None
+        if e.code == 400 and _no_action_field(e):
+            return "no_field", None  # no row has ever carried `action`: detection unavailable, not zero proven
         eprint(f"{rule}: OpenObserve HTTP {e.code}")
         return "error", None
     except Exception as e:  # noqa: BLE001

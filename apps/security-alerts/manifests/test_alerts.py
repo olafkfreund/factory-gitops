@@ -1,4 +1,6 @@
 """Decision logic and exit codes of alerts.py, with the network calls replaced."""
+import io
+import json
 import os
 import sys
 import urllib.error
@@ -64,6 +66,22 @@ assert rc == 0 and rec["egress_anomaly"]["status"] == "no_source"
 # a missing AUTH stream fails the run (rc 1) so job-watchdog sees it; the record keeps no_source
 rc, rec, *_ = run({"audit_chain": http(404)})
 assert rc == 1 and rec["auth_failure_spike"]["status"] == "no_source"
+# 3758: OpenObserve 400 "No field named action" (no row ever had it) is no_field: exit 0, egress still evaluated
+def http400(body):
+    return urllib.error.HTTPError("u", 400, "x", {}, io.BytesIO(body))
+
+nofield = json.dumps({"code": 20004, "message": "Search field not found: Schema error: No field named action."}).encode()
+rc, rec, *_ = run({"audit_chain": http400(nofield), "egress_denied": 1}, egress="egress_denied")
+assert rc == 0 and rec["auth_failure_spike"]["status"] == "no_field" and rec["auth_failure_spike"]["count"] is None
+assert rec["egress_anomaly"]["status"] == "firing"
+# anything else 400 stays an error (exit 1, egress still evaluated, record still emitted)
+for bad in (json.dumps({"code": 20004, "message": "No field named kind"}).encode(),
+            json.dumps({"code": 20001, "message": "No field named action"}).encode(), b"not json", b""):
+    rc, rec, *_ = run({"audit_chain": http400(bad), "egress_denied": 1}, egress="egress_denied")
+    assert rc == 1 and rec["auth_failure_spike"]["status"] == "error" and rec["egress_anomaly"]["status"] == "firing"
+# the unconfigured optional egress source never fails the run
+rc, rec, *_ = run({"audit_chain": 0})
+assert rc == 0 and rec["egress_anomaly"]["status"] == "not_configured"
 # configured egress fires at its default threshold of 1
 rc, rec, *_ = run({"audit_chain": 0, "egress_denied": 1}, egress="egress_denied")
 assert rec["egress_anomaly"]["status"] == "firing"

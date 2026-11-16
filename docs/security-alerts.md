@@ -15,7 +15,7 @@ reported like any other failed CronJob.
 
 Statuses in the `job_health` record (`kind = security_alert`, field `rule`): `ok`, `firing`,
 `error` (query failed; the run exits 1), `no_source` (the stream does not exist; never read as
-zero; for `auth_failure_spike` the run also exits 1, so job-watchdog reports the CronJob) and `not_configured` (`EGRESS_STREAM` empty).
+zero; for `auth_failure_spike` the run also exits 1, so job-watchdog reports the CronJob) `no_field` (OpenObserve says no row in the stream has ever had the field `action`, so no auth failure has been ingested; count is null, the run exits 0, and detection is unavailable, not proven zero; it clears when the first row arrives), and `not_configured` (`EGRESS_STREAM` empty; exits 0, optional source).
 
 ```sql
 SELECT rule, status, count, threshold FROM "job_health"
