@@ -11,6 +11,7 @@ BACKUP=${BACKUP:-/backup}
 BUCKETS=${BUCKETS:-factory-artifacts factory-evidence}
 SCRATCH_BUCKET=${SCRATCH_BUCKET:-restore-drill-scratch}
 SAMPLE_COUNT=${SAMPLE_COUNT:-20}
+SEED=${SAMPLE_SEED:-$(date -u +%Y%m%d)}
 MAX_OBJECT_BYTES=${MAX_OBJECT_BYTES:-52428800}
 MAX_SNAPSHOT_AGE_SECONDS=${MAX_SNAPSHOT_AGE_SECONDS:-90000}   # 25h: last night's snapshot is 25h old at worst
 export MC_CONFIG_DIR="$S/.mc"
@@ -39,7 +40,9 @@ run() {
   a=$(now)
   : > "$S/sample"
   for b in $BUCKETS; do
-    grep -E "^[0-9a-f]{64}  $b/" "$snap/MANIFEST.sha256" | sort -k2 > "$S/lines" || true
+    # Date-seeded shuffle: the sample changes nightly, so recent objects get restored too.
+    grep -E "^[0-9a-f]{64}  $b/" "$snap/MANIFEST.sha256" \
+      | awk -v s="$SEED" 'BEGIN { srand(s) } { printf "%.9f\t%s\n", rand(), $0 }' | sort | cut -f2- > "$S/lines" || true
     [ -s "$S/lines" ] || { add "empty_bucket_$b"; continue; }
     n=0
     while IFS= read -r line; do
