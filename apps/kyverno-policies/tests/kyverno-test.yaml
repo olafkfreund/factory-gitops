@@ -75,6 +75,7 @@ results:
     result: fail
     resources:
       - gateway-uncovered-pfactory
+      - gateway-uncovered-in-ephemeralcontainer
   # Factory#3665: gateway mirror skips covered gateway images
   - policy: require-first-party-signature-coverage
     rule: first-party-image-must-be-covered-in-gateway
@@ -90,6 +91,7 @@ results:
     resources:
       - fides-uncovered-aifactory
       - fides-reporter-uncovered-port443
+      - fides-uncovered-in-ephemeralcontainer
   # Factory#3665: fides mirror skips covered fides and fides-reporter images
   - policy: require-first-party-signature-coverage
     rule: first-party-image-must-be-covered-in-fides
