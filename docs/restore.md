@@ -103,6 +103,21 @@ Still open:
 - `factory-artifacts` has no off-cluster copy.
 - A restore from the off-cluster copy has not been drilled (Factory#3681).
 
+## Scheduled restore drill and MinIO off-site copy (Factory#3691)
+
+- `apps/backups/drill/` is a deployed CronJob, `postgres-restore-drill`, daily at
+  04:15 UTC. It restores the newest dump into a throwaway Postgres inside its own
+  pod (socket only, never the live database), checks the result, records
+  `rto_seconds` and the phase split, writes to `factory-evidence/control-plane-push/restore-drill/`
+  and to the `job_health` stream, and fails the Job on any problem.
+  `job-watchdog` watches it with no change. Tests: `.github/workflows/backup-drill-test.yml`.
+- `apps/backups/minio-offsite/` backs up `factory-artifacts` and `factory-evidence`
+  to the same off-site target as the Postgres copy. It is NOT deployed: create the
+  `offsite-s3-creds` Secret, then add `- ../minio-offsite` to
+  `apps/backups/manifests/kustomization.yaml`. It never deletes or overwrites at
+  the destination and fails if any source object is missing or different there.
+- Full write-up and the RTO method: Factory `docs/compliance/dr-runbook.md`.
+
 ## Restore: Postgres
 
 Prerequisites: `kubectl` access to the `factory` namespace, and the MinIO

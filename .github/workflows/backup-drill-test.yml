@@ -1,0 +1,45 @@
+# Runs the restore-drill and MinIO-backup tests (Factory#3691) in the same
+# images the CronJobs use. No paths filter: a required check that does not run
+# on a PR leaves that PR blocked.
+name: backup drill test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: restore drill and minio backup behave
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Images from the CronJobs
+        run: |
+          set -euo pipefail
+          pg="$(grep -oE 'postgres:16[.0-9]*@sha256:[0-9a-f]+' apps/backups/drill/cronjob.yaml | head -n 1)"
+          mc="$(grep -o 'cgr.dev/chainguard/minio-client[^ ]*' apps/backups/drill/cronjob.yaml | head -n 1)"
+          test -n "$pg" && test -n "$mc" || { echo "image not found in cronjob.yaml" >&2; exit 1; }
+          echo "PG=$pg" >> "$GITHUB_ENV"; echo "MC=$mc" >> "$GITHUB_ENV"
+      - name: Restore drill (real Postgres replay)
+        run: |
+          chmod -R a+rX apps/backups
+          docker run --rm --read-only --tmpfs /scratch:rw,exec,uid=999,mode=1777 -e TMPDIR=/scratch --user 999 -v "$PWD/apps/backups:/t:ro" --entrypoint /bin/bash "$PG" /t/drill/test.sh
+      - name: Fetch step and MinIO backup (real mc)
+        run: |
+          for t in drill/test-fetch.sh minio-offsite/test.sh; do
+            docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 --user 65532 -e HOME=/tmp -v "$PWD/apps/backups:/t:ro" --entrypoint /bin/sh "$MC" "/t/$t"
+          done
+      - name: Result emitter
+        run: python3 apps/backups/drill/test_emit.py
+      - name: Render the disabled MinIO backup
+        run: |
+          # Not referenced by any kustomization, so build it here explicitly.
+          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kustomize
+          kustomize build apps/backups/minio-offsite | grep -q 'kind: CronJob'

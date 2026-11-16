@@ -1,0 +1,110 @@
+################################################################################
+# Scheduled restore drill (Factory#3691, risk R-001).
+#
+# Restores the newest postgres-backup dump into a THROWAWAY Postgres that lives
+# only in this pod (unix socket, no listener, never the live database), checks
+# the restored data, measures the full path (fetch + initdb + start + replay +
+# validation) as rto_seconds, writes the result to factory-evidence and to the
+# OpenObserve job_health stream, and fails red when anything is wrong.
+# job-watchdog watches this CronJob like every other one in the namespace.
+# Nothing to clean up: the throwaway cluster is an emptyDir that dies with the pod.
+# See Factory docs/compliance/dr-runbook.md.
+#
+# Credentials (reused, none new): minio-creds, observe-root.
+################################################################################
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-restore-drill
+  namespace: factory
+  labels: { app: postgres-restore-drill }
+spec:
+  # 04:15 UTC: after the dump (02:15) and the off-site copy (03:15).
+  schedule: "15 4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Ten failed runs kept so a recurring failure can be read (Factory#381).
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      # 0: a retry would write a second evidence object and job_health record for one night.
+      backoffLimit: 0
+      # A hung restore must end: with Forbid, an active Job blocks every later run.
+      activeDeadlineSeconds: 1800
+      # No ttlSecondsAfterFinished: it would reap failed Jobs and their logs (Factory#381).
+      template:
+        metadata: { labels: { app: postgres-restore-drill } }
+        spec:
+          # Never, not OnFailure: failed pods must stay readable (Factory#438).
+          restartPolicy: Never
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999          # postgres uid in postgres:16.4; mc and python run as any uid
+            fsGroup: 999
+            seccompProfile: { type: RuntimeDefault }
+          initContainers:
+            - name: fetch
+              image: cgr.dev/chainguard/minio-client:latest-dev@sha256:b056b795d31828015aea061e3168267b0ba80590ba2d8f869e72ff77153a68e8
+              command: ["/bin/sh", "/script/fetch.sh"]
+              env:
+                - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+                - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+              securityContext: &sec
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts: &mounts
+                - { name: scratch, mountPath: /scratch }
+                - { name: script, mountPath: /script, readOnly: true }
+              resources: &small
+                requests: { cpu: 20m, memory: 64Mi }
+                limits: { cpu: 200m, memory: 256Mi }
+            # bash, not sh: the postgres image's sh is dash and has no pipefail.
+            - name: drill
+              image: postgres:16.4@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+              command: ["/bin/bash", "/script/drill.sh"]
+              securityContext: *sec
+              volumeMounts: *mounts
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits: { cpu: "1", memory: 1Gi }
+            - name: evidence
+              image: cgr.dev/chainguard/minio-client:latest-dev@sha256:b056b795d31828015aea061e3168267b0ba80590ba2d8f869e72ff77153a68e8
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  export MC_CONFIG_DIR=/scratch/.mc
+                  # A failed upload must not stop emit: it marks the run and emit goes red.
+                  { mc alias set fac http://minio.factory.svc.cluster.local:9000 "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1 \
+                    && mc cp /scratch/result.json "fac/factory-evidence/control-plane-push/restore-drill/$(date -u +%Y%m%dT%H%M%SZ).json"; } \
+                    || { echo "evidence: upload FAILED" >&2; : > /scratch/evidence.failed; }
+              env:
+                - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
+                - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+              securityContext: *sec
+              volumeMounts: *mounts
+              resources: *small
+          containers:
+            - name: emit
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+              command: ["python", "/script/emit.py"]
+              env:
+                - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+              securityContext: *sec
+              volumeMounts: *mounts
+              resources: *small
+          volumes:
+            - name: scratch
+              emptyDir: { sizeLimit: 5Gi }
+            - name: script
+              configMap:
+                name: postgres-restore-drill-script
+                defaultMode: 0555
