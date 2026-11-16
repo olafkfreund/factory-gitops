@@ -1906,6 +1906,33 @@ data:
         return out
 
 
+    PAGE_FAILS: list = []
+
+
+    def page(record: dict, sev: str, action: str, key: str) -> None:
+        """Optional paging webhook (Factory#3688), same Secret as security-alerts.
+
+        Critical findings only, on every run while the issue is open, with a stable
+        dedup_key: the pager de-duplicates, and a failed POST is retried by the
+        next run. Off when ALERT_WEBHOOK_URL is unset. Never raises and never prints the
+        URL or the exception text: a failure is counted and turns the run red
+        after the heartbeat, while the GitHub issue path stays primary.
+        """
+        url = os.environ.get("ALERT_WEBHOOK_URL")
+        if not url or sev != "critical":
+            return
+        try:  # building the request can raise with the URL in the message
+            text = (f"job-watchdog critical {record['namespace']}/{record['cronjob']} "
+                    f"[{record['status']}] ({action})")
+            req = urllib.request.Request(
+                url, data=json.dumps({"text": text, "dedup_key": key}).encode(),
+                headers={"content-type": "application/json"}, method="POST")
+            urllib.request.urlopen(req, timeout=30).close()
+        except Exception as e:  # noqa: BLE001 - never print the URL
+            PAGE_FAILS.append(key)
+            eprint(f"PAGE FAILED {record['cronjob']}: {type(e).__name__}")
+
+
     def notify(token: str, repo: str, records: list[dict], now: datetime,
                renotify_hours: float) -> int:
         """Route findings to a human. Returns the number of notifications sent."""
@@ -1919,6 +1946,10 @@ data:
             issue = existing.get(key)
             action = notify_action(r, issue, now, renotify_hours)
             if action is None:
+                # Still open and critical: page again with the same dedup_key, so a
+                # POST that failed last run is retried without any stored state.
+                if issue and issue.get("state") != "closed":
+                    page(r, severity_of(r), "still open", key)
                 continue
             sev = severity_of(r)
             name = r["cronjob"]
@@ -1973,6 +2004,8 @@ data:
                 gh(token, "PATCH", f"/repos/{repo}/issues/{issue['number']}",
                    {"state": "closed", "state_reason": "completed"})
                 eprint(f"RECOVERED {name} -> closed {repo}#{issue['number']}")
+            if action in ("open", "reopen", "escalate", "renotify"):
+                page(r, sev, action, key)
             sent += 1
 
         # ORPHANS: an open issue whose CronJob no longer exists at all. Without
@@ -2214,6 +2247,9 @@ data:
                    "run reports red too so both signals agree")
             return 6
         eprint(f"heartbeat {hb_var}={stamp}")
+        if PAGE_FAILS:
+            eprint(f"FATAL: {len(PAGE_FAILS)} page(s) not delivered to the webhook")
+            return 7
 
         # Exit 0 on findings BY DESIGN: see the manifest header. A red watchdog
         # must mean the watchdog is broken, not that a watched job is.
@@ -3298,6 +3334,57 @@ data:
         finally:
             globals()["gh"] = real_gh
 
+        # Paging (Factory#3688): off without the URL; one POST per critical state
+        # change; warnings and a healthy fleet page nothing; a failed POST is
+        # counted and never stops the issue path.
+        posted: list = []
+
+        class _Resp:
+            def close(self):
+                pass
+
+        def fake_urlopen(req, timeout=0):
+            posted.append((req.full_url, json.loads(req.data)))
+            return _Resp()
+
+        real_urlopen = urllib.request.urlopen
+        globals()["gh"] = fake_gh
+        urllib.request.urlopen = fake_urlopen
+        try:
+            stub_issues.clear()
+            os.environ.pop("ALERT_WEBHOOK_URL", None)
+            assert notify("t", "o/r", [never], now, 24) == 1 and not posted
+            os.environ["ALERT_WEBHOOK_URL"] = "http://pager.invalid/hook"
+            assert notify("t", "o/r", [never], now, 24) == 1
+            assert len(posted) == 1, posted
+            assert posted[0][1]["dedup_key"] == MARKER.format(
+                ns="factory", name="postgres-backup"), posted
+            posted.clear()
+            assert notify("t", "o/r", [healthy_rec, refused], stranded, 24) == 1
+            assert not posted, posted
+            # The issue now exists and is open: a quiet run (no issue action) still
+            # pages, and a POST that fails is retried by the next run.
+            stub_issues.append({
+                "number": 99, "title": "t", "created_at": "2026-07-26T11:50:00Z",
+                "updated_at": "2026-07-26T11:50:00Z",
+                "body": issue_body(never, "critical"),
+                "labels": [{"name": ISSUE_LABEL}, {"name": SEVERITY_LABELS["critical"]}]})
+            def boom(req, timeout=0):
+                raise OSError("https://secret.invalid/token")
+            urllib.request.urlopen = boom
+            PAGE_FAILS.clear()
+            assert notify("t", "o/r", [never], now, 24) == 0
+            assert PAGE_FAILS == [MARKER.format(ns="factory", name="postgres-backup")]
+            urllib.request.urlopen = fake_urlopen
+            posted.clear()
+            assert notify("t", "o/r", [never], now, 24) == 0
+            assert len(posted) == 1, posted
+        finally:
+            urllib.request.urlopen = real_urlopen
+            globals()["gh"] = real_gh
+            os.environ.pop("ALERT_WEBHOOK_URL", None)
+            PAGE_FAILS.clear()
+
         # Every new code that can reach a human needs a title phrase, or
         # issue_title raises mid-incident and the notification is lost.
         for c in ("job_failed", "job_stuck", "job_wedged", "orphans_unreaped"):
@@ -3381,6 +3468,10 @@ spec:
                 # would be this same bug wearing a convincing disguise.
                 - name: GITHUB_TOKEN
                   valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } }
+                # Optional paging webhook (Factory#3688): the same Secret as
+                # apps/security-alerts. Absent means no paging; GitHub issues stay.
+                - name: ALERT_WEBHOOK_URL
+                  valueFrom: { secretKeyRef: { name: security-alert-webhook, key: url, optional: true } }
                 # Same observe-root secret apps/audit-siem-forward already uses.
                 - name: OO_USER
                   valueFrom: { secretKeyRef: { name: observe-root, key: email } }
