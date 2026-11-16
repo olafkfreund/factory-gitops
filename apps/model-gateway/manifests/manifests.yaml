@@ -132,8 +132,7 @@ spec:
         - protocol: TCP
           port: 8080
 ---
-# DNS only: an upstream is named but not reachable. Upstream egress is an owner decision
-# (Factory#1959); it is added as its own policy by a later PR.
+# DNS only. Upstream egress is the separate allow-upstream-egress policy below.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -157,3 +156,31 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+---
+# Upstream egress (Factory#1959, owner delegation 2026-11-16: recommended option). Public HTTPS
+# only; the except list keeps the Kubernetes API, the LAN, link-local and CGNAT out of reach.
+# Residual: a compromised gateway can reach any public HTTPS host (a host allowlist needs an
+# egress proxy). `to` and `ports` stay in ONE rule so kube-router matches them together.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-upstream-egress
+  namespace: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: model-gateway
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
