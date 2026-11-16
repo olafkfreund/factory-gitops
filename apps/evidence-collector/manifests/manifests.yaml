@@ -2,7 +2,7 @@
 # Evidence collector (Factory#324) — automated, timestamped compliance evidence.
 #
 # A daily CronJob that snapshots the evidence the cluster can produce ON ITS OWN
-# into the dedicated, versioned + 90d-lifecycled `factory-evidence` MinIO bucket
+# into the dedicated, versioned + 396d-lifecycled `factory-evidence` MinIO bucket
 # (created by apps/minio), under a dated prefix `factory-evidence/<YYYY-MM-DD>/`.
 # Each run captures three self-collectable artifacts + a run manifest:
 #
@@ -268,7 +268,7 @@ spec:
   # 03:00 UTC daily — AFTER the 02:15 postgres backup (apps/backups) so the same
   # run's backups-index reflects today's backup, and after the 06:00 audit alert
   # window is irrelevant (we read the chain directly). One skipped run loses one
-  # daily snapshot; retention (90d) tolerates gaps.
+  # daily snapshot; retention (396d) tolerates gaps.
   schedule: "0 3 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -360,7 +360,7 @@ spec:
                   echo "  ]" >> "${out}/backups-index.json"
                   echo "}" >> "${out}/backups-index.json"
                   # Upload the whole dated snapshot. Object timestamps + the dated
-                  # prefix both date the evidence; bucket versioning + 90d ILM
+                  # prefix both date the evidence; bucket versioning + 396d ILM
                   # (apps/minio) give tamper-resistance and retention.
                   mc cp --recursive "${out}/" "fac/factory-evidence/${day}/"
                   echo "snapshot uploaded to factory-evidence/${day}/:"
