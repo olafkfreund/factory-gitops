@@ -4,7 +4,7 @@
 # deletions or rewrites), then checks every source object is present and equal
 # at the destination. Objects only at the destination (kept after a source
 # delete) are fine.
-set -eu
+set -euo pipefail
 
 fail() {
   printf 'minio-offsite: FAIL: %s\n' "$1" >&2

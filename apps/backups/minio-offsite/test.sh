@@ -9,6 +9,7 @@ mkdir -p "$tmp/bin" "$tmp/scratch"
 cat > "$tmp/bin/mc" <<EOS
 #!/bin/sh
 [ "\$1" = alias ] && exit 0
+[ "\$1" = cat ] && [ -n "\${FAIL_CAT:-}" ] && exit 1
 for a in "\$@"; do
   case "\$a" in
     fac/*|off/*) a="$tmp/root/\$a" ;;
@@ -45,6 +46,11 @@ echo "PASS changed object fails, destination untouched"
 echo two > "$R/fac/factory-evidence/e/2"; echo six > "$R/off/bk/minio/factory-evidence/e/2"   # same size, other bytes
 if sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL same-size corruption passed"; exit 1; fi
 echo "PASS same-size corruption fails"
+
+# Reads that fail must not hash as two equal empty inputs.
+echo two > "$R/off/bk/minio/factory-evidence/e/2"
+if FAIL_CAT=1 sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL failed reads passed"; exit 1; fi
+echo "PASS failed reads fail"
 
 if OFFSITE_S3_ENDPOINT=http://x sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL http endpoint accepted"; exit 1; fi
 echo "PASS refuses http endpoint"
