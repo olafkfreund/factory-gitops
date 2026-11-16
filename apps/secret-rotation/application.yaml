@@ -1,0 +1,24 @@
+# Secret rotation age report (Factory#314): a CronJob that reports Secret rotation age
+# against policy to job_health and opens issues. It rotates nothing.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: secret-rotation
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/secret-rotation/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
