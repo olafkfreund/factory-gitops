@@ -179,6 +179,91 @@ for hours, kw, want_rc, want_outcome, want_gh, label in ALERT_CASES:
         print(f"     want rc={want_rc} outcome={want_outcome} gh={want_gh}; got gh={gh_calls}")
 
 
+# --- Factory#3687: refreshTokenExpiresAt early warning ------------------------
+# Stateful GitHub fake: an issue POSTed in one run shows up in the next GET, so
+# "one issue across the run / across two runs" is provable, not assumed.
+ISO_DAY = "%Y-%m-%d"
+
+
+def rrun(rexp, *, grant_ok, access_hours=3, token="t", runs=1):
+    """rexp: days from now (number), a raw value via ("raw", v), or None to omit the field."""
+    os.environ.pop("GITHUB_TOKEN", None)
+    if token:
+        os.environ["GITHUB_TOKEN"] = token
+    os.environ["ALERT_REPO"] = "o/r"
+    m = load()
+    oauth = {"refreshToken": "rt-fake", "expiresAt": int((time.time() + access_hours * 3600) * 1000)}
+    if isinstance(rexp, tuple):
+        oauth["refreshTokenExpiresAt"] = rexp[1]
+    elif rexp is not None:
+        oauth["refreshTokenExpiresAt"] = int((time.time() + rexp * 86400) * 1000)
+    cred = {"claudeAiOauth": oauth}
+    issues, patched = [], []
+
+    class R:
+        def __init__(self, d): self.d = d
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self.d
+        def __iter__(self): return iter(())
+
+    def fake_urlopen(req, timeout=None, context=None):
+        if req.full_url.startswith("https://api.github.com"):
+            if req.get_method() == "GET":
+                return R(json.dumps(issues).encode())
+            if req.data and req.full_url.endswith("/issues"):
+                issues.append(json.loads(req.data))
+            return R(b'{"number": 7}')
+        if grant_ok:
+            return R(json.dumps({"access_token": "at-new", "refresh_token": "rt-new",
+                                 "expires_in": 28800}).encode())
+        raise urllib.error.HTTPError(req.full_url, 400, "x", {}, io.BytesIO(b'{"error":"invalid_grant"}'))
+
+    def fake_k8s(method, path, body=None, content_type="application/json"):
+        if method == "GET":
+            return {"data": {m.KEY: base64.b64encode(json.dumps(cred).encode()).decode()}}
+        if body and "data" in body:
+            patched.append(True)
+        return {}
+
+    m.k8s = fake_k8s
+    m.urllib.request.urlopen = fake_urlopen
+    outcomes = []
+    m.record = lambda outcome, detail, exp=None: outcomes.append((outcome, detail))
+    rcs = [m.main() for _ in range(runs)]
+    return rcs, outcomes, issues, bool(patched)
+
+
+def day(d):
+    return time.strftime(ISO_DAY, time.gmtime(time.time() + d * 86400))
+
+
+QUIET_RAW = [("absent", None), ("string", ("raw", "x")), ("bool", ("raw", True)), ("zero", ("raw", 0)),
+             ("huge negative", ("raw", -1e30)), ("inf", ("raw", float("inf"))),
+             ("epoch seconds", ("raw", int(time.time()) + 3 * 86400)), ("8 days out", 8)]
+# (label, rexp, grant_ok, runs, want_rcs, want_issue_count)
+RCASES = [(f"quiet: {lbl}", v, True, 1, [0], 0) for lbl, v in QUIET_RAW] + [
+    ("6d left warns, refresh still works", 6, True, 1, [0], 1),
+    ("two runs: one issue", 6, True, 2, [0, 0], 1),
+    ("already past + invalid_grant: one issue", -2, False, 1, [3], 1),
+    ("past, two runs: one issue", -2, False, 2, [3, 3], 1),
+    ("no token: inert, refresh works", 6, True, 1, [0], 0),
+]
+for label, rexp, grant_ok, runs, want_rcs, want_n in RCASES:
+    rcs, outcomes, issues, patched = rrun(rexp, grant_ok=grant_ok, runs=runs,
+                                          token="" if label.startswith("no token") else "t")
+    ok = rcs == want_rcs and len(issues) == want_n and patched == grant_ok
+    if ok and want_n:
+        want_day = day(rexp if rexp > 0 else rexp)
+        body, title = issues[0]["body"], issues[0]["title"]
+        ok = (want_day in body and "refresh token " in body and "k3d-factory" in body
+              and "secret-payload" not in body
+              and (("refresh-token-expiring" in title) if grant_ok else ("refresh-rejected:invalid_grant" in title))
+              and (any("refresh token expires" in d for _, d in outcomes) if grant_ok else True))
+    print(f"{'ok  ' if ok else 'FAIL'} expiry: {label:44s} rc={rcs} issues={len(issues)} patched={patched}")
+    if not ok:
+        failures.append(label)
+
 if failures:
     # The short-runway case going green would be the dangerous direction: it
     # means a genuine credential expiry no longer pages anyone.

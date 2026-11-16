@@ -34,9 +34,11 @@ Consequences:
 - A cluster rebuild depends on the bootstrap re-creating every Secret; a Secret
   whose key drifts from what a consumer expects fails silently (this exact class
   of bug bit the KEDA scaler — see `apps/keda/scaledobjects/triggerauthentication.yaml`).
-- Only **one** secret rotates automatically (the Claude OAuth cred, via the
-  cred-broker CronJob). Everything else is manual, on the schedule in
-  [Rotation policy](#rotation-policy).
+- No secret rotates itself for good. The cred-broker CronJob only refreshes a
+  `claude auth login` credential until its fixed ~30-day lineage ends and watches the
+  expiry of a `claude setup-token` one; both need a human re-seed
+  ([Re-seeding](#re-seeding-the-claude-oauth-credential)). Everything else is manual,
+  on the schedule in [Rotation policy](#rotation-policy).
 
 ## Inventory
 
@@ -48,7 +50,7 @@ All are namespace `factory` and seeded via agenix on p510 unless noted.
 | `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_JWT_SECRET, {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, CFACTORY_CREDENTIAL_KEY, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
 | `minio-creds` | S3_ACCESS_KEY, S3_SECRET_KEY | minio, minio bucket-init, pfactory, tfactory, aifactory, backups | Manual (agenix). Rotate = recreate + bounce minio and every consumer. |
 | `minio-kms` | MINIO_KMS_SECRET_KEY | minio | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; compromise-only rotation, see [Rotation policy](#rotation-policy). |
-| `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory (mounted) | AUTOMATIC — cred-broker CronJob (`apps/cred-broker`) refreshes the Claude OAuth token every 4h. Others manual. |
+| `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory (mounted) | Claude credential: `claude setup-token` (about 1 year) re-seeded by hand; cred-broker (`apps/cred-broker`) watches the expiry and refreshes only an `auth login` credential. Others manual. |
 | `factory-db-pfactory` | DATABASE_URL | pfactory | Manual (agenix). Derived from POSTGRES_PASSWORD; rotate together. |
 | `factory-db-tfactory` | DATABASE_URL | tfactory | Manual (agenix). As above. |
 | `factory-db-aifactory` | DATABASE_URL | aifactory | Manual (agenix). As above. |
@@ -73,8 +75,8 @@ controllers, not the app-seeding path): `kedaorg-certs` (KEDA operator TLS),
   `factory-secrets` (Postgres server + KEDA), the three `factory-db-*`
   DATABASE_URLs, and any manual psql. Rotating it is a multi-step dance
   (below) — a good argument for the ESO/SOPS templating recommended below.
-- Only `factory-cli-creds`' Claude token self-heals. Every other credential is a
-  manual, undocumented-until-now rotation.
+- Nothing self-heals past a credential's own expiry: the Claude token needs a
+  re-seed (about yearly with `setup-token`) and every other credential is a manual rotation.
 
 ## The last-applied-configuration annotation
 
@@ -179,8 +181,8 @@ General shape for the manual (agenix) secrets:
 - **minio-kms** (the KEK): compromise-only, never a plain swap — see the
   emergency path in [Rotation policy](#rotation-policy).
 
-- **factory-cli-creds** (Claude OAuth): normally hands-off (cred-broker). Only
-  needs a human when the refresh token is consumed/expired. Full procedure in
+- **factory-cli-creds** (Claude OAuth): a `claude setup-token` credential lasts about
+  a year; cred-broker only watches it. Needs a human at expiry. Full procedure in
   [Re-seeding the Claude OAuth credential](#re-seeding-the-claude-oauth-credential).
 
 - **oauth2-proxy-\*** cookie-secret: must be a 16/24/32-byte value; regenerate
@@ -204,7 +206,7 @@ General shape for the manual (agenix) secrets:
 | Data-encryption roots | `KMS_FERNET_KEY` (aifactory) | 365d | Envelope: `python -m server.crypto rotate-root` with `KMS_FERNET_KEY_NEW` set re-wraps the data keys, then the env is flipped (AIFactory `server/crypto/__main__.py`). |
 | Data-encryption roots | `CFACTORY_CREDENTIAL_KEY` | 365d | Multi-key: prepend `<new-id>:<key>,`, keeping old ids listed until records are re-wrapped (`cfactory/config.py`). |
 | Data-encryption roots | `minio-kms` KEK | **compromise only** | Single-key mode can't hold old and new at once, so there's no scheduled rotation until KES. On compromise, follow the emergency runbook (untested, needs downtime) in [`encryption-at-rest.md`](encryption-at-rest.md#kek-compromise-emergency-re-encryption-untested). |
-| Claude OAuth | `factory-cli-creds`, `CLAUDE_CODE_OAUTH_TOKEN` | n/a | Automated by cred-broker. Referenced only; unchanged. |
+| Claude OAuth | `factory-cli-creds`, `CLAUDE_CODE_OAUTH_TOKEN` | ~360d (`setup-token`) | Manual re-seed; cred-broker opens an issue when the expiry is near. See [Re-seeding](#re-seeding-the-claude-oauth-credential). Referenced only. |
 
 Triggers that force an immediate rotation, whatever the age: suspected or
 confirmed leak (including a value seen in a log, an annotation or a
@@ -296,8 +298,10 @@ or fingerprints belong in this repo.
 
 The broker opens a GitHub issue (label `cred-broker`, on `ALERT_REPO`) on the first
 refresh rejected with `invalid_grant`, and on any other failed refresh while the
-access token has `ALERT_WITHIN_HOURS` (default 5) or less left. The body carries
-`last-outcome`, `access-expires-at` and these steps (Factory#3687). It needs
+access token has `ALERT_WITHIN_HOURS` (default 5) or less left. For a refreshable
+(`auth login`) credential it also opens one 7 days before, or after, the refresh token's own
+expiry (`refresh-token-expiring`, date in `last-detail`). The body carries
+`last-outcome`, `access-expires-at` and a pointer to this section (Factory#3687). It needs
 `factory-secrets/GITHUB_TOKEN`; without it the broker logs `alerting inert` and still
 rotates. It raises nothing for a long-lived credential (more than 30 days left).
 
@@ -317,33 +321,109 @@ kubectl --context k3d-factory -n factory get secret factory-cli-creds \
 - `last-outcome` of `refresh-rejected:invalid_grant` is the case this section
   covers.
 
-### Which login flow — this is the part that bites
+### Why the credential dies (Factory#3687)
 
-Two different Claude credentials can land in this Secret and only one of them
-works with the broker.
+A `claude auth login` refresh-token lineage has a **fixed lifetime of about 30 days from the
+login**. Rotating the refresh token does not extend it, so the broker cannot keep an
+`auth login` credential alive: the file carries `claudeAiOauth.refreshTokenExpiresAt`, and
+the first `invalid_grant` ("Refresh token expired") comes shortly after that date. This is
+why the credential seeded on 2026-10-06 stopped on 2026-11-05. Earlier incidents were mostly
+cluster rebuilds and outages, not expiries.
 
-| Flow | Access TTL | Refresh token usable by cred-broker? |
-|---|---|---|
-| `claude auth login` | ~8h | **Yes** — this is what the broker is built for |
-| `claude setup-token` | ~1 year | **No** — the broker fails `invalid_grant` forever |
+### Which login flow
 
-Factory#437 was a `setup-token` credential: the fleet was fine (364 days of
-access left) but every 4h refresh failed and would have kept failing after any
-number of re-seeds using the same flow. If you re-seed, use `claude auth login`.
+| Flow | Lifetime | Refresh | Owner effort |
+|---|---|---|---|
+| `claude setup-token` (**default**) | about 1 year | none; the broker reports `not-applicable:long-lived-credential` | one re-seed a year |
+| `claude auth login` (alternative) | access 8h, refresh lineage about 30 days | broker refreshes every 4h, cannot extend the lineage | re-login about every 30 days; broker issue 7 days ahead |
 
-If you deliberately want the long-lived `setup-token` instead, then cred-broker
-is the wrong control for this credential — suspend it and monitor the expiry
-date rather than leaving a job to fail six times a day.
+A setup-token is inference-only (scope `user:inference`); nothing in this repo needs more.
+It is valid for a year if leaked, so treat it like any long-lived secret. Keep the broker
+scheduled with a setup-token: at 30 days of runway or less it goes red (`no-refresh-token`)
+and opens the issue, which is the yearly reminder.
 
-### Procedure
+### Procedure (default: setup-token)
 
 Rotate **both** Secrets. `factory-secrets/CLAUDE_CODE_OAUTH_TOKEN` and
-`factory-cli-creds/claude-credentials.json` must carry the same access token —
-the Claude SDK reads the mounted **file**, so fixing only the env var looks like
-it worked and does not.
+`factory-cli-creds/claude-credentials.json` must carry the same token: the Claude SDK
+reads the mounted **file**, so fixing only the env var looks like it worked and does not.
+Run on p620. Never paste the token into a command line, a log or an issue.
 
-1. On a machine with the CLI, `claude auth login`. This writes
-   `~/.claude/.credentials.json`.
+0. Optional: print only the dead credential's refresh expiry date.
+
+   ```sh
+   kubectl --context k3d-factory -n factory get secret factory-cli-creds \
+     -o jsonpath='{.data.claude-credentials\.json}' | base64 -d \
+     | jq -r '.claudeAiOauth.refreshTokenExpiresAt / 1000 | todate'
+   ```
+
+1. Mint the token (browser flow, shown once) and hold it without echo or history:
+
+   ```sh
+   claude setup-token
+   read -rs TOK
+   ```
+
+2. Patch both Secrets. `expiresAt` is epoch milliseconds, 360 days out, so the broker's
+   reminder fires early rather than late:
+
+   ```sh
+   EXP=$(( ($(date +%s) + 360*86400) * 1000 ))
+   kubectl --context k3d-factory -n factory patch secret factory-cli-creds \
+     --type merge --patch-file /dev/stdin <<EOF
+   {"data":{"claude-credentials.json":"$(jq -cn --arg t "$TOK" --argjson e "$EXP" \
+     '{claudeAiOauth:{accessToken:$t,expiresAt:$e,scopes:["user:inference"]}}' | base64 -w0)"}}
+   EOF
+   kubectl --context k3d-factory -n factory patch secret factory-secrets \
+     --type merge --patch-file /dev/stdin <<EOF
+   {"data":{"CLAUDE_CODE_OAUTH_TOKEN":"$(printf %s "$TOK" | base64 -w0)"}}
+   EOF
+   ```
+
+3. Make it survive a reboot. `factory-secrets` is re-applied from agenix on every boot, and
+   a cluster rebuild seeds `factory-cli-creds` from the agenix slot or the host snapshot,
+   whichever is fresher. In `~/.config/nixos`:
+   `./scripts/manage-secrets.sh edit factory-secret-factory-secrets` (interactive terminal),
+   set `CLAUDE_CODE_OAUTH_TOKEN` to the same token, and refresh the
+   `factory-secret-factory-cli-creds` slot from the live Secret; commit the `.age` files.
+   Then `unset TOK`.
+
+4. Confirm the broker before waiting 4h for the schedule:
+
+   ```sh
+   J=cred-broker-verify-$(date +%s)   # fresh name: a reused one can show an old outcome
+   kubectl --context k3d-factory -n factory create job $J --from=cronjob/cred-broker
+   kubectl --context k3d-factory -n factory wait --for=condition=complete job/$J --timeout=120s
+   kubectl --context k3d-factory -n factory get secret factory-cli-creds \
+     -o jsonpath='{.metadata.annotations.cred-broker\.factory\.dev/last-outcome}{"\n"}'
+   ```
+
+   Expect `not-applicable:long-lived-credential`. The annotation is the check that works
+   even though the pod is deleted on failure (Factory#438).
+
+5. Roll the consumers, after announcing it on the agent bus. This is required, not optional:
+   cred-sync refuses a seed more than 90 days fresher than the file already in a pod, so
+   running pods will not adopt the one-year file; a fresh pod's seed step copies it directly.
+
+   ```sh
+   kubectl --context k3d-factory -n factory rollout restart deploy/pfactory deploy/tfactory deploy/aifactory
+   ```
+
+6. Check TFactory accepts it (its `/v1/models` probe):
+
+   ```sh
+   kubectl --context k3d-factory get --raw \
+     /api/v1/namespaces/factory/services/tfactory:3103/proxy/api/health \
+     | jq '.. | objects | select(has("validity"))'
+   ```
+
+   Expect `"validity": "valid"`. Then close the `cred-broker` issue.
+
+### Alternative: `claude auth login` (re-login about every 30 days)
+
+Same two Secrets, same verify and roll steps; only the credential differs.
+
+1. On a machine with the CLI, `claude auth login`. This writes `~/.claude/.credentials.json`.
 
 2. Patch the file into `factory-cli-creds` without clobbering the sibling
    codex/copilot/gemini keys. Keep the value off the command line:
@@ -364,24 +444,8 @@ it worked and does not.
    EOF
    ```
 
-4. Confirm the broker before waiting 4h for the schedule:
-
-   ```sh
-   J=cred-broker-verify-$(date +%s)   # fresh name: a reused one can show an old `ok`
-   kubectl --context k3d-factory -n factory create job $J --from=cronjob/cred-broker
-   kubectl --context k3d-factory -n factory wait --for=condition=complete job/$J --timeout=120s
-   kubectl --context k3d-factory -n factory get secret factory-cli-creds \
-     -o jsonpath='{.metadata.annotations.cred-broker\.factory\.dev/last-outcome}{"\n"}'
-   ```
-
-   Expect `ok`. The annotation is the check that works even though the pod is
-   deleted on failure (Factory#438).
-
-5. Bounce the consumers so they re-seed from the mount:
-
-   ```sh
-   kubectl --context k3d-factory -n factory rollout restart deploy/pfactory deploy/tfactory deploy/aifactory
-   ```
+4. Do steps 3 (agenix), 4 (verify, expect `ok`) and 5 (roll the consumers) above. Put the
+   login date in your calendar: the broker's issue arrives 7 days before the lineage ends.
 
 ### Do not share this credential with a workstation
 

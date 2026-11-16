@@ -88,6 +88,10 @@ data:
     # imminent outage.
     LONG_LIVED_DAYS = 30
 
+    # The refresh token's lineage dies a fixed ~30 days after the interactive login and
+    # rotation does not extend it (Factory#3687). Warn this many days ahead.
+    REFRESH_ALERT_DAYS = 7
+
     # Factory#3687: raise a GitHub issue on the run that knows, not 8h later.
     ALERT_REPO = os.environ.get("ALERT_REPO", "olafkfreund/Factory")
     ALERT_WITHIN_HOURS = float(os.environ.get("ALERT_WITHIN_HOURS", "5"))
@@ -156,6 +160,19 @@ data:
             eprint(f"warn: could not record outcome on the Secret: {type(e).__name__}")
 
 
+    def refresh_expiry(oauth):
+        """(days_left, note) from refreshTokenExpiresAt, or None when absent or implausible.
+
+        Only an epoch-millisecond number is trusted; anything else is ignored so this
+        metadata can never stop a refresh.
+        """
+        v = oauth.get("refreshTokenExpiresAt")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 1e12 <= v < 1e14:
+            return None
+        days = (v / 1000 - time.time()) / 86400
+        return days, f"refresh token {'expires' if days > 0 else 'expired'} {iso(v)}"
+
+
     def within_window(exp_ms):
         """True when the access token has ALERT_WITHIN_HOURS or less left, or expiry is unknown."""
         return exp_ms is None or (exp_ms / 1000 - time.time()) / 3600 <= ALERT_WITHIN_HOURS
@@ -209,36 +226,32 @@ data:
                 expiry = "unknown"
             ctx = "--context k3d-factory -n factory"
             body = f"""{ALERT_MARKER}
-    The Claude OAuth credential in `factory/factory-cli-creds` could not be refreshed.
+    The Claude OAuth credential in `factory/factory-cli-creds` needs a human re-seed.
 
     - last-outcome: `{outcome}`
     - last-detail: `{detail}`
     - access-expires-at: `{expiry}`
 
     `refresh-rejected:invalid_grant` cannot succeed on retry: the refresh token is dead and a
-    human must re-seed it. Other outcomes may clear on their own; read `last-outcome` again
-    after the next run (every 4h) before re-seeding.
+    human must re-seed it. `refresh-token-expiring` is a warning raised while refreshes still
+    succeed: the refresh token's fixed lifetime (about 30 days from the login) is nearly over,
+    the date is in last-detail, and it does not clear until the credential is re-seeded. This
+    issue is not updated if the credential dies later. Other outcomes may clear on their own;
+    read `last-outcome` again after the next run (every 4h) before re-seeding.
 
-    ## Re-seed (full procedure: docs/secrets-management.md)
+    ## Re-seed
 
-    1. On a machine with the CLI: `claude auth login` (not `setup-token`).
-    2. Patch `factory-cli-creds` (keep the value off the command line):
-       ```
-       kubectl {ctx} patch secret factory-cli-creds --type merge --patch-file /dev/stdin <<EOF
-       {{"data":{{"claude-credentials.json":"$(base64 -w0 ~/.claude/.credentials.json)"}}}}
-       EOF
-       ```
-    3. Patch the matching access token into `factory-secrets` key `CLAUDE_CODE_OAUTH_TOKEN`
-       (step 3 of the doc).
-    4. Verify:
-       ```
-       J=cred-broker-verify-$(date +%s)
-       kubectl {ctx} create job $J --from=cronjob/cred-broker
-       kubectl {ctx} wait --for=condition=complete job/$J --timeout=120s
-       kubectl {ctx} get secret factory-cli-creds -o jsonpath='{{.metadata.annotations.cred-broker\\.factory\\.dev/last-outcome}}{{"\\n"}}'
-       ```
-       Expect `ok`.
-    5. `kubectl {ctx} rollout restart deploy/pfactory deploy/tfactory deploy/aifactory`, then close this issue.
+    Follow `docs/secrets-management.md`, "Re-seeding the Claude OAuth credential". Default:
+    `claude setup-token` (about 1 year, no refresh token). Alternative: `claude auth login`
+    (needs a re-login about every 30 days). Then verify:
+    ```
+    J=cred-broker-verify-$(date +%s)
+    kubectl {ctx} create job $J --from=cronjob/cred-broker
+    kubectl {ctx} wait --for=condition=complete job/$J --timeout=120s
+    kubectl {ctx} get secret factory-cli-creds -o jsonpath='{{.metadata.annotations.cred-broker\\.factory\\.dev/last-outcome}}{{"\\n"}}'
+    ```
+    Expect `not-applicable:long-lived-credential` (setup-token) or `ok` (auth login). Then roll
+    the consumers as the doc says and close this issue.
 
     This issue stays open until closed by hand, and no second one is raised while it is open.
     job-watchdog may open its own staleness issue for the same fault.
@@ -332,7 +345,8 @@ data:
             if bad_grant:
                 eprint(
                     "the refresh token was consumed elsewhere or expired — a human "
-                    "must re-seed the Secret from a fresh `claude auth login`"
+                    "must re-seed the Secret (docs/secrets-management.md; default "
+                    "`claude setup-token`)"
                 )
                 if days_left is not None and days_left > LONG_LIVED_DAYS:
                     # NOT an incident, so NOT a failure. The credential is
@@ -350,9 +364,8 @@ data:
                         "this is a BROKEN ROTATION, not an imminent outage. A credential "
                         "with this much runway came from `claude setup-token`, whose "
                         "refresh token this grant cannot use — the 4h refresh cycle does "
-                        "not apply to it and never will. Re-seed with `claude auth login` "
-                        "(8h token + usable refresh token) or retire the broker for this "
-                        "credential. See Factory#437."
+                        "not apply to it and never will, and none is needed. The broker "
+                        "stays on as the expiry reminder. See Factory#437."
                     )
                     eprint(
                         "reporting SUCCESS: nothing to rotate and nothing at risk. This "
@@ -366,10 +379,12 @@ data:
                     )
                     return 0
             code = "invalid_grant" if bad_grant else f"http_{e.code}"
-            record(f"refresh-rejected:{code}", f"HTTP {e.code} {code}", exp_ms)
+            note = refresh_expiry(oauth)
+            detail = f"HTTP {e.code} {code}" + (f"; {note[1]}" if note else "")
+            record(f"refresh-rejected:{code}", detail, exp_ms)
             # invalid_grant cannot succeed on retry, so the first one already knows.
             if bad_grant or within_window(exp_ms):
-                alert(f"refresh-rejected:{code}", f"HTTP {e.code} {code}", exp_ms)
+                alert(f"refresh-rejected:{code}", detail, exp_ms)
             return 3
         except (OSError, ValueError) as e:
             # Network error or a non-JSON 200. Never print str(e): it can carry payload.
@@ -403,7 +418,13 @@ data:
         )
         ttl_h = int(expires_in) / 3600
         eprint(f"OK: credential refreshed, access TTL {ttl_h:.1f}h")
-        record("ok", f"access TTL {ttl_h:.1f}h", oauth["expiresAt"])
+        note = refresh_expiry(oauth)
+        if note and note[0] <= REFRESH_ALERT_DAYS:
+            eprint(f"WARN: {note[1]} - re-seed before then.")
+            record("ok", f"access TTL {ttl_h:.1f}h; {note[1]}", oauth["expiresAt"])
+            alert("refresh-token-expiring", note[1], oauth["expiresAt"])
+        else:
+            record("ok", f"access TTL {ttl_h:.1f}h", oauth["expiresAt"])
         return 0
 
 
