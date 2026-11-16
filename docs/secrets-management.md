@@ -321,6 +321,40 @@ or fingerprints belong in this repo.
 - **MinIO KEK (`minio-kms`):** for object-encryption KEK custody and limits, see
   [`docs/encryption-at-rest.md`](encryption-at-rest.md#key-custody-the-kek).
 
+### Custody register
+
+No key material or fingerprints here; the register names where each decrypting identity lives and what it recovers. The owner keeps it current (Factory#314).
+
+| Identity | Held by | Where | Decrypts | Recovery use |
+|---|---|---|---|---|
+| Operator user key | owner | `~/.ssh/id_ed25519` on p510 | every `factory-secret-*.age` | day-to-day `manage-secrets.sh edit` |
+| p510 host key | host | `/etc/ssh/ssh_host_*_key` | every `factory-secret-*.age` at activation | boot-time seeding of Secrets |
+| p620 host key | host | `/etc/ssh/ssh_host_ed25519_key` | every `factory-secret-*.age` at activation | boot-time seeding on p620 |
+| Offline backup identity | owner | outside both hosts (**owner to name the place**) | every `factory-secret-*.age` | rebuild after losing all three above |
+
+### Check the offline backup (owner, read-only)
+
+This proves the backup identity decrypts the KEK slot without printing it. It prints a byte count only:
+
+```bash
+cd ~/.config/nixos
+age -d -i /path/to/offline-backup-identity secrets/factory-secret-minio-kms.age | wc -c
+```
+
+Expect a non-zero count (about 60 for `factory-kek-1:<base64>`). An error means the backup is not a recipient: add it to `secrets.nix`, then re-key as below. Record the date and where the backup lives in the register row, not the key.
+
+### Rotate or retire an identity (owner)
+
+Run in the `nixos_config` checkout, in the directory that holds `secrets.nix` (find it with `git ls-files | grep secrets.nix`), on a host whose identity is still a recipient:
+
+1. Edit `secrets.nix`: add the new public key or remove the old one. Public keys only.
+2. Re-key every `.age` file to the new recipient set: `agenix -r -i ~/.ssh/id_ed25519`.
+3. Check one file with the new identity (command above), commit the re-keyed `.age` files, deploy the hosts (`just quick-deploy p510`, then p620).
+4. If the identity was retired because it was compromised, re-keying is not enough: git history keeps the old ciphertext, so rotate every value that identity could decrypt, in the order of [Rotation policy](#rotation-policy) (the `minio-kms` KEK last, through its cutover runbook).
+5. Update the register row and the date. Remove the old private key from where it lived.
+
+Scheduled rotation of identities is not required (no fixed interval); the triggers are in the bullets above.
+
 ## Re-seeding the Claude OAuth credential
 
 The broker opens a GitHub issue (label `cred-broker`, on `ALERT_REPO`) on the first
