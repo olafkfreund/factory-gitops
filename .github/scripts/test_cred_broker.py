@@ -114,8 +114,9 @@ def arun(hours_left, *, mode, token="t", existing=False, gh_fail=False, no_rt=Fa
         def __iter__(self): return iter(())
 
     def fake_urlopen(req, timeout=None, context=None):
-        if "api.github.com" in req.full_url:
-            path = req.full_url.split("api.github.com", 1)[1]
+        gh_prefix = "https://api.github.com"
+        if req.full_url.startswith(gh_prefix):
+            path = req.full_url[len(gh_prefix):]
             gh_calls.append((req.get_method(), path))
             if gh_fail:
                 raise urllib.error.HTTPError(req.full_url, 500, "x", {}, io.BytesIO(b"{}"))
