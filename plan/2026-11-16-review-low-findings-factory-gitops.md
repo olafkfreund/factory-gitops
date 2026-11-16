@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 337
 spec: spec/2026-11-16-review-low-findings-factory-gitops.md
 coders:

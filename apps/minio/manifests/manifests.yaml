@@ -409,7 +409,7 @@ spec:
                 if ! mc admin policy attach fac aifactory-sts --user "$STS_ACCESS_KEY"; then
                   info="$(mc admin user info fac "$STS_ACCESS_KEY")"
                   case "$info" in
-                    *[:,\ ]aifactory-sts | *[:,\ ]aifactory-sts[!-A-Za-z0-9_.]*) ;;
+                    *"PolicyName: aifactory-sts" | *"PolicyName: aifactory-sts"[!-A-Za-z0-9_.]*) ;;
                     *) echo "FATAL: attaching aifactory-sts failed and the user lacks it" >&2; exit 1 ;;
                   esac
                 fi
