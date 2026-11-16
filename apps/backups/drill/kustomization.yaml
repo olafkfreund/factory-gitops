@@ -3,11 +3,13 @@ kind: Kustomization
 namespace: factory
 resources:
   - cronjob.yaml
+  - minio-cronjob.yaml
 configMapGenerator:
   - name: postgres-restore-drill-script
     files:
       - fetch.sh
       - drill.sh
       - emit.py
+      - minio-drill.sh
 generatorOptions:
   disableNameSuffixHash: true

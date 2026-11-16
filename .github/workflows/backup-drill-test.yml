@@ -32,14 +32,17 @@ jobs:
           docker run --rm --read-only --tmpfs /scratch:rw,exec,uid=999,mode=1777 -e TMPDIR=/scratch --user 999 -v "$PWD/apps/backups:/t:ro" --entrypoint /bin/bash "$PG" /t/drill/test.sh
       - name: Fetch step and MinIO backup (real mc)
         run: |
-          for t in drill/test-fetch.sh minio-offsite/test.sh; do
+          for t in drill/test-fetch.sh drill/test-minio.sh minio-offsite/test.sh minio-local/test.sh; do
             docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 --user 65532 -e HOME=/tmp -v "$PWD/apps/backups:/t:ro" --entrypoint /bin/sh "$MC" "/t/$t"
           done
       - name: Result emitter
         run: python3 apps/backups/drill/test_emit.py
-      - name: Render the disabled MinIO backup
+      - name: Render the backups app (snapshot, both drills) and the disabled off-site copy
         run: |
           # Not referenced by any kustomization, so build it here explicitly.
           curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
             | tar -xz -C /usr/local/bin kustomize
           kustomize build apps/backups/minio-offsite | grep -q 'kind: CronJob'
+          out="$(kustomize build apps/backups/manifests)"
+          for n in minio-backup-local minio-restore-drill postgres-restore-drill; do printf '%s' "$out" | grep -q "name: $n$" || { echo "$n not rendered" >&2; exit 1; }; done
+          printf '%s' "$out" | grep -q 'kind: PersistentVolumeClaim'
