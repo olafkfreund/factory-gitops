@@ -38,7 +38,13 @@ WHERE kind = 'security_alert' ORDER BY _timestamp DESC
   kubectl -n factory create secret generic security-alert-webhook --from-literal=url='<paging webhook URL>'
   ```
 
-- **Routing existing `job_health` failures to a pager.** `job-watchdog` posts to the same
+- **Routing `job_health` failures to a pager (OpenObserve Alert).** Create an OpenObserve Destination for the
+  same webhook (Alerts, Destinations), then an Alert on stream `job_health`, 15-minute frequency:
+  `SELECT count(*) AS n FROM "job_health" WHERE status NOT IN ('ok','due_soon','unstamped','not_configured','no_field','no_source')`, fire when
+  `n > 0`. The list names the healthy statuses, not the failing ones, so a status a watchdog or
+  CronJob adds later (`reconcile_stalled`, `restore_failed`, `missing`, ...) pages by default;
+  `test_alert_filter.py` checks that every known failing status matches. Created in the OpenObserve UI, so it is not managed by Argo CD.
+- **Paging from `job-watchdog` (in git).** `job-watchdog` posts to the same
   `security-alert-webhook` Secret (Factory#3688). It POSTs `{"text": ..., "dedup_key": "<issue
   marker>"}` for every **critical** finding on every run while its issue is open (about every 30
   minutes), so the pager must de-duplicate on `dedup_key`, as for `security-alerts`; a failed POST
@@ -46,6 +52,9 @@ WHERE kind = 'security_alert' ORDER BY _timestamp DESC
   failed POST is counted and the run exits 7 after the heartbeat, so a dead pager shows as a red
   CronJob rather than silence. The destination (who is paged, by which channel) is the owner's
   choice and must accept that JSON. Recovery is not paged: the issue closes.
+  It covers the watchdog's own critical findings; the OpenObserve Alert above also covers records from
+  other writers (`audit-anchor-alert`, `security_alert`) and pages warnings too. Using both pages a
+  critical watchdog finding twice; the shared `dedup_key` does not help across different senders.
 - **Known limit.** The auth rule reads what `audit-siem-forward` has delivered. That forwarder caps
   a run at 10,000 rows and reports success with a backlog, so a large backlog can push rows past the
   30-minute window. A forwarder-lag check is a follow-up.
