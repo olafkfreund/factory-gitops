@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 337
 intent: intent/2026-11-16-review-low-findings-factory-gitops.md
 ---

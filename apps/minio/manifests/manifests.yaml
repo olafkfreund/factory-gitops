@@ -403,7 +403,26 @@ spec:
               POLICY
                 mc admin policy create fac aifactory-sts /tmp/aifactory-sts.json
                 mc admin user add fac "$STS_ACCESS_KEY" "$STS_SECRET_KEY"
-                mc admin policy attach fac aifactory-sts --user "$STS_ACCESS_KEY"
+                # `attach` fails when the policy is already attached (every re-sync);
+                # that is success. A failure with the policy absent still stops the hook.
+                # Matches with `case` only: this image has no grep or sed (see above).
+                if ! mc admin policy attach fac aifactory-sts --user "$STS_ACCESS_KEY"; then
+                  info="$(mc admin user info fac "$STS_ACCESS_KEY")"
+                  case "$info" in
+                    *[:,\ ]aifactory-sts | *[:,\ ]aifactory-sts[!-A-Za-z0-9_.]*) ;;
+                    *) echo "FATAL: attaching aifactory-sts failed and the user lacks it" >&2; exit 1 ;;
+                  esac
+                fi
+                # Rotation: disable (not remove) any other user holding this dedicated
+                # policy, so the old key stops working but can be recovered. Best-effort:
+                # if `user list --json` carries no policyName nothing is disabled and the
+                # owner disables the old user by hand (#337).
+                mc admin user list fac --json 2>/dev/null | while IFS= read -r line; do
+                  case "$line" in *'"policyName"'*'"aifactory-sts"'*) ;; *) continue ;; esac
+                  old="${line#*\"accessKey\"}"; old="${old#*\"}"; old="${old%%\"*}"
+                  [ -n "$old" ] && [ "$old" != "$STS_ACCESS_KEY" ] || continue
+                  mc admin user disable fac "$old" && echo "disabled previous aifactory-sts user"
+                done || true
                 echo "aifactory-sts user ready"
               else
                 echo "STS_ACCESS_KEY/STS_SECRET_KEY not set: aifactory-sts user skipped"
