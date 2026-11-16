@@ -5,7 +5,7 @@
 # The key is written ONLY to OUT_FILE (mode 600, must not exist). stdout carries the kid,
 # the Secret key names, a fingerprint and the expiry, never the key. The trusted-plan key is a
 # shared HMAC secret, so there is no public key: the fingerprint (first 12 hex of sha256) lets
-# you compare two copies without showing either. Next steps: docs/secrets-management.md.
+# you compare two copies without showing either. The file is created exclusively (noclobber). Next steps: docs/secrets-management.md.
 set -euo pipefail
 
 gen() {
@@ -13,7 +13,7 @@ gen() {
   [[ $kid =~ ^[0-9A-Za-z]{2,16}$ ]] || { echo "kid must be 2-16 letters or digits (no _)" >&2; return 2; }
   [[ -e $out ]] && { echo "refusing to overwrite $out" >&2; return 2; }
   key=$(openssl rand -hex 32)
-  (umask 077; printf 'AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY__%s=%s\nPFACTORY_TRUSTED_PLAN_SIGNING_KEY__%s=%s\n' \
+  (umask 077; set -o noclobber; printf 'AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY__%s=%s\nPFACTORY_TRUSTED_PLAN_SIGNING_KEY__%s=%s\n' \
     "${kid^^}" "$key" "${kid^^}" "$key" > "$out")
   fp=$(printf %s "$key" | sha256sum | cut -c1-12)
   echo "kid:          ${kid,,}"
