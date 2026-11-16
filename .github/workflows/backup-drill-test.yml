@@ -43,6 +43,11 @@ jobs:
           curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
             | tar -xz -C /usr/local/bin kustomize
           kustomize build apps/backups/minio-offsite | grep -q 'kind: CronJob'
+          # Recipient wired into the init and the copy container of both off-site CronJobs.
+          for d in offsite minio-offsite; do
+            n="$(kustomize build apps/backups/$d | grep -c 'name: OFFSITE_AGE_RECIPIENT')"
+            [ "$n" = 2 ] || { echo "$d: OFFSITE_AGE_RECIPIENT in $n containers, want 2" >&2; exit 1; }
+          done
           out="$(kustomize build apps/backups/manifests)"
           for n in minio-backup-local minio-restore-drill postgres-restore-drill; do printf '%s' "$out" | grep -q "name: $n$" || { echo "$n not rendered" >&2; exit 1; }; done
           printf '%s' "$out" | grep -q 'kind: PersistentVolumeClaim'
