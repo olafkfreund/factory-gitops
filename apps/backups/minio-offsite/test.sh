@@ -15,6 +15,8 @@ for a in "\$@"; do
   esac
   set -- "\$@" "\$a"; shift
 done
+# On a local filesystem mc find also lists directories; S3 has none.
+if [ "\$1" = find ]; then "$real_mc" "\$@" | while IFS= read -r p; do [ -f "\$p" ] && echo "\$p"; done; exit 0; fi
 exec "$real_mc" "\$@"
 EOS
 chmod +x "$tmp/bin/mc"
@@ -39,6 +41,10 @@ echo changed-length > "$R/fac/factory-evidence/e/2"   # rewritten in place: not 
 if sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL changed object must fail"; exit 1; fi
 [ "$(cat "$R/off/bk/minio/factory-evidence/e/2")" = two ] || { echo "FAIL destination was overwritten"; exit 1; }
 echo "PASS changed object fails, destination untouched"
+
+echo two > "$R/fac/factory-evidence/e/2"; echo six > "$R/off/bk/minio/factory-evidence/e/2"   # same size, other bytes
+if sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL same-size corruption passed"; exit 1; fi
+echo "PASS same-size corruption fails"
 
 if OFFSITE_S3_ENDPOINT=http://x sh "$here/minio-offsite.sh" >/dev/null 2>&1; then echo "FAIL http endpoint accepted"; exit 1; fi
 echo "PASS refuses http endpoint"

@@ -35,5 +35,16 @@ for bucket in factory-artifacts factory-evidence; do
   # mc diff: "<" only in source, ">" only at destination, "!" differs.
   bad="$(printf '%s\n' "$diff_out" | grep -c '^[<!]' || true)"
   [ "$bad" -eq 0 ] || fail "$bucket: $bad object(s) missing or different at the destination"
+  # mc diff compares name, size and time only: a same-size corrupted copy passes it.
+  # shortcut: reads every object on both sides each night, fine at MB-GB scale; compare ETags or provider checksums when buckets get large
+  mc find "fac/$bucket" > "$SCRATCH/objects" || fail "listing of $bucket failed"
+  differ=0
+  while IFS= read -r obj; do
+    rel="${obj#*"/$bucket/"}"
+    a="$(mc cat "$obj" | sha256sum)" || fail "read of $obj failed"
+    b="$(mc cat "$dest/$rel" | sha256sum)" || fail "read of $dest/$rel failed"
+    [ "$a" = "$b" ] || { differ=$((differ + 1)); printf 'minio-offsite: content differs: %s\n' "$rel" >&2; }
+  done < "$SCRATCH/objects"
+  [ "$differ" -eq 0 ] || fail "$bucket: $differ object(s) differ in content at the destination"
   printf 'minio-offsite: OK bucket=%s\n' "$bucket"
 done
