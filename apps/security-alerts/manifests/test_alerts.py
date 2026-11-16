@@ -32,6 +32,7 @@ def run(counts, egress="", token=False, webhook=False, open_bodies=()):
         if path.endswith("/issues"):
             issues.append(body)
             return {"number": len(issues)}
+        return None
     alerts.gh = gh
     alerts.urllib.request.urlopen = lambda req, timeout=0: (posts.append(req), type("R", (), {"close": lambda s: None})())[1]
     if token:
