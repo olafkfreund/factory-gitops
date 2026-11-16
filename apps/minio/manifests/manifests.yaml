@@ -319,7 +319,7 @@ spec:
                 b="$1"; doc="$2"; shift 2
                 printf '%s' "$doc" | mc ilm import "fac/$b"
                 got="$(mc ilm export "fac/$b")"
-                rest="$got"; depth=0; rule=""; seen=0; ok=0
+                rest="$got"; depth=0; rule=""; seen=0; ok=0; done_ids=" "
                 while [ -n "$rest" ]; do
                   t="${rest#?}"; c="${rest%"$t"}"; rest="$t"
                   case "$c" in "{") depth=$((depth + 1)) ;; esac
@@ -332,7 +332,12 @@ spec:
                              case "$rule" in
                                *"\"ID\":\"${p%=*}\""*)
                                  case "$rule" in
-                                   *"\"Expiration\":{\"Days\":${p#*=},"*|*"\"Expiration\":{\"Days\":${p#*=}}"*) ok=$((ok + 1)) ;;
+                                   *"\"Expiration\":{\"Days\":${p#*=},"*|*"\"Expiration\":{\"Days\":${p#*=}}"*)
+                                          case "$done_ids" in
+                                            *" ${p%=*} "*) echo "FATAL: $b rule '${p%=*}' exported twice" >&2
+                                                           exit 1 ;;
+                                          esac
+                                          done_ids="$done_ids ${p%=*} "; ok=$((ok + 1)) ;;
                                    *) echo "FATAL: $b rule '${p%=*}' does not expire at ${p#*=} days" >&2
                                       echo "$got" >&2
                                       exit 1 ;;
