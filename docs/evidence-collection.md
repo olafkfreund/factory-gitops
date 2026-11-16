@@ -43,16 +43,17 @@ prior version.
 
 ## Retention
 
-- Bucket-wide lifecycle rule: expire objects after 90 days, expire noncurrent
+- Bucket-wide lifecycle rule `evidence-396d`: expire objects after 396 days
+  (13 months, the R-006 treatment floor, Factory#3692), expire noncurrent
   (versioned) copies 30 days after they become noncurrent
-  (`apps/minio/manifests/manifests.yaml`).
-- 90 days matches the evidence floor already established for the
-  `role=evidence` objects in `factory-artifacts` (#313, #321). It is a floor,
-  not an aggressive purge: evidence that backs a verification claim or audit
-  anchor must outlive the claim.
-- Ceiling to know about: SOC 2's typical 12-month observation window wants a
-  365-day retention. That is a one-line change to the ILM rule
-  (`--expire-days 365`) when an audit period is actually scoped.
+  (`apps/minio/manifests/manifests.yaml`). The bucket Job reads the rule back
+  and fails if its ID or its day count is not as written.
+- The `role=evidence` objects in `factory-artifacts` use the same 396 days
+  (#313, #321). It is a floor, not an aggressive purge: evidence that backs a
+  verification claim or audit anchor must outlive the claim.
+- Caveat: a new rule never restores objects an earlier 90-day rule already
+  expired, and a noncurrent version (an overwrite or delete) is still reaped
+  30 days later. Collection began 2026-07-25.
 
 ## What is collected, and by which side
 
