@@ -10,15 +10,17 @@
 # This broker makes the Secret the single refresher: a CronJob refreshes the
 # credential every 4h (access TTL is 8h) and patches the Secret in place, so the
 # access token services seed is always valid and they never need to refresh —
-# no rotation race. Each refresh also rolls the refresh token forward, well
-# inside its ~30d TTL, so no human re-login is needed while the broker runs.
+# no rotation race. Each refresh rolls the refresh token forward, but that does
+# NOT extend its life: the refresh-token lineage dies a fixed ~30 days after the
+# interactive login (Factory#3687), so a `claude auth login` credential still needs
+# a human re-login about monthly. The broker opens an issue 7 days before.
 #
-# This assumes a `claude auth login` credential (8h access, refreshable). A
-# `claude setup-token` credential (~1y access) has no refresh token this grant
-# can use, so the broker fails invalid_grant on every run forever — see
-# Factory#437 and docs/secrets-management.md "Re-seeding the Claude OAuth
-# credential". The broker now says which case it is in, and records the outcome
-# on the Secret so the diagnosis survives the pod.
+# The default credential is `claude setup-token` (~1y access, no refresh token):
+# there is nothing to rotate, the broker reports not-applicable:long-lived-credential
+# and stays on as the expiry reminder (docs/secrets-management.md "Re-seeding the
+# Claude OAuth credential", Factory#437/#3687). `claude auth login` (8h access,
+# refreshable) is the documented alternative. The broker records the outcome on
+# the Secret so the diagnosis survives the pod.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
