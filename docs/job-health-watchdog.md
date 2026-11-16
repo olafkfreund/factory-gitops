@@ -128,6 +128,9 @@ Two options were on the table: an OpenObserve Alert + Destination on the
 - **OpenObserve alert config is imperative API state.** It lives nowhere in git,
   so it drifts out of this GitOps repo the moment anyone edits it in the UI.
 
+**Paging (Factory#3688).** An optional webhook (Secret `security-alert-webhook`, key `url`, shared with
+`security-alerts`) receives one POST per critical state change. It stays off until the owner creates the Secret; the GitHub issue remains the primary channel.
+
 ### Why a GitHub issue
 
 There is no Slack webhook, SMTP relay or pager endpoint anywhere in this fleet.

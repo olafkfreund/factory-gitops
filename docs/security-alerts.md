@@ -38,12 +38,13 @@ WHERE kind = 'security_alert' ORDER BY _timestamp DESC
   kubectl -n factory create secret generic security-alert-webhook --from-literal=url='<paging webhook URL>'
   ```
 
-- **Routing existing `job_health` failures to a pager.** Create an OpenObserve Destination for the
-  same webhook (Alerts, Destinations), then an Alert on stream `job_health`, 15-minute frequency:
-  `SELECT count(*) AS n FROM "job_health" WHERE status NOT IN ('ok','due_soon','unstamped','not_configured','no_field','no_source')`, fire when
-  `n > 0`. The list names the healthy statuses, not the failing ones, so a status a watchdog or
-  CronJob adds later (`reconcile_stalled`, `restore_failed`, `missing`, ...) pages by default;
-  `test_alert_filter.py` checks that every known failing status matches. Created in the OpenObserve UI, so it is not managed by Argo CD.
+- **Routing existing `job_health` failures to a pager.** `job-watchdog` posts to the same
+  `security-alert-webhook` Secret (Factory#3688). It POSTs `{"text": ..., "dedup_key": "<issue
+  marker>"}` when it opens, reopens, escalates or renotifies a **critical** finding (one POST per
+  change, not per run); warnings stay GitHub-issue-only. Off while the Secret is absent. A failed
+  POST is counted and the run exits 7 after the heartbeat, so a dead pager shows as a red
+  CronJob rather than silence. One Secret feeds both jobs; the destination is the owner's choice
+  (who is paged, by which channel) and must accept that JSON. Recovery is not paged: the issue closes.
 - **Known limit.** The auth rule reads what `audit-siem-forward` has delivered. That forwarder caps
   a run at 10,000 rows and reports success with a backlog, so a large backlog can push rows past the
   30-minute window. A forwarder-lag check is a follow-up.
