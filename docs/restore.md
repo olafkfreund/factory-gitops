@@ -216,3 +216,13 @@ Run after any Postgres restore, before returning the fleet to service:
       line.
 - [ ] Restore drill on a scratch namespace/database at least quarterly — an
       untested backup is not a backup.
+
+## The `backups` Argo CD app shows Progressing until the first local MinIO backup runs
+
+`minio-backup-local` (`apps/backups/minio-local/cronjob.yaml`) is a PVC on `local-path`, whose
+binding mode is `WaitForFirstConsumer`. Argo CD reports a Pending PVC as Progressing, and nothing
+mounts it until the `minio-backup-local` CronJob first fires (`30 3 * * *`). Until then the app is
+`Synced / Progressing` and the PVC event reads `waiting for first consumer`. It is not a stuck
+hook or a broken manifest; it turns Healthy by itself after that first run. Do not "fix" it by
+switching the class to `nfs` (Immediate, but Retain and another failure domain). To clear it
+sooner, run the CronJob once: `kubectl -n factory create job --from=cronjob/minio-backup-local first-run`.

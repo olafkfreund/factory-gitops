@@ -16,7 +16,9 @@ export MC_CONFIG_DIR="$S/.mc"
 mc alias set fac "${SOURCE_ENDPOINT:-http://minio.factory.svc.cluster.local:9000}" \
   "${S3_ACCESS_KEY:-}" "${S3_SECRET_KEY:-}" >/dev/null 2>&1 || fail fetch_alias_failed
 # mc find is unordered; names embed a UTC stamp, so sort puts the newest last.
-latest="$(mc find fac/factory-backups/postgres --name 'factory-cluster-*.sql.gz' | sort | tail -n 1)" || fail fetch_list_failed
+# Capture first: `$(a | b) || x` tests only the last stage, so a failed `mc find` would read as no_dump_found.
+list="$(mc find fac/factory-backups/postgres --name 'factory-cluster-*.sql.gz')" || fail fetch_list_failed
+latest="$(printf '%s\n' "$list" | sort | tail -n 1)"
 [ -n "$latest" ] || fail no_dump_found
 mc cp "$latest" "$S/dump.sql.gz" >/dev/null 2>&1 || fail fetch_copy_failed
 printf '%s\n' "${latest##*/}" > "$S/dump.name"

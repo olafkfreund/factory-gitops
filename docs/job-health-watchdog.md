@@ -73,13 +73,16 @@ when the schedule is too exotic to read (ranges, lists).
 ```sql
 SELECT cronjob, status, consecutive_failures, surviving_jobs, last_success_age_seconds
 FROM "job_health"
-WHERE status != 'ok'
+WHERE status IN ('failing','stale','never_succeeded','not_scheduled','suspended','firing','error','overdue','missing')
 ORDER BY _timestamp DESC
 ```
 
-`audit-anchor-alert` writes into the same stream with `source =
-'audit-anchor-alert'`, on both its alert and healthy paths, so one query covers
-scheduled-job health and audit-chain health together.
+The stream is shared: `audit-anchor-alert` (`source = 'audit-anchor-alert'`, alert and healthy
+paths), `security-alerts` and `secret-rotation` write into it too, and several of them write
+non-failure statuses (`ok`, `due_soon`, `unstamped`, `not_configured`, `no_source`, `no_field`).
+`status != 'ok'` therefore over-matches; use the explicit non-healthy list above, the same one
+the pager Alert uses in `docs/security-alerts.md`. Add a status to both when a writer introduces
+a new failing one.
 
 ## Why it exits 0 even when it finds problems
 
