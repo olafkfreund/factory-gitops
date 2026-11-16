@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 1959
 intent: intent/2026-11-16-1959-gateway-upstream-egress.md
 ---
