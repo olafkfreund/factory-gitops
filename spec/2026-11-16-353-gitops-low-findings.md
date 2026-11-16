@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 353
 intent: intent/2026-11-16-353-gitops-low-findings.md
 ---
