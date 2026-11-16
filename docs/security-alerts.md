@@ -40,11 +40,12 @@ WHERE kind = 'security_alert' ORDER BY _timestamp DESC
 
 - **Routing existing `job_health` failures to a pager.** `job-watchdog` posts to the same
   `security-alert-webhook` Secret (Factory#3688). It POSTs `{"text": ..., "dedup_key": "<issue
-  marker>"}` when it opens, reopens, escalates or renotifies a **critical** finding (one POST per
-  change, not per run); warnings stay GitHub-issue-only. Off while the Secret is absent. A failed
-  POST is counted and the run exits 7 after the heartbeat, so a dead pager shows as a red
-  CronJob rather than silence. One Secret feeds both jobs; the destination is the owner's choice
-  (who is paged, by which channel) and must accept that JSON. Recovery is not paged: the issue closes.
+  marker>"}` for every **critical** finding on every run while its issue is open (about every 30
+  minutes), so the pager must de-duplicate on `dedup_key`, as for `security-alerts`; a failed POST
+  is retried by the next run. Warnings stay GitHub-issue-only. Off while the Secret is absent. A
+  failed POST is counted and the run exits 7 after the heartbeat, so a dead pager shows as a red
+  CronJob rather than silence. The destination (who is paged, by which channel) is the owner's
+  choice and must accept that JSON. Recovery is not paged: the issue closes.
 - **Known limit.** The auth rule reads what `audit-siem-forward` has delivered. That forwarder caps
   a run at 10,000 rows and reports success with a backlog, so a large backlog can push rows past the
   30-minute window. A forwarder-lag check is a follow-up.

@@ -129,7 +129,7 @@ Two options were on the table: an OpenObserve Alert + Destination on the
   so it drifts out of this GitOps repo the moment anyone edits it in the UI.
 
 **Paging (Factory#3688).** An optional webhook (Secret `security-alert-webhook`, key `url`, shared with
-`security-alerts`) receives one POST per critical state change. It stays off until the owner creates the Secret; the GitHub issue remains the primary channel.
+`security-alerts`) receives a POST for every critical finding on every run while its issue is open (stable `dedup_key`). It stays off until the owner creates the Secret; the GitHub issue remains the primary channel.
 
 ### Why a GitHub issue
 

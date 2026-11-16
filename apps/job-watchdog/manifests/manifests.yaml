@@ -1912,9 +1912,9 @@ data:
     def page(record: dict, sev: str, action: str, key: str) -> None:
         """Optional paging webhook (Factory#3688), same Secret as security-alerts.
 
-        Critical state changes only (the moments an issue is opened, reopened,
-        escalated or renotified), so the pager is as quiet as the issue list.
-        Off when ALERT_WEBHOOK_URL is unset. Never raises and never prints the
+        Critical findings only, on every run while the issue is open, with a stable
+        dedup_key: the pager de-duplicates, and a failed POST is retried by the
+        next run. Off when ALERT_WEBHOOK_URL is unset. Never raises and never prints the
         URL or the exception text: a failure is counted and turns the run red
         after the heartbeat, while the GitHub issue path stays primary.
         """
@@ -1946,6 +1946,10 @@ data:
             issue = existing.get(key)
             action = notify_action(r, issue, now, renotify_hours)
             if action is None:
+                # Still open and critical: page again with the same dedup_key, so a
+                # POST that failed last run is retried without any stored state.
+                if issue and issue.get("state") != "closed":
+                    page(r, severity_of(r), "still open", key)
                 continue
             sev = severity_of(r)
             name = r["cronjob"]
@@ -3358,12 +3362,23 @@ data:
             posted.clear()
             assert notify("t", "o/r", [healthy_rec, refused], stranded, 24) == 1
             assert not posted, posted
+            # The issue now exists and is open: a quiet run (no issue action) still
+            # pages, and a POST that fails is retried by the next run.
+            stub_issues.append({
+                "number": 99, "title": "t", "created_at": "2026-07-26T11:50:00Z",
+                "updated_at": "2026-07-26T11:50:00Z",
+                "body": issue_body(never, "critical"),
+                "labels": [{"name": ISSUE_LABEL}, {"name": SEVERITY_LABELS["critical"]}]})
             def boom(req, timeout=0):
                 raise OSError("https://secret.invalid/token")
             urllib.request.urlopen = boom
             PAGE_FAILS.clear()
-            assert notify("t", "o/r", [never], now, 24) == 1
+            assert notify("t", "o/r", [never], now, 24) == 0
             assert PAGE_FAILS == [MARKER.format(ns="factory", name="postgres-backup")]
+            urllib.request.urlopen = fake_urlopen
+            posted.clear()
+            assert notify("t", "o/r", [never], now, 24) == 0
+            assert len(posted) == 1, posted
         finally:
             urllib.request.urlopen = real_urlopen
             globals()["gh"] = real_gh
