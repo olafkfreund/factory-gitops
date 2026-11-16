@@ -23,4 +23,5 @@ jobs:
         run: |
           image="$(grep -o 'cgr.dev/chainguard/minio-client[^ ]*' apps/backups/offsite/cronjob.yaml | head -n 1)"
           test -n "$image" || { echo "no image found in cronjob.yaml" >&2; exit 1; }
-          docker run --rm -v "$PWD/apps/backups/offsite:/t:ro" --entrypoint /bin/sh "$image" /t/test.sh
+          chmod -R a+rX apps/backups
+          docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 --user 65532 -e HOME=/tmp -v "$PWD/apps/backups/offsite:/t:ro" --entrypoint /bin/sh "$image" /t/test.sh

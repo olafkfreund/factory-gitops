@@ -43,6 +43,46 @@ age=$((now - stamp))
 # The limit must stay below 25h: yesterday's dump is 25h old at this job's start.
 [ "$age" -le "$MAX_AGE_SECONDS" ] || fail 'dump is stale'
 
+if [ -n "${OFFSITE_AGE_RECIPIENT:-}" ]; then
+  # Encrypted copy (Factory#3681): age output differs on every run, so an object
+  # that is already there is checked, never re-encrypted or overwritten.
+  case "$OFFSITE_AGE_RECIPIENT" in
+    age1*[!a-z0-9]*|age1) fail 'OFFSITE_AGE_RECIPIENT is not an age public key' ;;
+    age1*) ;;
+    *) fail 'OFFSITE_AGE_RECIPIENT is not an age public key' ;;
+  esac
+  AGE_BIN=${AGE_BIN:-$SCRATCH/bin/age}
+  [ -x "$AGE_BIN" ] || fail 'age binary missing (init container did not run)'
+  mc cat "fac/factory-backups/postgres/$name" | gzip -t 2>/dev/null || fail 'source dump is invalid gzip'
+  dest="off/$OFFSITE_S3_BUCKET/postgres"
+  # Fail closed: a listing that errors must never read as "nothing there", or the
+  # upload below could replace an existing copy. S3 lists an unused prefix as empty.
+  listing="$(mc ls "$dest/")" || fail 'destination listing failed'
+  has() { printf '%s\n' "$listing" | awk -v n="$1" '$NF == n { f = 1 } END { exit !f }'; }
+  if has "$name.age"; then
+    mc cat "$dest/$name.age" > "$SCRATCH/readback.age" || fail 'destination read-back failed'
+    [ -s "$SCRATCH/readback.age" ] || fail 'destination object is empty'
+    [ "$(head -n 1 "$SCRATCH/readback.age")" = age-encryption.org/v1 ] || fail 'destination object is not an age file'
+    hash="$(sha256sum "$SCRATCH/readback.age" | cut -d ' ' -f 1)" || fail 'destination hash failed'
+    if has "$name.age.sha256"; then
+      want="$(mc cat "$dest/$name.age.sha256" | cut -d ' ' -f 1)" || fail 'checksum read failed'
+      [ "$want" = "$hash" ] || fail 'destination hash differs from its checksum file'
+    else
+      printf 'offsite-copy: WARN no checksum file for %s.age\n' "$name" >&2
+    fi
+  else
+    mc cat "fac/factory-backups/postgres/$name" | "$AGE_BIN" -r "$OFFSITE_AGE_RECIPIENT" -o "$SCRATCH/$name.age" || fail 'encryption failed'
+    [ -s "$SCRATCH/$name.age" ] || fail 'encrypted dump is empty'
+    hash="$(sha256sum "$SCRATCH/$name.age" | cut -d ' ' -f 1)" || fail 'local hash failed'
+    mc cp "$SCRATCH/$name.age" "$dest/$name.age" >/dev/null || fail 'upload failed'
+    back="$(mc cat "$dest/$name.age" | sha256sum | cut -d ' ' -f 1)" || fail 'destination read-back failed'
+    [ "$back" = "$hash" ] || fail 'destination hash differs from source'
+    printf '%s\n' "$hash" | mc pipe "$dest/$name.age.sha256" >/dev/null || fail 'checksum upload failed'
+  fi
+  printf 'offsite-copy: OK name=%s.age encrypted=age sha256=%s age_seconds=%s\n' "$name" "$hash" "$age"
+  exit 0
+fi
+
 mc mirror fac/factory-backups/postgres/ "off/$OFFSITE_S3_BUCKET/postgres/" || fail 'mirror failed'
 # shortcut: reads the whole newest dump back each night, fine at MB size; compare provider checksums when dumps reach GBs
 mc cat "off/$OFFSITE_S3_BUCKET/postgres/$name" > "$SCRATCH/readback.gz" || fail 'destination read-back failed'
