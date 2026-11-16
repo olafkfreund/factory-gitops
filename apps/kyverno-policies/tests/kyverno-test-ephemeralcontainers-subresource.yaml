@@ -1,0 +1,36 @@
+# Kyverno CLI test: the coverage rules apply to a `pods/ephemeralcontainers`
+# request, not only to a plain Pod CREATE (Factory#3701 item 2).
+#
+#   kyverno test apps/kyverno-policies/tests -f kyverno-test-ephemeralcontainers-subresource.yaml
+#
+# This pins the engine's subresource matching offline. It cannot prove the live
+# webhook routes `kubectl debug` here; that is a manual check, see
+# docs/image-signature-admission.md ("Live check: kubectl debug").
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: coverage-ephemeralcontainers-subresource
+policies:
+  - ../manifests/require-first-party-signature-coverage.yaml
+resources:
+  - resources.yaml
+values:
+  subresources:
+    - subresource: {name: pods/ephemeralcontainers, kind: Pod, version: v1}
+      parentResource: {name: pods, kind: Pod, version: v1}
+results:
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-by-a-signature-rule
+    kind: Pod
+    result: fail
+    resources: [uncovered-in-ephemeralcontainer]
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-gateway
+    kind: Pod
+    result: fail
+    resources: [gateway-uncovered-in-ephemeralcontainer]
+  - policy: require-first-party-signature-coverage
+    rule: first-party-image-must-be-covered-in-fides
+    kind: Pod
+    result: fail
+    resources: [fides-uncovered-in-ephemeralcontainer]

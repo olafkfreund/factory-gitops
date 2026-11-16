@@ -30,8 +30,9 @@ would admit it. That is compliance gap #8.
 
 CFactory (`ghcr.io/olafkfreund/cfactory`, `cfactory-frontend`) does **not** sign
 its images yet — it has no `release.yml` cosign step. Signing is tracked in
-CFactory#191. This is the reason the policy must stay in audit mode: an Enforce
-policy would block every CFactory Pod.
+CFactory#191. At the time this was the reason the policy had to stay in audit
+mode (an Enforce policy would have blocked every CFactory Pod); that is no
+longer true.
 
 ### Correction — Factory#430 (the audit was failing 100%)
 
@@ -612,10 +613,14 @@ Ephemeral containers (`kubectl debug`): each rule's jmesPath reads
 `ephemeralContainers`; the `uncovered-in-ephemeralcontainer`,
 `gateway-uncovered-in-ephemeralcontainer` and
 `fides-uncovered-in-ephemeralcontainer` tests pin that for the `factory`,
-`gateway` and `fides` rules (Factory#3701). Kyverno applies `Pod` rules to
+`gateway` and `fides` rules (Factory#3701), and
+`kyverno-test-ephemeralcontainers-subresource.yaml` runs the three rules with the
+`pods/ephemeralcontainers` subresource declared. Kyverno applies `Pod` rules to
 `pods/ephemeralcontainers` requests and the live webhooks register that
-subresource, but that routing has not been exercised live. Out of scope:
-namespaces with no group (no catch-all rule yet).
+subresource, but that routing has not been exercised against the live cluster:
+follow [Live check: kubectl debug](#live-check-kubectl-debug-factory3701).
+Namespaces with no group are reported by the Audit-only catch-all
+[below](#catch-all-for-namespaces-with-no-coverage-group-factory3701).
 
 Read its board as:
 
@@ -627,9 +632,10 @@ Read its board as:
 
 There are a lot of `skip` rows — roughly one per Pod per matching rule, and
 `factory` runs on the order of a hundred including retained Job Pods. That is
-deliberate. `skip` says "this
-rule looked here and had nothing to say"; silence is indistinguishable from the
-rule not running, and that indistinguishability *is* the bug being fixed.
+deliberate. `skip` says "this rule looked here and had nothing to say"; silence
+is indistinguishable from a rule not running, and that indistinguishability *is*
+the bug being fixed. A row from a rule that no longer matches the Pod's namespace is a
+stale report entry (seen once in `gateway` after Factory#3665; gone by 2026-11-16), not a check.
 
 **Historical (Factory#574), true only at `Audit`: this rule emitted no admission
 warning.** At `Audit`, a `verifyImages` rule returns both a `Warning` header and
@@ -1152,6 +1158,10 @@ fleet-wide red rather than a quiet one-off. Before treating a red sweep as a
 signing problem, check the transport first, exactly as the manifest header says.
 
 ## Phased path to Enforce
+
+Historical: both policies now run `Enforce` (Factory#3664). The phases and the
+"Not yet" verdicts below are the record of how it got there, not the current
+state.
 
 Do NOT skip a phase. Each is a separate, small PR.
 
@@ -1704,13 +1714,37 @@ syncs it, confirm the denial with
 throwaway namespace; that proof is only possible after the flip, because Audit
 admits the request. Roll back by reverting the flip commit. Enforce is off today.
 
+## Live check: kubectl debug (Factory#3701)
+
+Owner-run, once, after a sync of this repo. The offline suites cannot prove the
+live webhook routes `pods/ephemeralcontainers` to these rules. Nothing here is
+done by an agent: it creates an ephemeral container on a running Pod.
+
+```bash
+kubectl get validatingwebhookconfiguration -o json \
+  | jq -r '.items[] | select(.metadata.name|test("kyverno")) | .webhooks[].rules[].resources[]' \
+  | grep -c 'pods/ephemeralcontainers'          # expect >= 1
+POD=$(kubectl -n factory get pod -o name | head -1)
+kubectl -n factory debug "$POD" --image=ghcr.io/olafkfreund/not-a-rule:1 -- true
+```
+
+Expected: the second command is **denied** with
+`require-first-party-signature-coverage` /
+`first-party-image-must-be-covered-by-a-signature-rule` in the message, and
+`kubectl -n factory get "$POD" -o jsonpath='{.spec.ephemeralContainers}'` stays
+empty. Repeat with `-n gateway` and `-n fides` (rules `...-in-gateway`,
+`...-in-fides`). The image need not exist: the rule reads only the Pod spec. If
+any of the three is admitted, remove the ephemeral container by deleting the Pod
+and reopen Factory#3701 item 2. The Pod is only changed if the request is
+admitted.
+
 ## Notes
 
 - Scope is deliberately the four application namespaces (`factory`, `gateway`,
   `fides`, `fides-reporter`) only. Other namespaces are
   reported, not verified, by the Audit-only catch-all above; the Kubernetes
   system namespaces are excluded from both.
-- `verifyDigest: false` / `mutateDigest: false` in the audit phase: we verify
+- `verifyDigest: false` / `mutateDigest: false`: we verify
   the signature but do not yet require digest-pinned references or rewrite tags
   to digests. Digest pinning is a separate hardening step that can ride along
   with the Enforce move if desired.
