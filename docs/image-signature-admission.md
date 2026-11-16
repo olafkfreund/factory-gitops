@@ -1,12 +1,14 @@
-# Image signature verification at admission (audit mode)
+# Image signature verification at admission (Enforce)
 
-Status: AUDIT/WARN ONLY. The policy this PR introduces REPORTS unsigned or
-wrongly-signed images; it does NOT deny them. Nothing here is applied to the
-cluster by this PR — it is committed to GitOps for review, and ArgoCD will
-reconcile it after merge.
+Status: ENFORCING. `verify-factory-image-signatures` and
+`require-first-party-signature-coverage` both run `validationFailureAction:
+Enforce` and deny a Pod whose matched image is unsigned, wrongly signed, or
+first-party and covered by no verify rule. The sections below are the history of
+how the control got here; the phase-1 Audit text is kept as history.
+`./PANIC.sh 1` returns both policies to Audit.
 
-Related: Factory#318, compliance program #310 (gap #8). Depends on CFactory#191
-(CFactory image signing) before any move to Enforce.
+Related: Factory#318, compliance program #310 (gap #8). CFactory#191 (CFactory
+image signing) was the prerequisite for Enforce; it is done.
 
 ## Where we started
 
@@ -394,14 +396,16 @@ Two ArgoCD Applications, auto-discovered by `bootstrap/argocd-root-app.yaml`:
    **ClusterPolicy** (`verifyImages`), scoped to Pods in the `factory`,
    `gateway`, `fides` and `fides-reporter` namespaces (per rule).
 
-### The audit-mode policy
+### The policy
 
 `apps/kyverno-policies/manifests/verify-factory-image-signatures.yaml`:
 
-- `validationFailureAction: Audit` — violations go to a ClusterPolicyReport and
-  a PolicyViolation event; the Pod is **admitted regardless**.
-- `failurePolicy: Ignore` — if Kyverno is down or GHCR/Sigstore is unreachable,
-  Pods are admitted (verification is a signal here, not a gate).
+- `validationFailureAction: Enforce` — a violating Pod is **denied** at
+  admission and the violation also goes to a ClusterPolicyReport. (Phase 1 ran
+  `Audit`: reported, admitted regardless.)
+- `failurePolicy: Ignore` — if the Kyverno webhook is down or times out, Pods are
+  admitted. A webhook that answers but cannot verify (GHCR/Sigstore error)
+  denies; see the two regimes under "Fail" below.
 - One `verifyImages` rule per signed repo, each pinning that repo's keyless
   signer identity.
 
@@ -567,8 +571,10 @@ received https://github.com/olafkfreund/Odin/.github/workflows/deploy.yml@refs/h
 ```
 
 One mutation that does **not** go red: narrowing the glob (`odin:*` → `odin:v*`)
-gives `pass: 0, fail: 0, skip: 0` — silence, not a verdict. Nothing offline
-catches it. See factory-gitops#181.
+gives `pass: 0, fail: 0, skip: 0` — silence, not a verdict. The Kyverno test
+suite does not catch it, but `apps/kyverno-policies/assert-signature-lists-agree.py`
+(CI) does: it compares the globs with the coverage mirrors and the probe list.
+See factory-gitops#181.
 
 #### The control that closes the class: `require-first-party-signature-coverage`
 
@@ -603,8 +609,10 @@ verify rules that run in that namespace. It also fails when one of the four
 namespaces, or any namespace named by a verify rule, has no coverage rule.
 
 Ephemeral containers (`kubectl debug`): each rule's jmesPath reads
-`ephemeralContainers`; the `uncovered-in-ephemeralcontainer` test pins that for
-the `factory` rule only. Kyverno applies `Pod` rules to
+`ephemeralContainers`; the `uncovered-in-ephemeralcontainer`,
+`gateway-uncovered-in-ephemeralcontainer` and
+`fides-uncovered-in-ephemeralcontainer` tests pin that for the `factory`,
+`gateway` and `fides` rules (Factory#3701). Kyverno applies `Pod` rules to
 `pods/ephemeralcontainers` requests and the live webhooks register that
 subresource, but that routing has not been exercised live. Out of scope:
 namespaces with no group (no catch-all rule yet).
@@ -617,21 +625,22 @@ Read its board as:
 | `skip` | this Pod was checked and has no uncovered first-party image |
 | `pass` | never emitted; this rule verifies nothing itself |
 
-There are a lot of `skip` rows — roughly one per Pod, and this namespace runs
-about 140 including retained Job Pods. That is deliberate. `skip` says "this
+There are a lot of `skip` rows — roughly one per Pod per matching rule, and
+`factory` runs on the order of a hundred including retained Job Pods. That is
+deliberate. `skip` says "this
 rule looked here and had nothing to say"; silence is indistinguishable from the
 rule not running, and that indistinguishability *is* the bug being fixed.
 
-**Known limitation (Factory#574): this rule emits no admission warning.** At
-`Audit`, a `verifyImages` rule returns both a `Warning` header and a standing
-report result; a `validate` rule returns only the standing result. So
-`kubectl apply --dry-run=server` of a Pod carrying an uncovered image comes back
-clean even though the rule fails that Pod in its PolicyReport. An uncovered
-first-party image used *only* by ephemeral Job Pods is therefore caught by
-neither channel — no standing result because the Pod is gone (Factory#562), no
-warning because of the rule type. Every first-party image today is used by a
-long-running workload, which is fully covered. Do not "fix" this by switching
-the rule to `verifyImages`; that loses the standing result, which is the point.
+**Historical (Factory#574), true only at `Audit`: this rule emitted no admission
+warning.** At `Audit`, a `verifyImages` rule returns both a `Warning` header and
+a standing report result; a `validate` rule returns only the standing result, so
+a `kubectl apply --dry-run=server` of a Pod with an uncovered image came back
+clean and an uncovered image used only by ephemeral Job Pods was caught by
+neither channel (no standing result because the Pod is gone, Factory#562).
+At `Enforce` that no longer holds: the `validate` rule denies the Pod, so the
+dry-run is denied and a Job cannot create a Pod carrying an uncovered image. The
+runner probe still cross-checks the globs. Do not switch the rule to
+`verifyImages`; that loses the standing result, which is the point.
 
 **Options considered, and why this shape.**
 
@@ -1377,8 +1386,8 @@ Do NOT skip a phase. Each is a separate, small PR.
 
    This is no longer a reason the green board over-claims. The reason it still
    might is narrower and is recorded above: a narrowed glob makes a rule fall
-   silent rather than fail, and nothing offline catches it
-   (factory-gitops#181).
+   silent rather than fail; the Kyverno tests do not catch it, but
+   `assert-signature-lists-agree.py` does (factory-gitops#181).
 
    From the point of the flip, unsigned images matching a rule are denied at
    admission.
@@ -1645,8 +1654,9 @@ Residual risks, named rather than implied away:
 - **Glob narrowing is silent.** Narrowing a rule's `imageReferences` makes it
   stop speaking, and both the signature board and the coverage board stay quiet,
   because the coverage policy reads a hand-maintained mirror list rather than the
-  globs it mirrors. Only `apps/kyverno-runner-probe`, which reads the live
-  `verify-images` annotation, catches it. Do not phrase the Enforce criterion on
+  globs it mirrors. `assert-signature-lists-agree.py` (CI) catches it offline and
+  `apps/kyverno-runner-probe`, which reads the live `verify-images` annotation,
+  catches it live. Do not phrase the Enforce criterion on
   the two boards alone.
 - **Coverage is by glob, not by default.** `required: true` means "a matched
   image must be signed", not "every image must match a rule" (Factory#564).
