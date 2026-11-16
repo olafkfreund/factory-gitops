@@ -1,0 +1,74 @@
+################################################################################
+# Keycloak MFA ladder for realm "factory" (Factory#312, R-010).
+#
+# MFA_MODE (change it here, in git):
+#   audit      DEFAULT. Writes nothing. Logs enabled users with no second factor.
+#   new-users  Enables the CONFIGURE_TOTP required action as a default action, so
+#              users created from now on enroll an authenticator at first login.
+#   enforce    As new-users, plus CONFIGURE_TOTP on every enabled, non-exempt user
+#              with no otp/webauthn credential. Refuses to run unless every user
+#              in MFA_REQUIRE_ENROLLED already has a second factor (set it to the
+#              owner), so the owner cannot be the one locked out.
+#
+# MFA_EXEMPT_USERS (comma list) are never assigned the action by this job. The
+# realm default of new-users still applies to NEW accounts: create break-glass
+# accounts before switching new-users on.
+# The master realm is never touched: it is the recovery path.
+# Credentials (reused, none new): factory-secrets/KEYCLOAK_ADMIN_PASSWORD.
+# Rollback: docs/keycloak-sso.md, "MFA".
+################################################################################
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: keycloak-mfa
+  namespace: factory
+  labels: { app: keycloak-mfa }
+spec:
+  schedule: "10 5 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 900
+      template:
+        metadata: { labels: { app: keycloak-mfa } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: mfa
+              image: quay.io/keycloak/keycloak:26.1@sha256:be6a86215213145bfb4fb3e2b3ab982a806d00262655abdcf3ffa6a38d241c7c
+              command: ["/bin/sh", "/script/keycloak-mfa.sh"]
+              env:
+                - { name: MFA_MODE, value: "audit" }
+                - { name: MFA_REQUIRE_ENROLLED, value: "" }
+                - { name: MFA_EXEMPT_USERS, value: "" }
+                - { name: KC_URL, value: "http://keycloak:8080" }
+                - { name: KC_ADMIN_USER, value: "admin" }
+                - { name: JAVA_OPTS, value: "-Xmx192m -XX:MaxMetaspaceSize=128m" }
+                - { name: KCADM_PASSWORD, valueFrom: { secretKeyRef: { name: factory-secrets, key: KEYCLOAK_ADMIN_PASSWORD } } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: tmp, mountPath: /tmp }
+                - { name: script, mountPath: /script, readOnly: true }
+              resources:
+                requests: { cpu: 50m, memory: 256Mi }
+                limits: { cpu: 500m, memory: 512Mi }
+          volumes:
+            - name: tmp
+              emptyDir: { sizeLimit: 64Mi }
+            - name: script
+              configMap:
+                name: keycloak-mfa-script
+                defaultMode: 0555
