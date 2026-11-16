@@ -236,8 +236,9 @@ data:
     human must re-seed it. `refresh-token-expiring` is a warning raised while refreshes still
     succeed: the refresh token's fixed lifetime (about 30 days from the login) is nearly over,
     the date is in last-detail, and it does not clear until the credential is re-seeded. This
-    issue is not updated if the credential dies later. Other outcomes may clear on their own;
-    read `last-outcome` again after the next run (every 4h) before re-seeding.
+    issue is not updated if the credential dies later. `no-refresh-token` is the yearly
+    reminder for a `setup-token` credential and does not clear either. Other outcomes may clear
+    on their own; read `last-outcome` again after the next run (every 4h) before re-seeding.
 
     ## Re-seed
 
@@ -379,7 +380,7 @@ data:
                     )
                     return 0
             code = "invalid_grant" if bad_grant else f"http_{e.code}"
-            note = refresh_expiry(oauth)
+            note = refresh_expiry(oauth) if bad_grant else None
             detail = f"HTTP {e.code} {code}" + (f"; {note[1]}" if note else "")
             record(f"refresh-rejected:{code}", detail, exp_ms)
             # invalid_grant cannot succeed on retry, so the first one already knows.
@@ -420,7 +421,7 @@ data:
         eprint(f"OK: credential refreshed, access TTL {ttl_h:.1f}h")
         note = refresh_expiry(oauth)
         if note and note[0] <= REFRESH_ALERT_DAYS:
-            eprint(f"WARN: {note[1]} - re-seed before then.")
+            eprint(f"WARN: {note[1]} - re-seed (docs/secrets-management.md).")
             record("ok", f"access TTL {ttl_h:.1f}h; {note[1]}", oauth["expiresAt"])
             alert("refresh-token-expiring", note[1], oauth["expiresAt"])
         else:

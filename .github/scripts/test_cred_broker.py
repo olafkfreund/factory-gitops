@@ -198,7 +198,7 @@ def rrun(rexp, *, grant_ok, access_hours=3, token="t", runs=1):
     elif rexp is not None:
         oauth["refreshTokenExpiresAt"] = int((time.time() + rexp * 86400) * 1000)
     cred = {"claudeAiOauth": oauth}
-    issues, patched = [], []
+    issues, patched, gh = [], [], []
 
     class R:
         def __init__(self, d): self.d = d
@@ -209,6 +209,7 @@ def rrun(rexp, *, grant_ok, access_hours=3, token="t", runs=1):
 
     def fake_urlopen(req, timeout=None, context=None):
         if req.full_url.startswith("https://api.github.com"):
+            gh.append(req.get_method())
             if req.get_method() == "GET":
                 return R(json.dumps(issues).encode())
             if req.data and req.full_url.endswith("/issues"):
@@ -231,7 +232,7 @@ def rrun(rexp, *, grant_ok, access_hours=3, token="t", runs=1):
     outcomes = []
     m.record = lambda outcome, detail, exp=None: outcomes.append((outcome, detail))
     rcs = [m.main() for _ in range(runs)]
-    return rcs, outcomes, issues, bool(patched)
+    return rcs, outcomes, issues, bool(patched), gh
 
 
 def day(d):
@@ -250,13 +251,17 @@ RCASES = [(f"quiet: {lbl}", v, True, 1, [0], 0) for lbl, v in QUIET_RAW] + [
     ("no token: inert, refresh works", 6, True, 1, [0], 0),
 ]
 for label, rexp, grant_ok, runs, want_rcs, want_n in RCASES:
-    rcs, outcomes, issues, patched = rrun(rexp, grant_ok=grant_ok, runs=runs,
+    rcs, outcomes, issues, patched, gh = rrun(rexp, grant_ok=grant_ok, runs=runs,
                                           token="" if label.startswith("no token") else "t")
-    ok = rcs == want_rcs and len(issues) == want_n and patched == grant_ok
+    # no GitHub traffic at all when quiet or inert: an alert() that threw early would show up here
+    ok = (rcs == want_rcs and len(issues) == want_n and patched == grant_ok
+          and (bool(gh) == (want_n > 0)))
     if ok and want_n:
-        want_day = day(rexp if rexp > 0 else rexp)
+        want_day = day(rexp)
         body, title = issues[0]["body"], issues[0]["title"]
-        ok = (want_day in body and "refresh token " in body and "k3d-factory" in body
+        tense = "expires" if rexp > 0 else "expired"
+        ok = (want_day in body and f"refresh token {tense} " in body and "k3d-factory" in body
+              and (grant_ok and "- last-outcome: `refresh-token-expiring`" in body or not grant_ok)
               and "secret-payload" not in body
               and (("refresh-token-expiring" in title) if grant_ok else ("refresh-rejected:invalid_grant" in title))
               and (any("refresh token expires" in d for _, d in outcomes) if grant_ok else True))

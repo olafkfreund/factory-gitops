@@ -206,7 +206,7 @@ General shape for the manual (agenix) secrets:
 | Data-encryption roots | `KMS_FERNET_KEY` (aifactory) | 365d | Envelope: `python -m server.crypto rotate-root` with `KMS_FERNET_KEY_NEW` set re-wraps the data keys, then the env is flipped (AIFactory `server/crypto/__main__.py`). |
 | Data-encryption roots | `CFACTORY_CREDENTIAL_KEY` | 365d | Multi-key: prepend `<new-id>:<key>,`, keeping old ids listed until records are re-wrapped (`cfactory/config.py`). |
 | Data-encryption roots | `minio-kms` KEK | **compromise only** | Single-key mode can't hold old and new at once, so there's no scheduled rotation until KES. On compromise, follow the emergency runbook (untested, needs downtime) in [`encryption-at-rest.md`](encryption-at-rest.md#kek-compromise-emergency-re-encryption-untested). |
-| Claude OAuth | `factory-cli-creds`, `CLAUDE_CODE_OAUTH_TOKEN` | ~360d (`setup-token`) | Manual re-seed; cred-broker opens an issue when the expiry is near. See [Re-seeding](#re-seeding-the-claude-oauth-credential). Referenced only. |
+| Claude OAuth | `factory-cli-creds`, `CLAUDE_CODE_OAUTH_TOKEN` | ~360d (`setup-token`) | Manual re-seed; cred-broker opens an issue when the expiry is near. See [Re-seeding](#re-seeding-the-claude-oauth-credential). |
 
 Triggers that force an immediate rotation, whatever the age: suspected or
 confirmed leak (including a value seen in a log, an annotation or a
@@ -318,8 +318,10 @@ kubectl --context k3d-factory -n factory get secret factory-cli-creds \
 - `access-expires-at` is the **access token** expiry, and it decides urgency.
   A failing broker with months left on that date is a broken rotation, not an
   outage — do not treat it as one.
-- `last-outcome` of `refresh-rejected:invalid_grant` is the case this section
-  covers.
+- `last-outcome` of `refresh-rejected:invalid_grant` (dead lineage) or `no-refresh-token`
+  (a `setup-token` credential 30 days from expiry) is what this section covers. While a
+  refresh still works, `last-outcome` stays `ok` and the warning shows only in
+  `cred-broker.factory.dev/last-detail` (`refresh token expires <date>`).
 
 ### Why the credential dies (Factory#3687)
 
@@ -347,21 +349,22 @@ and opens the issue, which is the yearly reminder.
 Rotate **both** Secrets. `factory-secrets/CLAUDE_CODE_OAUTH_TOKEN` and
 `factory-cli-creds/claude-credentials.json` must carry the same token: the Claude SDK
 reads the mounted **file**, so fixing only the env var looks like it worked and does not.
-Run on p620. Never paste the token into a command line, a log or an issue.
+Run the kubectl steps on the host that has the `k3d-factory` context (p620) and step 3 where you
+edit agenix. Never paste the token into a command line, a log or an issue.
 
 0. Optional: print only the dead credential's refresh expiry date.
 
    ```sh
    kubectl --context k3d-factory -n factory get secret factory-cli-creds \
      -o jsonpath='{.data.claude-credentials\.json}' | base64 -d \
-     | jq -r '.claudeAiOauth.refreshTokenExpiresAt / 1000 | todate'
+     | jq -r '(.claudeAiOauth.refreshTokenExpiresAt // empty) / 1000 | todate'
    ```
 
 1. Mint the token (browser flow, shown once) and hold it without echo or history:
 
-   ```sh
+   ```bash
    claude setup-token
-   read -rs TOK
+   read -rs TOK; test -n "$TOK" || echo "empty: stop"
    ```
 
 2. Patch both Secrets. `expiresAt` is epoch milliseconds, 360 days out, so the broker's
@@ -371,8 +374,8 @@ Run on p620. Never paste the token into a command line, a log or an issue.
    EXP=$(( ($(date +%s) + 360*86400) * 1000 ))
    kubectl --context k3d-factory -n factory patch secret factory-cli-creds \
      --type merge --patch-file /dev/stdin <<EOF
-   {"data":{"claude-credentials.json":"$(jq -cn --arg t "$TOK" --argjson e "$EXP" \
-     '{claudeAiOauth:{accessToken:$t,expiresAt:$e,scopes:["user:inference"]}}' | base64 -w0)"}}
+   {"data":{"claude-credentials.json":"$(printf %s "$TOK" | jq -Rsc --argjson e "$EXP" \
+     '{claudeAiOauth:{accessToken:.,expiresAt:$e,scopes:["user:inference"]}}' | base64 -w0)"}}
    EOF
    kubectl --context k3d-factory -n factory patch secret factory-secrets \
      --type merge --patch-file /dev/stdin <<EOF
@@ -444,10 +447,13 @@ Same two Secrets, same verify and roll steps; only the credential differs.
    EOF
    ```
 
-4. Do steps 3 (agenix), 4 (verify, expect `ok`) and 5 (roll the consumers) above. Put the
-   login date in your calendar: the broker's issue arrives 7 days before the lineage ends.
+4. Do steps 4 (verify, expect `ok`), 5 (roll the consumers) and 6 (TFactory check, close the
+   issue) above. Skip the agenix slots for the credential file: the broker rotates its refresh
+   token every 4h, so a stored copy is dead within hours (set only `CLAUDE_CODE_OAUTH_TOKEN`
+   from the access token if you want it to survive a reboot). Put the login date in your
+   calendar: the broker's issue arrives 7 days before the lineage ends.
 
-### Do not share this credential with a workstation
+### Do not share this credential with a workstation (`auth login` only)
 
 The broker's whole design is that the Secret is the *single* refresher, because
 Anthropic rotates the refresh token on every grant and the loser of that race
