@@ -137,7 +137,7 @@ spec:
 ---
 # Idempotent bucket creation. Runs after MinIO is reachable, creates the
 # `factory-artifacts` bucket if absent (mc mb --ignore-existing) and applies a
-# per-role retention/ILM policy (logs 30d, evidence 90d — conventions §2).
+# per-role retention/ILM policy (logs 30d, evidence 396d — conventions §2).
 # A Job (not initContainer) so it can target the in-cluster Service. ArgoCD
 # re-runs it on hook-changes; `--ignore-existing` keeps it safe to re-apply.
 apiVersion: batch/v1
@@ -266,7 +266,7 @@ spec:
               #
               # Every line below used to end `2>/dev/null || true`: stderr
               # discarded, exit code swallowed. Retention on factory-backups and
-              # factory-evidence — the 14-day backup rule and the 90-day evidence
+              # factory-evidence — the 14-day backup rule and the 396-day evidence
               # floor both cited in the compliance docs — was therefore claimed by
               # a command whose failure was unobservable by construction. A gate
               # that cannot fail (standards 4.7).
@@ -286,9 +286,9 @@ spec:
               #     takes our own stable rule IDs (verified: importing the same
               #     document twice leaves the same rules, not doubled).
               #  2. Each import is read back with `mc ilm export` and the Job
-              #     fails if an expected rule is not there. The IDs come from the
-              #     document we just sent, so their presence is proof the whole
-              #     rule landed, not just its name.
+              #     fails if an expected rule is not there or expires at the wrong day
+              #     count (Factory#3692). The expected values come from the document
+              #     we just sent, so a match is proof the whole rule landed.
               ############################################################
               # Durability: object versioning so an overwrite or delete is
               # recoverable (a prior version survives). Floor for DR alongside the
@@ -310,55 +310,77 @@ spec:
                 esac
               done
 
-              # ilm_apply BUCKET JSON ID...  — import, export, assert each ID.
-              # The IDs come from the document we just sent, so seeing one come
-              # back is proof that whole rule landed, not just its name.
+              # ilm_apply BUCKET JSON ID=DAYS...  — import, export, then assert every exported
+              # rule is one we expect, with the day count we expect (Factory#3692: IDs alone
+              # let a wrong Days value through). POSIX sh only: this image has no grep, sed
+              # or awk, so the export is cut into rule objects by brace depth. A rule's Days
+              # must be followed by , or } so 3960 never satisfies 396.
               ilm_apply() {
                 b="$1"; doc="$2"; shift 2
                 printf '%s' "$doc" | mc ilm import "fac/$b"
                 got="$(mc ilm export "fac/$b")"
-                for id in "$@"; do
-                  case "$got" in
-                    *"\"ID\":\"$id\""*) ;;
-                    *) echo "FATAL: $b lifecycle rule '$id' absent after import" >&2
-                       echo "$got" >&2
-                       exit 1 ;;
+                rest="$got"; depth=0; rule=""; seen=0; ok=0
+                while [ -n "$rest" ]; do
+                  t="${rest#?}"; c="${rest%"$t"}"; rest="$t"
+                  case "$c" in "{") depth=$((depth + 1)) ;; esac
+                  if [ "$depth" -ge 2 ]; then rule="$rule$c"; fi
+                  case "$c" in
+                    "}") depth=$((depth - 1))
+                         if [ "$depth" -eq 1 ]; then
+                           seen=$((seen + 1))
+                           for p in "$@"; do
+                             case "$rule" in
+                               *"\"ID\":\"${p%=*}\""*)
+                                 case "$rule" in
+                                   *"\"Expiration\":{\"Days\":${p#*=},"*|*"\"Expiration\":{\"Days\":${p#*=}}"*) ok=$((ok + 1)) ;;
+                                   *) echo "FATAL: $b rule '${p%=*}' does not expire at ${p#*=} days" >&2
+                                      echo "$got" >&2
+                                      exit 1 ;;
+                                 esac ;;
+                             esac
+                           done
+                           rule=""
+                         fi ;;
                   esac
                 done
+                if [ "$ok" -ne "$#" ] || [ "$seen" -ne "$#" ]; then
+                  echo "FATAL: $b expected $# lifecycle rules ($*), matched $ok of $seen exported" >&2
+                  echo "$got" >&2
+                  exit 1
+                fi
                 echo "ok: $b lifecycle = $*"
               }
 
-              # Artifacts: logs expire after 30d, evidence after 90d (conventions
-              # §2). Evidence referenced by a VAL claim must outlive the claim, so
-              # 90d is a floor, not an aggressive purge. Without these rules
-              # evidence had NO lifecycle guarantee (#313, #321).
+              # Artifacts: logs expire after 30d, evidence after 396d (13 months, the
+              # R-006 treatment floor; conventions §2). Evidence referenced by a VAL
+              # claim must outlive the claim, so this is a floor, not an aggressive
+              # purge. Without these rules evidence had NO lifecycle guarantee
+              # (#313, #321).
               ilm_apply factory-artifacts '{"Rules":[
                 {"ID":"log-pfactory-30d","Status":"Enabled","Expiration":{"Days":30},"Filter":{"And":{"Prefix":"pfactory/","Tags":[{"Key":"role","Value":"log"}]}}},
                 {"ID":"log-aifactory-30d","Status":"Enabled","Expiration":{"Days":30},"Filter":{"And":{"Prefix":"aifactory/","Tags":[{"Key":"role","Value":"log"}]}}},
                 {"ID":"log-tfactory-30d","Status":"Enabled","Expiration":{"Days":30},"Filter":{"And":{"Prefix":"tfactory/","Tags":[{"Key":"role","Value":"log"}]}}},
-                {"ID":"evidence-pfactory-90d","Status":"Enabled","Expiration":{"Days":90},"Filter":{"And":{"Prefix":"pfactory/","Tags":[{"Key":"role","Value":"evidence"}]}}},
-                {"ID":"evidence-aifactory-90d","Status":"Enabled","Expiration":{"Days":90},"Filter":{"And":{"Prefix":"aifactory/","Tags":[{"Key":"role","Value":"evidence"}]}}},
-                {"ID":"evidence-tfactory-90d","Status":"Enabled","Expiration":{"Days":90},"Filter":{"And":{"Prefix":"tfactory/","Tags":[{"Key":"role","Value":"evidence"}]}}}
-              ]}' log-pfactory-30d log-aifactory-30d log-tfactory-30d \
-                  evidence-pfactory-90d evidence-aifactory-90d evidence-tfactory-90d
+                {"ID":"evidence-pfactory-396d","Status":"Enabled","Expiration":{"Days":396},"Filter":{"And":{"Prefix":"pfactory/","Tags":[{"Key":"role","Value":"evidence"}]}}},
+                {"ID":"evidence-aifactory-396d","Status":"Enabled","Expiration":{"Days":396},"Filter":{"And":{"Prefix":"aifactory/","Tags":[{"Key":"role","Value":"evidence"}]}}},
+                {"ID":"evidence-tfactory-396d","Status":"Enabled","Expiration":{"Days":396},"Filter":{"And":{"Prefix":"tfactory/","Tags":[{"Key":"role","Value":"evidence"}]}}}
+              ]}' log-pfactory-30d=30 log-aifactory-30d=30 log-tfactory-30d=30 \
+                  evidence-pfactory-396d=396 evidence-aifactory-396d=396 evidence-tfactory-396d=396
 
               # Backup retention = ~14 dailies. Lifecycle enforces it (no prune
               # step in the CronJob); noncurrent versions reaped a week later so
               # versioning does not grow storage unbounded.
               ilm_apply factory-backups '{"Rules":[
                 {"ID":"backups-14d","Status":"Enabled","Expiration":{"Days":14},"NoncurrentVersionExpiration":{"NoncurrentDays":7},"Filter":{}}
-              ]}' backups-14d
+              ]}' backups-14d=14
 
               # Compliance-evidence bucket: everything in it IS evidence, so one
-              # bucket-wide 90d rule (matching the 90d evidence floor above; #313
-              # #321 #324). Noncurrent versions reaped 30d later so
-              # tamper-recovery is retained without unbounded growth.
-              # ponytail: 90d = the established floor; SOC2's 12-month observation
-              # window wants Days 365 — one-line bump when an audit period is
-              # actually scoped.
+              # bucket-wide 396d rule (13 months, the R-006 treatment floor; #313
+              # #321 #324 #3692). Noncurrent versions reaped 30d later so
+              # tamper-recovery is retained without unbounded growth. Raising Days
+              # never restores objects an earlier 90d rule already expired.
               ilm_apply factory-evidence '{"Rules":[
-                {"ID":"evidence-90d","Status":"Enabled","Expiration":{"Days":90},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"Filter":{}}
-              ]}' evidence-90d
+                {"ID":"evidence-396d","Status":"Enabled","Expiration":{"Days":396},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"Filter":{}}
+              ]}' evidence-396d=396
 
               echo "bucket ready:"; mc ls fac/
           env:
