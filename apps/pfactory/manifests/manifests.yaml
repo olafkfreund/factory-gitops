@@ -286,6 +286,9 @@ spec:
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
+            # Keyed (kid) signing key (Factory#3689, R-013). Optional: unset until the owner has
+            # rolled aifactory with the verification key. A keyed var wins over the legacy one.
+            - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY__2026Q4, valueFrom: { secretKeyRef: { name: factory-secrets, key: PFACTORY_TRUSTED_PLAN_SIGNING_KEY__2026Q4, optional: true } } }
             # Ed25519 Task Contract signing key (TFactory#1432, plan step 7). The seed
             # lives in factory-secrets via agenix; optional so the pod starts before
             # it is seeded (no key = contract ships HMAC-only, TFactory warns).

@@ -349,6 +349,11 @@ spec:
             # Shared HMAC key so PFactory's signed Task Contract verifies in
             # AIFactory's /api/tasks/from-plan (skip-planning fast path) — PARR (#517).
             - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY } } }
+            # Keyed (kid) verification key and its expiry (Factory#3689, R-013). Optional: unset
+            # until the owner seeds the 2026Q4 key, so nothing changes before then. The signer
+            # (pfactory) gets its copy under a separate Secret key, so aifactory can be rolled first.
+            - { name: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY__2026Q4, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY__2026Q4, optional: true } } }
+            - { name: AIFACTORY_TRUSTED_PLAN_EXPIRY, value: "pfactory/2026q4=2027-03-15" }
             # At-rest key for credentials in the JSON settings/profile stores (AIFactory#1799).
             # Unset = plaintext with a warning; existing plaintext values are re-sealed on next save.
             - { name: KMS_FERNET_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: KMS_FERNET_KEY } } }
