@@ -360,10 +360,32 @@ spec:
                 {"ID":"evidence-90d","Status":"Enabled","Expiration":{"Days":90},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"Filter":{}}
               ]}' evidence-90d
 
+              # AIFactory#2023: a non-root MinIO user that the control plane calls
+              # STS AssumeRole with, to mint per-task credentials (session policy
+              # narrows this user's policy further) for build and spec Jobs, so a
+              # Job never holds the root key. Skipped until the owner adds
+              # STS_ACCESS_KEY and STS_SECRET_KEY to minio-creds: inert without them.
+              # The secret rides on mc's argv for the life of this one short Job
+              # (mc has no env or stdin form for `admin user add`).
+              if [ -n "${STS_ACCESS_KEY:-}" ] && [ -n "${STS_SECRET_KEY:-}" ]; then
+                cat > /tmp/aifactory-sts.json <<'POLICY'
+              {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:PutObjectTagging"],"Resource":["arn:aws:s3:::factory-artifacts/aifactory/*"]}]}
+              POLICY
+                mc admin policy create fac aifactory-sts /tmp/aifactory-sts.json
+                mc admin user add fac "$STS_ACCESS_KEY" "$STS_SECRET_KEY"
+                mc admin policy attach fac aifactory-sts --user "$STS_ACCESS_KEY"
+                echo "aifactory-sts user ready"
+              else
+                echo "STS_ACCESS_KEY/STS_SECRET_KEY not set: aifactory-sts user skipped"
+              fi
+
               echo "bucket ready:"; mc ls fac/
           env:
             - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
             - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+            # AIFactory#2023: optional; absent keys skip the STS user above.
+            - { name: STS_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: STS_ACCESS_KEY, optional: true } } }
+            - { name: STS_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: STS_SECRET_KEY, optional: true } } }
             # mc reads MC_HOST_<alias> for the `fac` alias, so the credential
             # never reaches argv. $(VAR) is kubelet env expansion, not shell.
             - { name: MC_HOST_fac, value: "http://$(S3_ACCESS_KEY):$(S3_SECRET_KEY)@minio.factory.svc.cluster.local:9000" }
