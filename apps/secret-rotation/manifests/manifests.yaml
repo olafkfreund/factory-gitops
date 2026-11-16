@@ -1,0 +1,110 @@
+# Secret rotation age report (Factory#314). Reports, never rotates.
+#
+# Daily: reads the metadata annotation rotation.factory.dev/rotated-at of each Secret below
+# (PartialObjectMetadata GETs, so no Secret value reaches the pod), writes one `job_health`
+# record per Secret to OpenObserve and opens one issue per overdue Secret. job-watchdog
+# watches this CronJob like every other. Policy: Factory docs/compliance/policies/key-rotation.md;
+# stamp procedure: docs/secrets-management.md "Rotation age report".
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: secret-rotation-report
+  namespace: factory
+---
+# `get` returns values for a full read; the script only asks for metadata and refuses a response
+# that carries data (test_report.py). Read-only, exactly these names, no list/watch.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-rotation-report
+  namespace: factory
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames:
+      - cfactory-api-keys
+      - factory-cli-creds
+      - factory-db-aifactory
+      - factory-db-pfactory
+      - factory-db-tfactory
+      - factory-secrets
+      - minio-creds
+      - oauth2-proxy-cfactory
+      - oauth2-proxy-observe
+      - oauth2-proxy-odin
+      - observe-root
+      - odin-ssh-key
+      - otel-otlp-auth
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: secret-rotation-report
+  namespace: factory
+subjects:
+  - kind: ServiceAccount
+    name: secret-rotation-report
+    namespace: factory
+roleRef:
+  kind: Role
+  name: secret-rotation-report
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: secret-rotation-report
+  namespace: factory
+  labels: { app: secret-rotation-report }
+spec:
+  schedule: "0 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  # Ten failed runs kept so a recurring failure can be read (Factory#381).
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      # 0: a retry would write a second set of job_health records for one day.
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        metadata: { labels: { app: secret-rotation-report } }
+        spec:
+          # Never, not OnFailure: failed pods must stay readable (Factory#438).
+          restartPolicy: Never
+          enableServiceLinks: false
+          serviceAccountName: secret-rotation-report
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: report
+              image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+              command: ["python3", "/script/report.py"]
+              env:
+                - { name: PYTHONDONTWRITEBYTECODE, value: "1" }
+                - { name: ALERT_REPO, value: olafkfreund/Factory }
+                - name: OO_USER
+                  valueFrom: { secretKeyRef: { name: observe-root, key: email } }
+                - name: OO_PASS
+                  valueFrom: { secretKeyRef: { name: observe-root, key: password } }
+                # Optional: without it the issues are off and the job_health records still flow.
+                - name: GITHUB_TOKEN
+                  valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN, optional: true } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { cpu: 200m, memory: 128Mi }
+              volumeMounts:
+                - { name: script, mountPath: /script, readOnly: true }
+          volumes:
+            - name: script
+              configMap:
+                name: secret-rotation-report-script

@@ -161,6 +161,9 @@ General shape for the manual (agenix) secrets:
    `kubectl -n factory rollout restart deploy/<svc> statefulset/<svc>`.
 5. Where the credential is external (GitHub PAT, an LLM API key), revoke the old
    one at the provider **after** the new one is confirmed working.
+6. Stamp the Secret (see [Rotation age report](#rotation-age-report)) and update the
+   ledger row in the same window. Re-stamp after any recreate of the Secret, because a
+   recreate drops the annotation.
 
 ### Per-secret specifics
 
@@ -214,6 +217,30 @@ confirmed leak (including a value seen in a log, an annotation or a
 recipient that could decrypt it (see [Decryption-key custody](#decryption-key-custody));
 departure of anyone who held it; a provider notice. A compromise-only row still
 rotates on these triggers. It just has no schedule.
+
+### Rotation age report
+
+The CronJob `secret-rotation-report` (`apps/secret-rotation`, daily 06:00 UTC) reads one
+metadata annotation per Secret in `factory`, compares its age to the policy, writes one
+`job_health` record per Secret (`kind: secret_rotation`) and opens one GitHub issue (label
+`secret-rotation`) per overdue Secret. It never rotates anything and never reads a value: it asks the API
+for metadata only. Policy and owners: Factory
+[`docs/compliance/policies/key-rotation.md`](https://github.com/olafkfreund/Factory/blob/main/docs/compliance/policies/key-rotation.md).
+
+After a rotation, stamp the Secret with the **oldest evidenced last-rotated date among every
+credential still in it that has a scheduled interval** (not the compromise-only `CFACTORY_AUDIT_HMAC_SECRET`), taken from the ledger rows (not necessarily today: rotating the oldest key
+leaves the next-oldest as the stamp):
+
+```bash
+kubectl --context k3d-factory -n factory annotate secret <name> --overwrite \
+  rotation.factory.dev/rotated-at=<YYYY-MM-DD>
+```
+
+Stamping without a rotation does not make a credential newer, it only silences the report; the ledger
+is the record. An unstamped Secret is measured from the policy start (2026-11-07). Max age is 90 days for
+`factory-secrets` (API tokens, runbook R-016) and 365 days for the other listed Secrets; the ledger
+rows for tokens inside `factory-secrets` still say 365 and should be aligned by the owner. Read the
+latest result with `kubectl -n factory logs job/<latest secret-rotation-report job>` or the `job_health` stream.
 
 ## Rotation ledger
 
