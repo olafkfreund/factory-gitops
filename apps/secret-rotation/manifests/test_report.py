@@ -91,7 +91,8 @@ import tempfile
 import ssl
 
 d = tempfile.mkdtemp()
-open(f"{d}/token", "w").write("tok")
+with open(f"{d}/token", "w") as fh:
+    fh.write("tok")
 importlib.reload(report)
 report.SA = d
 ssl.create_default_context = lambda cafile=None: None
