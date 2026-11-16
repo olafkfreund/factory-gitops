@@ -116,7 +116,7 @@ Two consequences to expect, both benign:
 Audit at any time — this must print nothing:
 
 ```bash
-kubectl --context factory get secrets -A -o json | jq -r '
+kubectl --context k3d-factory get secrets -A -o json | jq -r '
   .items[]
   | select(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")
   | select(.type != "kubernetes.io/service-account-token")
@@ -276,7 +276,7 @@ or fingerprints belong in this repo.
   survives — update `secrets.nix` and re-key with `agenix -r`.
 - **Loss of all identities:** before any cluster rebuild, a recovery window
   remains through the live Kubernetes Secrets still present in etcd
-  (`kubectl --context factory -n factory get secret ... -o yaml`), which can be
+  (`kubectl --context k3d-factory -n factory get secret ... -o yaml`), which can be
   used to re-seed agenix under new recipient keys. If that window closes, every
   `factory-secret-*.age` is unreadable and the MinIO KEK, and with it every
   encrypted object, is gone.
@@ -294,13 +294,20 @@ or fingerprints belong in this repo.
 
 ## Re-seeding the Claude OAuth credential
 
+The broker opens a GitHub issue (label `cred-broker`, on `ALERT_REPO`) on the first
+refresh rejected with `invalid_grant`, and on any other failed refresh while the
+access token has `ALERT_WITHIN_HOURS` (default 5) or less left. The body carries
+`last-outcome`, `access-expires-at` and these steps (Factory#3687). It needs
+`factory-secrets/GITHUB_TOKEN`; without it the broker logs `alerting inert` and still
+rotates. It raises nothing for a long-lived credential (more than 30 days left).
+
 ### First: read what the broker already told you
 
 Since Factory#437 the broker records every run on the Secret itself, so this
 works with no surviving pod:
 
 ```sh
-kubectl --context factory -n factory get secret factory-cli-creds \
+kubectl --context k3d-factory -n factory get secret factory-cli-creds \
   -o jsonpath='{.metadata.annotations.cred-broker\.factory\.dev/last-outcome}{"\n"}{.metadata.annotations.cred-broker\.factory\.dev/access-expires-at}{"\n"}'
 ```
 
@@ -342,7 +349,7 @@ it worked and does not.
    codex/copilot/gemini keys. Keep the value off the command line:
 
    ```sh
-   kubectl --context factory -n factory patch secret factory-cli-creds \
+   kubectl --context k3d-factory -n factory patch secret factory-cli-creds \
      --type merge --patch-file /dev/stdin <<EOF
    {"data":{"claude-credentials.json":"$(base64 -w0 ~/.claude/.credentials.json)"}}
    EOF
@@ -351,7 +358,7 @@ it worked and does not.
 3. Patch the matching access token into `factory-secrets`:
 
    ```sh
-   kubectl --context factory -n factory patch secret factory-secrets \
+   kubectl --context k3d-factory -n factory patch secret factory-secrets \
      --type merge --patch-file /dev/stdin <<EOF
    {"data":{"CLAUDE_CODE_OAUTH_TOKEN":"$(python3 -c 'import json,base64,os;print(base64.b64encode(json.load(open(os.path.expanduser("~/.claude/.credentials.json")))["claudeAiOauth"]["accessToken"].encode()).decode())')"}}
    EOF
@@ -360,8 +367,10 @@ it worked and does not.
 4. Confirm the broker before waiting 4h for the schedule:
 
    ```sh
-   kubectl --context factory -n factory create job cred-broker-verify --from=cronjob/cred-broker
-   kubectl --context factory -n factory get secret factory-cli-creds \
+   J=cred-broker-verify-$(date +%s)   # fresh name: a reused one can show an old `ok`
+   kubectl --context k3d-factory -n factory create job $J --from=cronjob/cred-broker
+   kubectl --context k3d-factory -n factory wait --for=condition=complete job/$J --timeout=120s
+   kubectl --context k3d-factory -n factory get secret factory-cli-creds \
      -o jsonpath='{.metadata.annotations.cred-broker\.factory\.dev/last-outcome}{"\n"}'
    ```
 
@@ -371,7 +380,7 @@ it worked and does not.
 5. Bounce the consumers so they re-seed from the mount:
 
    ```sh
-   kubectl --context factory -n factory rollout restart deploy/pfactory deploy/tfactory deploy/aifactory
+   kubectl --context k3d-factory -n factory rollout restart deploy/pfactory deploy/tfactory deploy/aifactory
    ```
 
 ### Do not share this credential with a workstation
