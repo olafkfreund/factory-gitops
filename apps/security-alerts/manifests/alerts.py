@@ -96,10 +96,10 @@ def gh(method, path, body=None):
 
 
 def open_issues(firing):
-    """One issue per firing rule while none is open. Never changes the exit code."""
+    """One issue per firing rule while none is open. True unless a GitHub call failed."""
     if not os.environ.get("GITHUB_TOKEN"):
         eprint("issues inert: no GITHUB_TOKEN")
-        return
+        return True
     try:
         try:
             gh("POST", f"/repos/{ALERT_REPO}/labels", {
@@ -124,7 +124,9 @@ def open_issues(firing):
                         f"is open."})
             eprint(f"ALERTED: opened {ALERT_REPO}#{new['number']} for {rule}")
     except Exception as e:  # noqa: BLE001
-        eprint(f"warn: could not raise the issue: {type(e).__name__}")
+        eprint(f"issue delivery: {type(e).__name__}")
+        return False
+    return True
 
 
 def page(firing):
@@ -134,11 +136,11 @@ def page(firing):
         return True
     ok = True
     for rule, n, threshold in firing:
-        req = urllib.request.Request(
-            url, data=json.dumps({"text": f"security-alert {rule}: {n} in {WINDOW_S // 60} min "
-                                          f"(threshold {threshold})", "dedup_key": rule}).encode(),
-            headers={"content-type": "application/json"}, method="POST")
-        try:
+        try:  # building the request can raise with the URL in the message: keep it inside
+            req = urllib.request.Request(
+                url, data=json.dumps({"text": f"security-alert {rule}: {n} in {WINDOW_S // 60} min "
+                                              f"(threshold {threshold})", "dedup_key": rule}).encode(),
+                headers={"content-type": "application/json"}, method="POST")
             urllib.request.urlopen(req, timeout=30).close()
         except Exception as e:  # noqa: BLE001  never print the URL
             eprint(f"page {rule}: {type(e).__name__}")
@@ -170,8 +172,8 @@ def main():
     except Exception as e:  # noqa: BLE001
         eprint(f"emit: {type(e).__name__}")
         rc = 1
-    open_issues(firing)
-    if not page(firing):
+    ok_issue, ok_page = open_issues(firing), page(firing)
+    if not (ok_issue and ok_page):
         rc = 1
     return rc
 

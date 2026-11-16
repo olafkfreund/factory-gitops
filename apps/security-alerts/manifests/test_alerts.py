@@ -89,4 +89,21 @@ assert len(posts) == 1 and b'"dedup_key": "auth_failure_spike"' in posts[0].data
 alerts.urllib.request.urlopen = lambda req, timeout=0: (_ for _ in ()).throw(OSError())
 os.environ["ALERT_WEBHOOK_URL"] = "http://hook.invalid/x"
 assert alerts.page([("r", 1, 1)]) is False
+# a malformed URL fails the delivery without raising or printing the URL
+os.environ["ALERT_WEBHOOK_URL"] = "not a url SECRETVALUE"
+alerts.urllib.request.urlopen = lambda req, timeout=0: None
+import io, contextlib
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf):
+    assert alerts.page([("r", 1, 1)]) is False
+assert "SECRETVALUE" not in buf.getvalue()
+# a failing GitHub call exits 1
+os.environ.pop("ALERT_WEBHOOK_URL")
+def boom(*a, **k):
+    raise OSError()
+alerts.gh = boom
+os.environ["GITHUB_TOKEN"] = "t"
+alerts.count = lambda sql: 50
+alerts.emit = lambda recs: True
+assert alerts.main() == 1
 print("ok")
