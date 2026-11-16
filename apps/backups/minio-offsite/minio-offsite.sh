@@ -27,6 +27,57 @@ mc alias set fac "${SOURCE_ENDPOINT:-http://minio.factory.svc.cluster.local:9000
 mc alias set off "$OFFSITE_S3_ENDPOINT" "$OFFSITE_S3_ACCESS_KEY" \
   "$OFFSITE_S3_SECRET_KEY" >/dev/null 2>&1 || fail 'destination alias failed'
 
+if [ -n "${OFFSITE_AGE_RECIPIENT:-}" ]; then
+  # Encrypted copy (Factory#3691): one age-encrypted tar.gz snapshot per bucket
+  # per UTC day (current object versions only). age output differs on every run,
+  # so a snapshot already there is checked, never re-encrypted or overwritten.
+  case "$OFFSITE_AGE_RECIPIENT" in
+    age1*[!a-z0-9]*|age1) fail 'OFFSITE_AGE_RECIPIENT is not an age public key' ;;
+    age1*) ;;
+    *) fail 'OFFSITE_AGE_RECIPIENT is not an age public key' ;;
+  esac
+  AGE_BIN=${AGE_BIN:-$SCRATCH/bin/age}
+  [ -x "$AGE_BIN" ] || fail 'age binary missing (init container did not run)'
+  day="$(date -u +%Y%m%d)"
+  for bucket in factory-artifacts factory-evidence; do
+    dest="off/$OFFSITE_S3_BUCKET/minio/$bucket/snapshots"
+    file="$bucket-$day.tar.gz.age"
+    # A prefix that does not exist yet may list as an error: then the bucket itself must list.
+    listing="$(mc ls "$dest/" 2>/dev/null)" || {
+      mc ls "off/$OFFSITE_S3_BUCKET/" >/dev/null 2>&1 || fail 'destination listing failed'
+      listing=
+    }
+    has() { printf '%s\n' "$listing" | awk -v n="$1" '$NF == n { f = 1 } END { exit !f }'; }
+    if has "$file"; then
+      mc cat "$dest/$file" > "$SCRATCH/readback.age" || fail "read-back of $file failed"
+      [ -s "$SCRATCH/readback.age" ] || fail "$file at the destination is empty"
+      [ "$(head -n 1 "$SCRATCH/readback.age")" = age-encryption.org/v1 ] || fail "$file at the destination is not an age file"
+      hash="$(sha256sum "$SCRATCH/readback.age" | cut -d ' ' -f 1)" || fail 'destination hash failed'
+      if has "$file.sha256"; then
+        want="$(mc cat "$dest/$file.sha256" | cut -d ' ' -f 1)" || fail 'checksum read failed'
+        [ "$want" = "$hash" ] || fail "$file differs from its checksum file"
+      else
+        printf 'minio-offsite: WARN no checksum file for %s\n' "$file" >&2
+      fi
+      rm -f "$SCRATCH/readback.age"
+    else
+      rm -rf "$SCRATCH/snap"; mkdir -p "$SCRATCH/snap/$bucket"
+      mc mirror "fac/$bucket" "$SCRATCH/snap/$bucket" >/dev/null || fail "mirror of $bucket failed"
+      tar -C "$SCRATCH/snap" -cf - "$bucket" | gzip | "$AGE_BIN" -r "$OFFSITE_AGE_RECIPIENT" -o "$SCRATCH/$file" || fail "encrypting $bucket failed"
+      rm -rf "$SCRATCH/snap"
+      [ -s "$SCRATCH/$file" ] || fail "encrypted $bucket snapshot is empty"
+      hash="$(sha256sum "$SCRATCH/$file" | cut -d ' ' -f 1)" || fail 'local hash failed'
+      mc cp "$SCRATCH/$file" "$dest/$file" >/dev/null || fail "upload of $file failed"
+      back="$(mc cat "$dest/$file" | sha256sum | cut -d ' ' -f 1)" || fail "read-back of $file failed"
+      [ "$back" = "$hash" ] || fail "$file at the destination differs from the local copy"
+      printf '%s\n' "$hash" | mc pipe "$dest/$file.sha256" >/dev/null || fail 'checksum upload failed'
+      rm -f "$SCRATCH/$file"
+    fi
+    printf 'minio-offsite: OK bucket=%s encrypted=age sha256=%s\n' "$bucket" "$hash"
+  done
+  exit 0
+fi
+
 # factory-backups is not here: the postgres dumps have their own copy (#3681).
 for bucket in factory-artifacts factory-evidence; do
   dest="off/$OFFSITE_S3_BUCKET/minio/$bucket"

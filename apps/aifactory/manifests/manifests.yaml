@@ -654,6 +654,16 @@ spec:
             - { name: S3_BUCKET, value: "factory-artifacts" }
             - { name: S3_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_ACCESS_KEY } } }
             - { name: S3_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: S3_SECRET_KEY } } }
+            # AIFactory#2023: per-task MinIO STS credentials for build and spec Jobs,
+            # so a Job never holds the bucket-wide key above. OFF until the owner
+            # (1) adds STS_ACCESS_KEY/STS_SECRET_KEY to minio-creds, (2) resyncs the
+            # minio app so the minio-create-bucket hook creates the user and logs
+            # "aifactory-sts user ready", (3) flips the flag to "true" and restarts
+            # aifactory, then (4) runs one build and one spec Job. Keys are
+            # optional: absent keys leave the flag unusable, not the pod broken.
+            - { name: AIFACTORY_SCOPED_JOB_S3, value: "false" }
+            - { name: S3_STS_ACCESS_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: STS_ACCESS_KEY, optional: true } } }
+            - { name: S3_STS_SECRET_KEY, valueFrom: { secretKeyRef: { name: minio-creds, key: STS_SECRET_KEY, optional: true } } }
             # RFC-0017 #190 (Stage E) FLIP: turn ON workspace packing. The build
             # producer (build_backend) now packs the populated /work to MinIO and
             # threads the s3:// URI onto the Job's WORKSPACE_URI; the Job drops the

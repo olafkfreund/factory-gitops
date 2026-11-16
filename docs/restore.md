@@ -72,7 +72,7 @@ survive losing the site.
 
 Secret `offsite-s3-creds` (namespace `factory`), keys: `OFFSITE_S3_ENDPOINT`
 (must start with `https://`), `OFFSITE_S3_BUCKET`, `OFFSITE_S3_ACCESS_KEY`,
-`OFFSITE_S3_SECRET_KEY`. Seed it the way `docs/secrets-management.md` describes,
+`OFFSITE_S3_SECRET_KEY`, and optionally `OFFSITE_AGE_RECIPIENT` (see "Encrypting the copy"). Seed it the way `docs/secrets-management.md` describes,
 then add a row for it to that file's inventory and rotation ledger.
 
 Enable: add `- ../offsite` to `apps/backups/manifests/kustomization.yaml` in a PR,
@@ -95,12 +95,41 @@ gunzip -c factory-cluster-<ts>.sql.gz | psql -h postgres -U factory -d postgres 
 This path has not been drilled. Read the role-password finding from the
 2026-08-10 drill (Factory#321) first.
 
+### Encrypting the copy (decided under owner delegation, 2026-11-16)
+
+Both off-site jobs can encrypt every upload with [age](https://github.com/FiloSottile/age)
+to a public key. It is off until `OFFSITE_AGE_RECIPIENT` is set. Without it the
+jobs behave exactly as described above.
+
+- Postgres: `postgres/<dump>.age` plus `postgres/<dump>.age.sha256`.
+- MinIO: one snapshot per bucket per UTC day,
+  `minio/<bucket>/snapshots/<bucket>-<YYYYMMDD>.tar.gz.age` (current object
+  versions only) plus a `.sha256`. Keep a destination lifecycle of about 90 days:
+  every snapshot is a full copy.
+- An init container downloads age v1.3.2 (sha256 pinned in `fetch-age.sh`) from
+  github.com, so the pod needs HTTPS egress to it. If that fails the Job fails
+  and nothing is uploaded.
+- age output is different on every run, so an object that is already at the
+  destination is never re-encrypted or overwritten: it is checked for the age
+  header and, if a `.sha256` file exists, for a matching hash.
+- The jobs cannot decrypt, so they check the ciphertext hash, not the content.
+
+Owner steps (nothing here is done by an agent):
+
+1. Mint the key pair on a machine you trust and back the private key up offline
+   BEFORE enabling (a lost private key makes every encrypted copy unreadable):
+   `age-keygen -o offsite-backup.key` (it prints the public key, `age1...`).
+   Store `offsite-backup.key` offline, in two places. Never commit it.
+2. Add the public key to the Secret, with the other four keys:
+   `OFFSITE_AGE_RECIPIENT=age1...`.
+3. Restore check: `age -d -i offsite-backup.key factory-cluster-<ts>.sql.gz.age | gunzip -c | head`
+   (Postgres) or `age -d -i offsite-backup.key <snapshot>.tar.gz.age | tar -tzf - | head`
+   (MinIO), on a machine that never saw the key in the cluster.
+
 Still open:
 
-- Dumps are not encrypted client-side. The pinned image has no `openssl`, `gpg`
-  or `age`. Adding one means another image and a key that must be at hand during
-  a restore. Owner's decision.
-- `factory-artifacts` has no off-cluster copy.
+- `factory-artifacts` and `factory-evidence` are copied by `minio-offsite` once
+  deployed (Factory#3691); `factory-backups` has the Postgres copy only.
 - A restore from the off-cluster copy has not been drilled (Factory#3681).
 
 ## Scheduled restore drill and MinIO off-site copy (Factory#3691)
