@@ -24,13 +24,13 @@ u1,owner,true
 u2,alice,true
 u3,bob,true
 u4,gone,false
-u5,service-account-x,true
+u5,service-account-human,true
 u6,carol,true
 u7,breakglass,true
 USERS
 for u in u1 u6; do printf 'password\notp\n' >"$FIX/creds-$u"; done      # enrolled
-printf 'password\n' >"$FIX/creds-u2"; printf 'password\n' >"$FIX/creds-u3"; printf 'password\n' >"$FIX/creds-u7"
-for u in u1 u2 u6 u7; do printf '\n' >"$FIX/actions-$u"; done
+printf 'password\n' >"$FIX/creds-u2"; printf 'password\n' >"$FIX/creds-u5"; printf 'password\n' >"$FIX/creds-u3"; printf 'password\n' >"$FIX/creds-u7"
+for u in u1 u2 u5 u6 u7; do printf '\n' >"$FIX/actions-$u"; done
 printf 'UPDATE_PASSWORD,CONFIGURE_TOTP\n' >"$FIX/actions-u3"              # bob already has it
 fail() { echo "FAIL $1"; cat "$LOG" 2>/dev/null; cat "$tmp/out" 2>/dev/null; exit 1; }
 run() { : >"$LOG"; env "$@" sh "$here/keycloak-mfa.sh" >"$tmp/out" 2>&1; }
@@ -38,10 +38,11 @@ writes() { grep -c '^update ' "$LOG" || true; }
 
 run MFA_MODE=audit || fail "audit exit"
 [ "$(writes)" = 0 ] || fail "audit wrote"
-grep -q 'without_second_factor=3' "$tmp/out" && grep -q 'no second factor: alice' "$tmp/out" || fail "audit report"
-! grep -q 'gone\|service-account' "$tmp/out" || fail "audit listed disabled or service user"
+grep -q 'without_second_factor=4' "$tmp/out" && grep -q 'no second factor: alice' "$tmp/out" || fail "audit report"
+! grep -q 'gone' "$tmp/out" || fail "audit listed a disabled user"
+grep -q 'service-account-human' "$tmp/out" || fail "a human named service-account-* was skipped"
 ! grep -q hunter2-sentinel "$tmp/out" || fail "password echoed"
-echo "PASS audit writes nothing, reports 3"
+echo "PASS audit writes nothing, reports 4"
 
 run MFA_MODE=new-users || fail "new-users exit"
 [ "$(writes)" = 1 ] && grep -q '^update authentication/required-actions/CONFIGURE_TOTP .*defaultAction=true' "$LOG" || fail "new-users writes"
@@ -58,10 +59,15 @@ echo "PASS enforce refuses without an enrolled MFA_REQUIRE_ENROLLED user"
 run MFA_MODE=enforce MFA_REQUIRE_ENROLLED=owner,carol MFA_EXEMPT_USERS=breakglass || fail "enforce exit"
 grep -q '^update users/u2 .*requiredActions+=CONFIGURE_TOTP' "$LOG" || fail "alice not assigned"
 ! grep -q '^update users/u3' "$LOG" || fail "bob already has it, must not be updated"
-! grep -qE '^update users/(u1|u4|u5|u6|u7)' "$LOG" || fail "wrong user updated"
-[ "$(writes)" = 2 ] || fail "expected action definition plus one user, got $(writes)"
+grep -q '^update users/u5 ' "$LOG" || fail "human named service-account-* not assigned"
+! grep -qE '^update users/(u1|u4|u6|u7)' "$LOG" || fail "wrong user updated"
+[ "$(writes)" = 3 ] || fail "expected action definition plus two users, got $(writes)"
 grep -q 'exempt: breakglass' "$tmp/out" || fail "exempt not reported"
 echo "PASS enforce updates only unenrolled, non-exempt, enabled users"
+
+run MFA_MODE=enforce MFA_REQUIRE_ENROLLED=o.ner && fail "regex match let a lookalike satisfy the owner guard" || :
+[ "$(writes)" = 0 ] || fail "lookalike guard wrote"
+echo "PASS the owner guard matches names literally"
 
 run MFA_MODE=bogus && fail "bogus mode accepted" || :
 [ ! -s "$LOG" ] || fail "bogus mode called kcadm"

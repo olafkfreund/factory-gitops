@@ -1,5 +1,6 @@
 #!/bin/sh
 # Keycloak MFA ladder for realm "factory" (Factory#312). Modes: see cronjob.yaml.
+# Service-account users are not listed by the Keycloak users API, so no name-based skip.
 # Reads everything first and writes only afterwards, so a failed read leaves the
 # realm untouched. Never removes an action or a credential; never touches master.
 set -eu
@@ -38,7 +39,6 @@ kc get users -r "$REALM" -q "max=$MAX_USERS" --fields id,username,enabled --form
 while IFS=, read -r id name enabled; do
   [ -n "$id" ] || continue
   [ "$enabled" = true ] || continue
-  case "$name" in service-account-*) continue ;; esac
   kc get "users/$id/credentials" -r "$REALM" --fields type --format csv --noquotes \
     >"$W/creds" || die "credentials of a user"
   if grep -qxE 'otp|webauthn|webauthn-passwordless' "$W/creds"; then
@@ -58,7 +58,7 @@ cut -d, -f2 "$W/unenrolled" | sed 's/^/  no second factor: /'
 if [ "$MODE" = enforce ]; then
   [ -n "$REQUIRE" ] || die "enforce needs MFA_REQUIRE_ENROLLED (the owner): nothing written"
   for u in $(printf %s "$REQUIRE" | tr ',' ' '); do
-    grep -qx "$u" "$W/enrolled" || die "MFA_REQUIRE_ENROLLED user '$u' has no second factor (or is not an enabled user): nothing written"
+    grep -Fxq -- "$u" "$W/enrolled" || die "MFA_REQUIRE_ENROLLED user '$u' has no second factor (or is not an enabled user): nothing written"
   done
 fi
 
