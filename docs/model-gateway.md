@@ -22,9 +22,11 @@ token, only the gateway holds the upstream provider key. Image signatures are ve
 ```bash
 # 1. two new random values; the client token is shared with factory-secrets
 umask 077; d=$(mktemp -d /dev/shm/gw.XXXXXX)
-openssl rand -hex 32 > "$d/client"
-# put the Ollama Cloud key issued FOR THE GATEWAY (not a copy of OLLAMA_API_KEY) in $d/upstream
-$EDITOR "$d/upstream"
+openssl rand -hex 32 | tr -d '\n' > "$d/client"
+# put the Ollama Cloud key issued FOR THE GATEWAY (not a copy of OLLAMA_API_KEY) in $d/upstream,
+# then strip the newline: the gateway compares both values verbatim, so a trailing newline
+# makes every client call fail with 401
+$EDITOR "$d/upstream"; tr -d '\n' < "$d/upstream" > "$d/upstream.n"; mv "$d/upstream.n" "$d/upstream"
 kubectl -n gateway create secret generic model-gateway-secrets \
   --from-file=GATEWAY_CLIENT_TOKEN="$d/client" --from-file=GATEWAY_UPSTREAM_API_KEY="$d/upstream"
 # 2. the same client token as MODEL_GATEWAY_CLIENT_TOKEN in factory/factory-secrets,
