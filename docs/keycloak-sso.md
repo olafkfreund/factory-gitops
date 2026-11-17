@@ -246,7 +246,24 @@ Rollback:
 - Withdraw an assigned action from one user: admin console, Users, the user, Required user actions, remove "Configure OTP" only. Do not set `requiredActions=[]`: it also clears password-change and email-verification actions.
 - A locked-out user is recovered by the `master` realm admin (`KEYCLOAK_ADMIN_PASSWORD`), which this job never changes.
 
-Known limits: this ladder guarantees that every enabled user **enrolls** an authenticator. It does not by itself add an OTP challenge to every GitHub-brokered login: a broker login that already has a Keycloak session or goes through the first-broker-login flow only sees the enrollment prompt once, and a post-broker-login flow with a conditional OTP step is not installed (tracked as a follow-up, R-010). Until then the upstream GitHub account's own MFA is the second factor for brokered users. The array-append used by `enforce` (`-s 'requiredActions+=CONFIGURE_TOTP'`) has not been exercised against the pinned Keycloak 26.1 image, so the first `enforce` run is also its test (a failed update fails the job and the watchdog reports it). WebAuthn registration as an alternative second factor is a follow-up, and a declarative realm export (R-010's other half) is not covered.
+### Conditional OTP on every brokered login (Factory#3781)
+
+`apps/keycloak-broker-otp` is a second daily CronJob, default `BROKER_OTP_MODE: audit` (writes nothing). It installs the post-broker-login flow `post-broker-otp` (declared in `apps/keycloak-broker-otp/manifests/post-broker-otp.realm.json`) and binds it to the `github` identity provider: a user **with** an OTP credential is asked for a code on every brokered login; a user **without** one is not blocked (the ladder above makes them enrol).
+
+| mode | writes |
+|---|---|
+| `audit` (default) | nothing; logs `flow_present=yes/no/drift` and the flow the IdP uses |
+| `install` | the flow, if absent; no login changes |
+| `bind` | install, then binds the flow to the IdP; refuses to replace another flow or a hand-edited one |
+| `unbind` | clears the binding if it is ours; works even if the flow was edited by hand |
+
+Owner steps, in order (one PR each): (1) log in to the `master` realm admin console with the local admin password and create your break-glass account there; the `master` realm has no GitHub IdP, so it does not depend on GitHub or OTP; (2) enrol your own authenticator; (3) read the `audit` log; (4) `install`; (5) `bind`; (6) log in through GitHub with a throwaway account that has an authenticator: you must be asked for a code, and a wrong code must be refused.
+
+Rollback: set `BROKER_OTP_MODE: unbind` (or `audit`) in git and let Argo sync. A direct `kcadm.sh update identity-provider/instances/github -r factory -s postBrokerLoginFlowAlias=` is an emergency step only and must be followed by that git change, because a job still set to `bind` binds again on its next run. A user who lost the authenticator is reset in the `master` realm admin console (Users, Credentials, delete the OTP).
+
+Tested on the pinned Keycloak 26.1 image in a throwaway container with a stand-in upstream IdP (`apps/keycloak-broker-otp/manifests/e2e-local.sh`, also a PR workflow): the flow builds and is idempotent; users without OTP pass, users with OTP are challenged, a wrong code is refused; `unbind` restores the plain login; `-s 'requiredActions+=CONFIGURE_TOTP'` appends, keeps `UPDATE_PASSWORD` and adds no duplicate; a brokered login with `CONFIGURE_TOTP` pending is sent to OTP enrolment. **Not tested:** the real GitHub IdP. The throwaway-account login in step (6) is that test and is the owner's.
+
+Known limits: the ladder guarantees that every enabled user **enrols** an authenticator; the flow above adds the per-login challenge. A user with a Keycloak session does not see the challenge again until the session ends. WebAuthn registration as an alternative second factor is a follow-up.
 
 ## Troubleshooting (hard-won)
 
