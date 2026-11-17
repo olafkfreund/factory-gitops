@@ -1,0 +1,24 @@
+# Factory#3781: builds the post-broker OTP flow in a THROWAWAY Keycloak container and
+# logs in through a stand-in upstream IdP. Never touches the cluster. Paths-filtered:
+# it needs docker and a ~400 MB image pull, so it is not a required check.
+name: keycloak broker otp e2e
+
+on:
+  pull_request:
+    paths:
+      - apps/keycloak-broker-otp/**
+      - apps/keycloak-mfa/manifests/keycloak-mfa.sh
+      - .github/workflows/keycloak-broker-otp-e2e.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: flow, conditional otp, requiredActions append
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash apps/keycloak-broker-otp/manifests/e2e-local.sh

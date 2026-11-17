@@ -1,0 +1,71 @@
+################################################################################
+# Post-broker-login conditional OTP for the GitHub identity provider of realm
+# "factory" (Factory#3781, R-010). The flow itself is post-broker-otp.realm.json.
+#
+# BROKER_OTP_MODE (change it here, in git):
+#   audit    DEFAULT. Writes nothing. Logs whether the flow exists and is bound.
+#   install  Creates the flow if absent (unbound: no login changes). A flow that
+#            exists but differs from the JSON is refused, never edited.
+#   bind     As install, plus sets it as the IdP's post-broker-login flow. Users
+#            WITH an otp credential are then asked for a code on every brokered
+#            login; users without one are not challenged (enrollment is the
+#            keycloak-mfa job's CONFIGURE_TOTP). Refuses to replace another flow.
+#   unbind   Clears the IdP binding if it is ours. The flow stays.
+# The master realm (recovery, break-glass admins) is never touched.
+# Credentials (reused, none new): factory-secrets/KEYCLOAK_ADMIN_PASSWORD.
+# Rollback and owner steps: docs/keycloak-sso.md, "MFA".
+################################################################################
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: keycloak-broker-otp
+  namespace: factory
+  labels: { app: keycloak-broker-otp }
+spec:
+  schedule: "40 5 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 900
+      template:
+        metadata: { labels: { app: keycloak-broker-otp } }
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+            - name: broker-otp
+              image: quay.io/keycloak/keycloak:26.1@sha256:be6a86215213145bfb4fb3e2b3ab982a806d00262655abdcf3ffa6a38d241c7c
+              command: ["/bin/sh", "/script/keycloak-broker-otp.sh"]
+              env:
+                - { name: BROKER_OTP_MODE, value: "audit" }
+                - { name: BROKER_IDP_ALIAS, value: "github" }
+                - { name: KC_URL, value: "http://keycloak:8080" }
+                - { name: KC_ADMIN_USER, value: "admin" }
+                - { name: JAVA_OPTS, value: "-Xmx192m -XX:MaxMetaspaceSize=128m" }
+                - { name: KCADM_PASSWORD, valueFrom: { secretKeyRef: { name: factory-secrets, key: KEYCLOAK_ADMIN_PASSWORD } } }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              volumeMounts:
+                - { name: tmp, mountPath: /tmp }
+                - { name: script, mountPath: /script, readOnly: true }
+              resources:
+                requests: { cpu: 50m, memory: 256Mi }
+                limits: { cpu: 500m, memory: 512Mi }
+          volumes:
+            - name: tmp
+              emptyDir: { sizeLimit: 64Mi }
+            - name: script
+              configMap:
+                name: keycloak-broker-otp-script
+                defaultMode: 0555

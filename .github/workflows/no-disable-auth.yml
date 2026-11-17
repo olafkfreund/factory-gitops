@@ -1,0 +1,22 @@
+# Production must never set the local-dev auth bypass (Factory#312): the check fails if the flag
+# appears in any deployable file. No paths filter, so a required check never goes missing.
+name: no auth bypass flag
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: auth bypass flag absent from deployable files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sh scripts/check-no-disable-auth.sh --self-test
+      - run: sh scripts/check-no-disable-auth.sh

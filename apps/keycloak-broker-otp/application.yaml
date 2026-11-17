@@ -1,0 +1,25 @@
+# Keycloak post-broker-login conditional OTP (Factory#3781): audit -> install -> bind.
+# Default is audit, which writes nothing to Keycloak. See docs/keycloak-sso.md "MFA".
+# App-of-apps auto-discovers this file (apps/**/application.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: keycloak-broker-otp
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/keycloak-broker-otp/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
