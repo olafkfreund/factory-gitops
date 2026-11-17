@@ -107,6 +107,26 @@ recomputation remains CFactory's job (`AuditStore.verify`); OpenObserve gives
 the central, searchable, retained copy that an assessor reviews, and
 `apps/audit-anchor-alert` remains the active integrity alarm.
 
+## AIFactory auth failures (AIFactory#2079)
+
+AIFactory pushes its own `auth.failure` rows (`action`, `source=aifactory`, `reason`, `ip`; no
+token, no path) straight to this stream; the forwarder above is not involved. The aifactory
+Deployment sets `AIFACTORY_AUDIT_SIEM_URL` and reads `AIFACTORY_AUDIT_SIEM_USER/PASSWORD` from the
+optional Secret `observe-audit-ingest`; without it the push is inert and `auth_failure_spike`
+reports `no_field`.
+
+Owner step (once): `scripts/mint-audit-ingest-user.sh` (`DRY_RUN=1` first). It creates the Secret,
+creates the OpenObserve user (role `user`; open-source OpenObserve has no ingest-only role, so this
+is the least-privileged one it offers), and restarts aifactory, because env from a new Secret is
+read at container start. Rerunning is safe and rotates the password.
+
+Proof (agent or owner, after the rollout): send one request with a non-empty invalid token to a
+protected endpoint (`curl -H 'Authorization: Bearer x' https://<aifactory-host>/api/tasks`), then in
+OpenObserve run `SELECT * FROM "audit_chain" WHERE action = 'auth.failure' AND source = 'aifactory'
+ORDER BY _timestamp DESC LIMIT 5`, then
+`kubectl -n factory create job --from=cronjob/security-alerts proof-2079` and check that
+`auth_failure_spike` is no longer `no_field`.
+
 ## Scope / follow-ups
 
 - **Retention** of the `audit_chain` stream is governed by OpenObserve's own

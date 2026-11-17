@@ -60,6 +60,20 @@ alerts.count = lambda sql: sqls.append(sql) or 0
 alerts.evaluate("r", "audit_chain", "action = 'auth.failure'", 10)
 assert "action = 'auth.failure'" in sqls[0]
 
+# AIFactory#2079 dry run: the SQL evaluate() builds, run on rows shaped like AIFactory's audit_siem
+# record and CFactory's forwarded rows; only auth.failure rows count.
+import sqlite3
+db = sqlite3.connect(":memory:")
+db.execute('CREATE TABLE "audit_chain" (action TEXT, kind TEXT, source TEXT, reason TEXT)')
+db.executemany('INSERT INTO "audit_chain" VALUES (?,?,?,?)', [
+    ("auth.failure", None, "aifactory", "invalid_token"),
+    ("auth.failure", None, "aifactory", "invalid_ws_token"),
+    ("gate.reject", None, "cfactory", None),
+    (None, "auth.failure", "cfactory", None),  # CFactory rows are keyed by kind, not action
+])
+alerts.count = lambda sql: db.execute(sql).fetchone()[0]
+assert alerts.evaluate("r", "audit_chain", "action = 'auth.failure'", 2) == ("firing", 2)
+
 # missing stream is no_source, not ok, and not an error
 rc, rec, *_ = run({"audit_chain": 0, "egress_denied": http(404)}, egress="egress_denied")
 assert rc == 0 and rec["egress_anomaly"]["status"] == "no_source"
