@@ -264,6 +264,19 @@ spec:
             # available + connectivity-checkable; copilot_provider stays "claude"
             # (default) until explicitly switched via CFACTORY_COPILOT_PROVIDER.
             - { name: OLLAMA_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OLLAMA_API_KEY } } }
+            # Factory#1959: off until factory-secrets has both keys; seed the token first, then MODEL_GATEWAY_URL=http://model-gateway.gateway.svc.cluster.local:8080.
+            - name: CFACTORY_MODEL_GATEWAY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_URL
+                  optional: true
+            - name: CFACTORY_MODEL_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_CLIENT_TOKEN
+                  optional: true
             - { name: CFACTORY_AUDIT_HMAC_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_AUDIT_HMAC_SECRET } } }
             # The chain forked once at entry 2178 under the pre-CFactory#310 write
             # race. Both rows are genuine and every HMAC recomputes; relinking one
