@@ -764,6 +764,19 @@ spec:
             # real completion before pinning one -- listing is not access.
             - { name: OPENAI_COMPATIBLE_BASE_URL, value: "https://ollama.com" }
             - { name: OPENAI_COMPATIBLE_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_COMPATIBLE_API_KEY } } }
+            # Factory#1959: off until factory-secrets has both keys; seed the token first, then MODEL_GATEWAY_URL=http://model-gateway.gateway.svc.cluster.local:8080.
+            - name: AIFACTORY_MODEL_GATEWAY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_URL
+                  optional: true
+            - name: AIFACTORY_MODEL_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_CLIENT_TOKEN
+                  optional: true
             # Local reasoning models (Ollama gemma4/gpt-oss) spend the response
             # budget on hidden thinking; bound it + reserve an output budget so
             # structured/tool turns actually emit (else finish=length, empty).
