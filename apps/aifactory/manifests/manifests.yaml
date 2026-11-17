@@ -382,6 +382,12 @@ spec:
             # children: warn (log, still pass) or refuse (withhold). refuse since the
             # GitHub App cutover (#367): children get App tokens, never a classic PAT.
             - { name: AIFACTORY_AGENT_TOKEN_ADMIN_POLICY, value: "refuse" }
+            # PR endgame reviewer (AIFactory#1701). The App installation token cannot
+            # request Copilot reviews (probe 2026-11-17: HTTP 201, copilot not listed), so a
+            # repository ruleset "Copilot code review" requests it on PR open and the
+            # endgame waits for that review. Repos without the ruleset never get one:
+            # set the project's own reviewer (Project settings) to "aifactory" there.
+            - { name: AIFACTORY_PR_REVIEWER, value: "copilot-ruleset" }
             # git cannot see gh's credential on its own, so `git push` to the https
             # origin has no username to send and dies non-interactively with
             # "could not read Username for 'https://github.com'". That surfaced as
