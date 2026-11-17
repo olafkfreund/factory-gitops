@@ -55,6 +55,7 @@ nav:
   - Deploying the Factory Suite: deploying-the-factory-suite.md
   - Build & Deploy: build-and-deploy.md
   - Keycloak SSO: keycloak-sso.md
+  - AIFactory GitHub App cutover: aifactory-github-app-cutover.md
   - Multi-tenancy: multi-tenancy.md
   - Egress Allowlist (design): egress-allowlist.md
   - CronJob Health Watchdog: job-health-watchdog.md

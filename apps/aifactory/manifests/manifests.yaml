@@ -371,6 +371,19 @@ spec:
             - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
             - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
+            # GitHub App identity (AIFactory#1973, #1700). OFF until the owner has created
+            # the App: the three keys do not exist in factory-secrets, so `optional: true`
+            # leaves the variables unset and the server ignores the App. All three or none
+            # (the server refuses a partial set), and the server refuses to boot while any
+            # PAT is also present, so adding the keys and deleting the GITHUB_TOKEN line
+            # above must happen in one window: docs/aifactory-github-app-cutover.md.
+            - { name: AIFACTORY_GITHUB_APP_ID, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_ID, optional: true } } }
+            - { name: AIFACTORY_GITHUB_APP_INSTALLATION_ID, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_INSTALLATION_ID, optional: true } } }
+            - { name: AIFACTORY_GITHUB_APP_PRIVATE_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_PRIVATE_KEY, optional: true } } }
+            # What to do with an admin/delete_repo-scoped GitHub token bound for agent
+            # children: warn (log, still pass) or refuse (withhold). Stays warn until the
+            # admin PAT is gone, because refuse would stop agent pushes on the live PAT.
+            - { name: AIFACTORY_AGENT_TOKEN_ADMIN_POLICY, value: "warn" }
             # git cannot see gh's credential on its own, so `git push` to the https
             # origin has no username to send and dies non-interactively with
             # "could not read Username for 'https://github.com'". That surfaced as

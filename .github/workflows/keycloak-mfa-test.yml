@@ -1,0 +1,22 @@
+# The keycloak-mfa script gates MFA on the identity provider (Factory#312): its
+# modes and lockout guards are proven against a stub kcadm.sh. No paths filter,
+# so a required check never goes missing.
+name: keycloak mfa script
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: audit writes nothing, enforce is guarded
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sh apps/keycloak-mfa/manifests/test.sh

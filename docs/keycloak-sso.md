@@ -218,6 +218,36 @@ kubectl -n factory run kcc --rm -it --image=curlimages/curl --restart=Never -- \
 In a browser: open `https://aifactory.freundcloud.org.uk` → **Sign in with SSO** → GitHub →
 land **inside** the app. If you bounce back to `/login`, read the troubleshooting table.
 
+## MFA (Factory#312, R-010)
+
+`apps/keycloak-mfa` is a daily CronJob that moves the `factory` realm toward an
+enrolled second factor for every user, in three steps. It never touches the
+`master` realm, never removes an action or a credential, and reads everything
+before it writes. Its mode is `MFA_MODE` in `apps/keycloak-mfa/manifests/cronjob.yaml`.
+
+| mode | writes | what it does |
+|---|---|---|
+| `audit` (default) | nothing | logs enabled users with no `otp`/`webauthn` credential |
+| `new-users` | the `CONFIGURE_TOTP` action definition | users created from now on enroll an authenticator at first login |
+| `enforce` | the above, plus `CONFIGURE_TOTP` on each existing user without a second factor | those users enroll at next login |
+
+Climb the ladder one step per PR, reading the job log (`kubectl -n factory logs job/<keycloak-mfa job>`) between steps:
+
+1. Read the `audit` log. Expect the owner and any test users.
+2. Create the break-glass account(s) you want **before** `new-users` (the realm default applies to every new account; `MFA_EXEMPT_USERS` only stops the job).
+3. Set `MFA_MODE: new-users`. Create a throwaway GitHub account, log in through the broker once and confirm Keycloak asks for OTP enrollment. Whether a GitHub-brokered login prompts for the required action is not assumed; this step is how you find out.
+4. Enroll your own authenticator (Account console, Signing in).
+5. Set `MFA_MODE: enforce`, `MFA_REQUIRE_ENROLLED: "<your username>"` and `MFA_EXEMPT_USERS` as needed. The job refuses to write anything unless every `MFA_REQUIRE_ENROLLED` user already has a second factor.
+
+Rollback:
+
+- Set `MFA_MODE: audit`. This stops further writes; it does **not** undo what was written.
+- Withdraw the default: `kcadm.sh update authentication/required-actions/CONFIGURE_TOTP -r factory -s defaultAction=false`.
+- Withdraw an assigned action from one user: admin console, Users, the user, Required user actions, remove "Configure OTP" only. Do not set `requiredActions=[]`: it also clears password-change and email-verification actions.
+- A locked-out user is recovered by the `master` realm admin (`KEYCLOAK_ADMIN_PASSWORD`), which this job never changes.
+
+Known limits: this ladder guarantees that every enabled user **enrolls** an authenticator. It does not by itself add an OTP challenge to every GitHub-brokered login: a broker login that already has a Keycloak session or goes through the first-broker-login flow only sees the enrollment prompt once, and a post-broker-login flow with a conditional OTP step is not installed (tracked as a follow-up, R-010). Until then the upstream GitHub account's own MFA is the second factor for brokered users. The array-append used by `enforce` (`-s 'requiredActions+=CONFIGURE_TOTP'`) has not been exercised against the pinned Keycloak 26.1 image, so the first `enforce` run is also its test (a failed update fails the job and the watchdog reports it). WebAuthn registration as an alternative second factor is a follow-up, and a declarative realm export (R-010's other half) is not covered.
+
 ## Troubleshooting (hard-won)
 
 | Symptom                                   | Cause                                                                 | Fix |
