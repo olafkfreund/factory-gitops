@@ -650,6 +650,12 @@ spec:
             # build to Job-native. REVERT = re-comment this one line.
             - { name: AIFACTORY_BUILD_BACKEND, value: "kubejob" }
             - { name: AIFACTORY_SPEC_BACKEND, value: "kubejob" }  # AIFactory#1932: spec creation runs as a Job (needs >= 3.11.0)
+            # AIFactory#1932 (needs >= 3.13.0): PR review and task clarification run as Jobs, no in-pod fallback.
+            # Revert = delete this line (and the FORBID line below, or reviews are refused).
+            - { name: AIFACTORY_REVIEW_BACKEND, value: "kubejob" }
+            # AIFactory#1932 (needs >= 3.13.0): refuse in-pod agent spawns (spec, build, review, clarification).
+            # Insights, changelog, conflict resolution and QA apply-correction stay in-pod (AIFactory#2095). Revert = delete this line.
+            - { name: AIFACTORY_FORBID_INPOD_AGENTS, value: "true" }
             # #690: file-auth CLI creds for the dispatched build Job — seeds the
             # factory-cli-creds secret into the Job pod via the seed-creds
             # initContainer (build_backend._inject_seed_creds). INERT until
