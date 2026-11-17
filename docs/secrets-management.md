@@ -47,7 +47,7 @@ All are namespace `factory` and seeded via agenix on p510 unless noted.
 
 | Secret | Keys | Consumers | Rotation owner / mechanism |
 |--------|------|-----------|----------------------------|
-| `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY, PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_JWT_SECRET, {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, CFACTORY_CREDENTIAL_KEY, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
+| `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY (+ optional `__2026Q4` and `PFACTORY_TRUSTED_PLAN_SIGNING_KEY__2026Q4`, Factory#3689), PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_JWT_SECRET, {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, CFACTORY_CREDENTIAL_KEY, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
 | `minio-creds` | S3_ACCESS_KEY, S3_SECRET_KEY; optional STS_ACCESS_KEY, STS_SECRET_KEY (AIFactory#2023: a non-root MinIO user `aifactory-sts`, created by the minio-create-bucket hook; read by aifactory as S3_STS_*) | minio, minio bucket-init, pfactory, tfactory, aifactory, backups | Manual (agenix). Rotate = recreate + bounce minio and every consumer. STS keys: new pair, resync minio (the hook tries to disable the previous user but only best effort: check `mc admin user list` and disable the old key by hand if it is still enabled), restart aifactory. |
 | `minio-kms` | MINIO_KMS_SECRET_KEY | minio | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; compromise-only rotation, see [Rotation policy](#rotation-policy). |
 | `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory (mounted) | Claude credential: `claude setup-token` (about 1 year) re-seeded by hand; cred-broker (`apps/cred-broker`) watches the expiry and refreshes only an `auth login` credential. Others manual. |
@@ -190,6 +190,25 @@ General shape for the manual (agenix) secrets:
 
 - **oauth2-proxy-\*** cookie-secret: must be a 16/24/32-byte value; regenerate
   with `openssl rand -base64 32 | head -c 32`, then restart the proxy.
+
+### Moving live trusted-plan signing to a kid key (Factory#3689, R-013)
+
+The manifests already read two optional `factory-secrets` keys, so nothing changes until you seed them:
+`AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY__2026Q4` (aifactory, verifies) and
+`PFACTORY_TRUSTED_PLAN_SIGNING_KEY__2026Q4` (pfactory, signs; a keyed var wins over the legacy one).
+Separate names let you roll the verifier first. The expiry
+(`AIFACTORY_TRUSTED_PLAN_EXPIRY=pfactory/2026q4=2027-03-15`) is in the aifactory manifest; if you
+generate the key after 2026-12-01, edit the date to the one the script prints.
+
+1. `scripts/gen-trusted-plan-key.sh 2026Q4 /dev/shm/tp-2026q4.env` writes both lines to that file (mode 600)
+   and prints only the kid, key names, a fingerprint and the expiry. The key is a shared HMAC secret, so there is no public key.
+2. Seed the first line's key (`AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY__2026Q4`) with `agenix -e` and into the cluster
+   Secret, then `kubectl -n factory rollout restart deploy/aifactory` and wait for it.
+3. Seed the second line's key (`PFACTORY_TRUSTED_PLAN_SIGNING_KEY__2026Q4`), then restart `deploy/pfactory`.
+   New envelopes carry `kid: 2026q4`. `shred -u` the file.
+4. After the overlap (no in-flight plan signed with the legacy key), remove `AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY`
+   from both Deployments in a PR, and drop the legacy Secret key. Runbook, expiry and revocation:
+   AIFactory `docs/docs/compliance/trusted-plan-key-rotation.md`.
 
 ## Rotation policy
 
