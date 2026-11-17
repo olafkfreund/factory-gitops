@@ -40,7 +40,7 @@ resolv.conf mount).
 ## Re-add the hosts entries `docker restart` drops
 
 Build the entries from the live IPs (they may have swapped), then append them
-to `/etc/hosts` in both node containers. Skip a name that is already present.
+to `/etc/hosts` in both node containers (bash; `-i` is required to pass stdin). Skip a name that is already present.
 
 ```bash
 ip() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
@@ -50,7 +50,7 @@ $(ip k3d-factory-server-0) k3d-factory-server-0
 $(ip k3d-factory-agent-0) k3d-factory-agent-0
 $(ip k3d-factory-serverlb) k3d-factory-serverlb"
 for n in k3d-factory-server-0 k3d-factory-agent-0; do
-  docker exec "$n" sh -c 'while read -r ip name; do grep -q " $name\$" /etc/hosts || echo "$ip $name" >> /etc/hosts; done' <<<"$ENTRIES"
+  docker exec -i "$n" sh -c 'while read -r ip name; do grep -q " $name\$" /etc/hosts || echo "$ip $name" >> /etc/hosts; done' <<<"$ENTRIES"
 done
 kubectl get nodes   # both Ready
 ```
