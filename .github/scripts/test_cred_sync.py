@@ -31,7 +31,7 @@ import tempfile
 import time
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-APPS = ("aifactory", "pfactory", "tfactory")
+APPS = ("aifactory", "pfactory", "tfactory", "cfactory")
 
 
 def extract(app):
@@ -56,9 +56,9 @@ def extract(app):
 
 scripts = {app: extract(app) for app in APPS}
 if len(set(scripts.values())) != 1:
-    raise SystemExit("::error::the three vendored cred-sync copies have drifted; "
+    raise SystemExit("::error::the vendored cred-sync copies have drifted; "
                      "they must stay byte-identical")
-print(f"ok   three vendored copies identical ({len(scripts[APPS[0]].splitlines())} lines)")
+print(f"ok   vendored copies identical ({len(scripts[APPS[0]].splitlines())} lines)")
 
 path = pathlib.Path(tempfile.mkdtemp()) / "cred_sync.py"
 path.write_text(scripts[APPS[0]])
@@ -155,7 +155,7 @@ def prestop(app):
 
 hooks = {app: prestop(app) for app in APPS}
 if len({tuple(command) for command in hooks.values()}) != 1:
-    raise SystemExit("::error::the three cred-sync preStop commands have drifted")
+    raise SystemExit("::error::the vendored cred-sync preStop commands have drifted")
 hook = hooks[APPS[0]]
 sudo = []
 unshare = ["unshare", "-Urpf", "--kill-child", "--mount-proc"]
