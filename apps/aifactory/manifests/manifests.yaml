@@ -370,20 +370,18 @@ spec:
             # .credentials.json resolution is unchanged.
             - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             - { name: AIFACTORY_COMPLETION_WEBHOOK, value: "http://cfactory.factory.svc.cluster.local:3111/api/events" }
-            - { name: GITHUB_TOKEN, valueFrom: { secretKeyRef: { name: factory-secrets, key: GITHUB_TOKEN } } }
-            # GitHub App identity (AIFactory#1973, #1700). OFF until the owner has created
-            # the App: the three keys do not exist in factory-secrets, so `optional: true`
-            # leaves the variables unset and the server ignores the App. All three or none
-            # (the server refuses a partial set), and the server refuses to boot while any
-            # PAT is also present, so adding the keys and deleting the GITHUB_TOKEN line
-            # above must happen in one window: docs/aifactory-github-app-cutover.md.
+            # GitHub App identity (AIFactory#1973, #1700). The fleet PAT (GITHUB_TOKEN) is
+            # gone from this pod: the server mints installation tokens from these three
+            # factory-secrets keys and refuses to boot with a partial set or with any PAT
+            # present. Rollback: restore the GITHUB_TOKEN line and remove the three keys
+            # (docs/aifactory-github-app-cutover.md).
             - { name: AIFACTORY_GITHUB_APP_ID, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_ID, optional: true } } }
             - { name: AIFACTORY_GITHUB_APP_INSTALLATION_ID, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_INSTALLATION_ID, optional: true } } }
             - { name: AIFACTORY_GITHUB_APP_PRIVATE_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_PRIVATE_KEY, optional: true } } }
             # What to do with an admin/delete_repo-scoped GitHub token bound for agent
-            # children: warn (log, still pass) or refuse (withhold). Stays warn until the
-            # admin PAT is gone, because refuse would stop agent pushes on the live PAT.
-            - { name: AIFACTORY_AGENT_TOKEN_ADMIN_POLICY, value: "warn" }
+            # children: warn (log, still pass) or refuse (withhold). refuse since the
+            # GitHub App cutover (#367): children get App tokens, never a classic PAT.
+            - { name: AIFACTORY_AGENT_TOKEN_ADMIN_POLICY, value: "refuse" }
             # git cannot see gh's credential on its own, so `git push` to the https
             # origin has no username to send and dies non-interactively with
             # "could not read Username for 'https://github.com'". That surfaced as
@@ -394,7 +392,7 @@ spec:
             # read-only at runtime, so `git config --global` cannot be applied live.
             # AIFactory#1373 bakes the same helper into the image; these three may
             # be dropped once that ships. No secret here -- the helper shells out
-            # to gh, which reads its own token from GITHUB_TOKEN above.
+            # to gh, which reads GITHUB_TOKEN (the server sets it from the App token).
             - { name: GIT_CONFIG_COUNT, value: "1" }
             - { name: GIT_CONFIG_KEY_0, value: "credential.https://github.com.helper" }
             - { name: GIT_CONFIG_VALUE_0, value: "!gh auth git-credential" }
@@ -767,6 +765,19 @@ spec:
             # real completion before pinning one -- listing is not access.
             - { name: OPENAI_COMPATIBLE_BASE_URL, value: "https://ollama.com" }
             - { name: OPENAI_COMPATIBLE_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OPENAI_COMPATIBLE_API_KEY } } }
+            # Factory#1959: off until factory-secrets has both keys; seed the token first, then MODEL_GATEWAY_URL=http://model-gateway.gateway.svc.cluster.local:8080.
+            - name: AIFACTORY_MODEL_GATEWAY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_URL
+                  optional: true
+            - name: AIFACTORY_MODEL_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_CLIENT_TOKEN
+                  optional: true
             # Local reasoning models (Ollama gemma4/gpt-oss) spend the response
             # budget on hidden thinking; bound it + reserve an output budget so
             # structured/tool turns actually emit (else finish=length, empty).

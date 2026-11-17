@@ -1,0 +1,31 @@
+# netpol-node-probe: is NetworkPolicy actually enforced on EACH node? (Factory#3782)
+#
+# Follow-up to Factory#3770: after a k3d restart Docker swapped the node IPs and
+# kube-router wrote pod firewall rules for the other node's pods, so task pods on
+# one node ran with no policy. The netpol-gate init container failed closed, but
+# nothing said a node had lost enforcement. This probes every node every 10
+# minutes and exits non-zero on a finding; apps/job-watchdog turns that into a
+# GitHub issue (see apps/host-k3d-internal-probe for the same split).
+# Runbook: docs/runbooks/k3d-restart.md
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: netpol-node-probe
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/netpol-node-probe/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

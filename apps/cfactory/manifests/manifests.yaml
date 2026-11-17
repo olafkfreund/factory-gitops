@@ -53,7 +53,151 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        # CFactory#530: the copilot (provider=claude) calls the Claude Agent SDK, so the
+        # pod needs a Claude login. Same wiring as pfactory (Factory#292), Claude only.
+        - name: seed-creds
+          image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+          command: ["sh","-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /h/.claude
+              cp /seed/claude-credentials.json /h/.claude/.credentials.json
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: cc-claude, mountPath: /h/.claude }
+            - { name: cli-creds, mountPath: /seed, readOnly: true }
       containers:
+        # Credential sync (Factory#292, CFactory#530): re-copies the kubelet-refreshed
+        # factory-cli-creds seed into the writable ~/.claude emptyDir when it is newer.
+        - name: cred-sync
+          image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              # cred-sync (Factory#292, hardened by Factory#628). The cli-creds Secret
+              # volume is refreshed by kubelet, so this re-copies the seed into the writable
+              # ~/.claude emptyDir whenever the seed is genuinely newer than what is there.
+              #
+              # Factory#628: exp() used to collapse every read failure -- missing file,
+              # malformed JSON, absent key -- to 0, and 0 is not a sentinel here, it is the
+              # oldest possible timestamp. An unreadable destination therefore lost every
+              # comparison, so ANY seed was copied over it, including one that had expired
+              # two months earlier, announced as "adopted fresher credential (+494672.6h)".
+              # 494672.6h is 56 years: it is seed_expiry_ms/3600000 with the other side at 0.
+              #
+              # Tested by .github/scripts/test_cred_sync.py, which also proves the three
+              # vendored copies of this script are byte-identical.
+              import json, os, shutil, time
+              import signal, sys
+              # As PID 1 this process ignores SIGTERM unless it installs a handler, so since the
+              # 1800s drain grace (#303) every pod stop waited for SIGKILL. Exit on SIGTERM.
+              signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+              SEED = os.environ.get("CRED_SYNC_SEED", "/seed/claude-credentials.json")
+              DEST = os.environ.get("CRED_SYNC_DEST", "/h/.claude/.credentials.json")
+              # No real credential is 90 days fresher than the one it replaces. A delta that
+              # large means one side is garbage, not that the seed is better.
+              MAX_SKEW_MS = 90 * 86400000
+
+
+              def exp(path):
+                  """Expiry in ms, or None when unreadable / unparseable / no expiry key.
+
+                  None means "unknown" and is deliberately not a number. Substituting a
+                  timestamp for a read failure is the whole of Factory#628.
+                  """
+                  try:
+                      with open(path) as fh:
+                          value = json.load(fh).get("claudeAiOauth", {}).get("expiresAt")
+                  except Exception:
+                      return None
+                  return None if value is None else int(value)
+
+
+              def ts(ms):
+                  if ms is None:
+                      return "unknown"
+                  return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000))
+
+
+              def decide(seed, dest, dest_exists, now):
+                  """(adopt, message). Pure, so the selftest can pin every branch."""
+                  if seed is None:
+                      return False, "seed unreadable, leaving dest untouched"
+                  if seed <= now:
+                      return False, f"seed expires {ts(seed)}, already past (now {ts(now)}), refusing to adopt"
+                  if dest is None and dest_exists:
+                      return False, "dest exists but is unreadable, refusing to overwrite it"
+                  # `dest > 0`: a literal 0 expiry is a CLEARED credential, not a read
+                  # failure. exp() returns None for unreadable/unparseable/absent-key --
+                  # that was the whole of Factory#628 -- so 0 can now only come from a
+                  # real `expiresAt: 0` in valid JSON, which is what the Claude SDK
+                  # leaves behind when it clears an access token.
+                  #
+                  # Without this the bound wedges the pod permanently: dest reads 0, the
+                  # delta is ~56 years, cred-sync refuses forever, and every run dies at
+                  # the planner with "No OAuth token found" while a valid seed sits in
+                  # the Secret (observed 2026-08-27, TFactory spec 191).
+                  if dest is not None and dest > 0 and seed - dest > MAX_SKEW_MS:
+                      return False, (f"seed expires {ts(seed)}, dest expires {ts(dest)}, delta "
+                                     f"{(seed - dest) / 3600000:.1f}h exceeds the sanity bound, refusing")
+                  if dest is not None and seed <= dest:
+                      return False, ""
+                  # States what was compared, not a conclusion: this line cannot be wrong the
+                  # way "adopted fresher credential" was.
+                  return True, f"seed expires {ts(seed)}, dest expires {ts(dest)}, adopting seed"
+
+
+              def sync(now=None):
+                  now = int(time.time() * 1000) if now is None else now
+                  adopt, why = decide(exp(SEED), exp(DEST), os.path.exists(DEST), now)
+                  if adopt:
+                      tmp = DEST + ".tmp"
+                      shutil.copyfile(SEED, tmp)
+                      os.chmod(tmp, 0o660)
+                      os.replace(tmp, DEST)  # atomic; readers never see a partial file
+                  return adopt, why
+
+
+              def main():
+                  last = None
+                  while True:
+                      try:
+                          why = sync()[1]
+                      except Exception as e:
+                          why = f"{type(e).__name__}: {e}"
+                      if why and why != last:  # a refusal recurs every 60s; say it once
+                          print(f"cred-sync: {why}", flush=True)
+                      last = why
+                      time.sleep(60)
+
+
+              if __name__ == "__main__":
+                  main()
+          # factory-gitops#332: as PID 1 this container drops a SIGTERM that arrives before
+          # the script installs its handler (about 1.7s at the 100m CPU limit), and the
+          # kubelet sends only one. So wait until PID 1 catches SIGTERM: SigCgt bit 0x4000,
+          # which makes the 4th hex digit from the right one of 4567cdef.
+          lifecycle: { preStop: { exec: { command: ["sh", "-c", "until grep -Eq '^SigCgt:.*[4-7c-f][0-9a-f]{3}$' /proc/1/status; do sleep 0.1; done"] } } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Stdlib-only inline script; every write goes to the /h/.claude
+            # emptyDir. Verified read-only + uid 65532 against python:3.12-slim.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 5m, memory: 24Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          volumeMounts:
+            - { name: cc-claude, mountPath: /h/.claude }
+            - { name: cli-creds, mountPath: /seed, readOnly: true }
         - name: cfactory
           image: ghcr.io/olafkfreund/cfactory:0.1.0
           imagePullPolicy: IfNotPresent
@@ -73,6 +217,9 @@ spec:
           ports: [{ containerPort: 3111 }]
           env:
             - { name: CFACTORY_BACKEND_PORT, value: "3111" }
+            # CFactory#530: the claude CLI writes ~/.claude.json at the HOME root, which is
+            # read-only; relocate it into the cc-claude emptyDir (same trick as pfactory).
+            - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             - { name: CFACTORY_AIFACTORY_API_URL, value: "http://aifactory.factory.svc.cluster.local:3101" }
             - { name: CFACTORY_PFACTORY_API_URL, value: "http://pfactory.factory.svc.cluster.local:3114" }
             - { name: CFACTORY_TFACTORY_API_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }
@@ -117,6 +264,19 @@ spec:
             # available + connectivity-checkable; copilot_provider stays "claude"
             # (default) until explicitly switched via CFACTORY_COPILOT_PROVIDER.
             - { name: OLLAMA_API_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: OLLAMA_API_KEY } } }
+            # Factory#1959: off until factory-secrets has both keys; seed the token first, then MODEL_GATEWAY_URL=http://model-gateway.gateway.svc.cluster.local:8080.
+            - name: CFACTORY_MODEL_GATEWAY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_URL
+                  optional: true
+            - name: CFACTORY_MODEL_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: factory-secrets
+                  key: MODEL_GATEWAY_CLIENT_TOKEN
+                  optional: true
             - { name: CFACTORY_AUDIT_HMAC_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: CFACTORY_AUDIT_HMAC_SECRET } } }
             # The chain forked once at entry 2178 under the pre-CFactory#310 write
             # race. Both rows are genuine and every HMAC recomputes; relinking one
@@ -197,12 +357,15 @@ spec:
           volumeMounts:
             - { name: data, mountPath: /home/nonroot/.cfactory }
             - { name: tmp,  mountPath: /tmp }
+            - { name: cc-claude, mountPath: /home/nonroot/.claude }
           readinessProbe: { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 6 }
           livenessProbe:  { httpGet: { path: /health, port: 3111 }, initialDelaySeconds: 20, periodSeconds: 20 }
           resources: { requests: { cpu: 50m, memory: 256Mi }, limits: { memory: 1Gi } }
       volumes:
         - { name: data, persistentVolumeClaim: { claimName: cfactory-data } }
         - { name: tmp,  emptyDir: {} }
+        - { name: cc-claude, emptyDir: {} }
+        - { name: cli-creds, secret: { secretName: factory-cli-creds } }
 ################################################################################
 # CFactory cockpit (frontend, service: cfactory-frontend, :80 -> 8080)
 # Public ingress via Cloudflare (cfactory.freundcloud.org.uk). No sidecar.

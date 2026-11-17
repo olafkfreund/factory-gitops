@@ -240,3 +240,20 @@ spec:
           port: 5080
         - protocol: TCP
           port: 5081
+
+    # 6. The model gateway (Factory#1959), gateway pods only, TCP 8080. Both
+    #    selectors sit in ONE peer: as two peers they would allow every pod in
+    #    the `gateway` namespace and any `app=model-gateway` pod in `factory`.
+    #    The gateway's own ingress policy admits the `factory` namespace, and it
+    #    still demands its client token. No Job uses it until a service is given
+    #    <SVC>_MODEL_GATEWAY_URL, which stays unset until the owner seeds it.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gateway
+          podSelector:
+            matchLabels:
+              app: model-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
