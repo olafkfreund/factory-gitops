@@ -132,3 +132,6 @@ sudo systemctl restart k3d-cluster-bootstrap
 
 If Docker itself didn't start, that's a separate problem — fix Docker
 first, the cluster will come back.
+
+For restarting the k3d node containers themselves (IP swap, `/etc/hosts`,
+NetworkPolicy enforcement check) see [k3d restart](runbooks/k3d-restart.md).
