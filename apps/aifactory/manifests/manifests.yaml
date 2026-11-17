@@ -379,9 +379,9 @@ spec:
             - { name: AIFACTORY_GITHUB_APP_INSTALLATION_ID, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_INSTALLATION_ID, optional: true } } }
             - { name: AIFACTORY_GITHUB_APP_PRIVATE_KEY, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_GITHUB_APP_PRIVATE_KEY, optional: true } } }
             # What to do with an admin/delete_repo-scoped GitHub token bound for agent
-            # children: warn (log, still pass) or refuse (withhold). Stays warn until the
-            # admin PAT is gone, because refuse would stop agent pushes on the live PAT.
-            - { name: AIFACTORY_AGENT_TOKEN_ADMIN_POLICY, value: "warn" }
+            # children: warn (log, still pass) or refuse (withhold). refuse since the
+            # GitHub App cutover (#367): children get App tokens, never a classic PAT.
+            - { name: AIFACTORY_AGENT_TOKEN_ADMIN_POLICY, value: "refuse" }
             # git cannot see gh's credential on its own, so `git push` to the https
             # origin has no username to send and dies non-interactively with
             # "could not read Username for 'https://github.com'". That surfaced as
