@@ -1,0 +1,14 @@
+# ArgoCD v2.13.1's structured-merge diff (used by the ServerSideApply apps: keda,
+# kyverno, coredns-upstream) builds typed objects from Kubernetes schemas older
+# than the cluster's 1.35, so a live Deployment's .status.terminatingReplicas
+# fails the compare ("field not declared in schema") and the app shows sync
+# Unknown. Ignoring status in every diff removes the field from the compare;
+# status is never part of desired state anyway (nixos_config #3071).
+# Revisit when argo-cd is bumped to a release built against k8s >= 1.35.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+data:
+  resource.compareoptions: |
+    ignoreResourceStatusField: all
