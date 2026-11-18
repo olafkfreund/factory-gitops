@@ -22,29 +22,38 @@ trap 'rm -rf "$work"' EXIT
 chmod 700 "$work"
 kubectl --context "${KUBE_CONTEXT:-k3d-factory}" -n gateway get deploy model-gateway -o json > "$work/deploy.json" 2>/dev/null || inspection_fail 'Deployment fetch failed'
 kubectl --context "${KUBE_CONTEXT:-k3d-factory}" -n gateway get policyreport -o json > "$work/reports.json" 2>/dev/null || inspection_fail 'PolicyReports fetch failed'
+kubectl --context "${KUBE_CONTEXT:-k3d-factory}" -n gateway get replicaset,pod -o json > "$work/children.json" 2>/dev/null || inspection_fail 'children fetch failed'
 
-if ! jq -r -n --slurpfile deployment "$work/deploy.json" --slurpfile reports "$work/reports.json" '
+if ! jq -r -n --slurpfile deployment "$work/deploy.json" --slurpfile reports "$work/reports.json" --slurpfile children "$work/children.json" '
     def image_token($message; $image):
         any(range(0; ($message | length) - ($image | length) + 1) as $i |
             $message[$i:$i + ($image | length)] == $image and
             ($i == 0 or ($message[$i - 1:$i] | test("[^A-Za-z0-9._/:-]"))) and
             ($i + ($image | length) == ($message | length) or
                 ($message[$i + ($image | length):$i + ($image | length) + 1] | test("[^A-Za-z0-9._-]"))));
-    if ($deployment | length) != 1 or ($reports | length) != 1 or
+    if ($deployment | length) != 1 or ($reports | length) != 1 or ($children | length) != 1 or
        ($deployment[0] | type) != "object" or ($reports[0].items | type) != "array" or
+       ($children[0].items | type) != "array" or
        ($deployment[0].spec.template.spec.containers | type) != "array" or
        ($reports[0].items | any((.results | type) != "array")) then
         error("invalid report data")
     else
         ($deployment[0].spec.template.spec.containers | map(select(.name == "model-gateway") | .image) | first // "") as $image |
         $deployment[0].metadata.uid as $uid |
+        [$children[0].items[] | select(.kind == "ReplicaSet") |
+            select(any(.metadata.ownerReferences[]?; .kind == "Deployment" and .uid == $uid)) |
+            .metadata.uid | select(type == "string" and . != "")] as $replicasets |
+        ($replicasets + [$children[0].items[] | select(.kind == "Pod") |
+            select(any(.metadata.ownerReferences[]?; .uid as $owner |
+                .kind == "ReplicaSet" and ($replicasets | index($owner)) != null)) |
+            .metadata.uid | select(type == "string" and . != "")]) as $owned |
         [$reports[0].items[] | . as $report | .results[] | {scope: $report.scope, row: .}] as $rows |
         if ($rows | any((.row.result | type) != "string" or (.row.policy | type) != "string" or
                         (.row.rule | type) != "string" or (.row.timestamp.seconds | type) != "number")) then
             error("invalid report row")
         else
             ($rows[] | "\(.row.result | ascii_upcase) \(.row.policy)/\(.row.rule) \(.scope.kind)/\(.scope.name) \(.row.timestamp.seconds | todate)"),
-            "SUMMARY image=\($image) pass=\([$rows[] | select(.row.result == "pass")] | length) fail=\([$rows[] | select(.row.result == "fail")] | length) error=\([$rows[] | select(.row.result == "error")] | length) image_pass=\(if $image != "" and ($uid | type) == "string" and $uid != "" and ($rows | any(.scope.kind == "Deployment" and .scope.name == "model-gateway" and .scope.uid == $uid and .row.policy == "verify-factory-image-signatures" and .row.result == "pass" and (.row.message | type) == "string" and image_token(.row.message; $image))) then 1 else 0 end) inspection_failed=0"
+            "SUMMARY image=\($image) pass=\([$rows[] | select(.row.result == "pass")] | length) fail=\([$rows[] | select(.row.result == "fail")] | length) error=\([$rows[] | select(.row.result == "error")] | length) image_pass=\(if $image != "" and ($uid | type) == "string" and $uid != "" and ($rows | any(((.scope.kind == "Deployment" and .scope.name == "model-gateway" and .scope.uid == $uid) or ((.scope.kind == "Pod" or .scope.kind == "ReplicaSet") and (.scope.uid | type) == "string" and (.scope.uid as $scope_uid | ($owned | index($scope_uid)) != null))) and .row.policy == "verify-factory-image-signatures" and .row.result == "pass" and (.row.message | type) == "string" and image_token(.row.message; $image))) then 1 else 0 end) inspection_failed=0"
         end
     end
     ' > "$work/results" 2>/dev/null; then
