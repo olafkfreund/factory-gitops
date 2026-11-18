@@ -21,6 +21,11 @@ for value in "${S3_ACCESS_KEY:-}" "${S3_SECRET_KEY:-}" "${OFFSITE_S3_BUCKET:-}" 
 done
 
 SCRATCH=${SCRATCH:-/scratch}
+# Cap mc parallelism: autodetect scales with the host CPUs and OOMKilled the 512Mi pod (Factory#3806).
+MC_MAX_WORKERS=${MC_MAX_WORKERS:-4}
+case "$MC_MAX_WORKERS" in
+  ""|*[!0-9]*|0*) fail 'invalid MC_MAX_WORKERS' ;;
+esac
 export MC_CONFIG_DIR="$SCRATCH/.mc"
 mc alias set fac "${SOURCE_ENDPOINT:-http://minio.factory.svc.cluster.local:9000}" \
   "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1 || fail 'source alias failed'
@@ -60,7 +65,7 @@ if [ -n "${OFFSITE_AGE_RECIPIENT:-}" ]; then
       rm -f "$SCRATCH/readback.age"
     else
       rm -rf "$SCRATCH/snap"; mkdir -p "$SCRATCH/snap/$bucket"
-      mc mirror "fac/$bucket" "$SCRATCH/snap/$bucket" >/dev/null || fail "mirror of $bucket failed"
+      mc mirror --max-workers "$MC_MAX_WORKERS" "fac/$bucket" "$SCRATCH/snap/$bucket" >/dev/null || fail "mirror of $bucket failed"
       tar -C "$SCRATCH/snap" -cf - "$bucket" | gzip | "$AGE_BIN" -r "$OFFSITE_AGE_RECIPIENT" -o "$SCRATCH/$file" || fail "encrypting $bucket failed"
       rm -rf "$SCRATCH/snap"
       [ -s "$SCRATCH/$file" ] || fail "encrypted $bucket snapshot is empty"
@@ -79,7 +84,7 @@ fi
 # factory-backups is not here: the postgres dumps have their own copy (#3681).
 for bucket in factory-artifacts factory-evidence; do
   dest="off/$OFFSITE_S3_BUCKET/minio/$bucket"
-  mc mirror "fac/$bucket" "$dest" || fail "mirror of $bucket failed"
+  mc mirror --max-workers "$MC_MAX_WORKERS" "fac/$bucket" "$dest" || fail "mirror of $bucket failed"
   diff_out="$(mc diff "fac/$bucket" "$dest")" || fail "diff of $bucket failed"
   # mc diff: "<" only in source, ">" only at destination, "!" differs.
   bad="$(printf '%s\n' "$diff_out" | grep -c '^[<!]' || true)"

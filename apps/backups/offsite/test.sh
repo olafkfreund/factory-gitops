@@ -21,11 +21,12 @@ case "$1" in
     done
     ;;
   mirror)
-    [ "$#" -eq 3 ]
-    mkdir -p "$STUB_ROOT/$3"
-    for file in "$STUB_ROOT/$2"*; do
+    # Factory#3806: every mirror call must carry the worker cap.
+    [ "$#" -eq 5 ] && [ "$2" = --max-workers ] && [ "$3" = "${EXPECT_WORKERS:-4}" ] || exit 97
+    mkdir -p "$STUB_ROOT/$5"
+    for file in "$STUB_ROOT/$4"*; do
       [ -f "$file" ] || continue
-      target="$STUB_ROOT/$3${file##*/}"
+      target="$STUB_ROOT/$5${file##*/}"
       [ -e "$target" ] || cp "$file" "$target"
     done
     ;;
