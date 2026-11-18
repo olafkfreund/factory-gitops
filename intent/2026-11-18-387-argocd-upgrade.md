@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 387
 author: olafkfreund
 ---
@@ -77,3 +77,10 @@ annotation limit, the same reason keda uses server-side apply (`apps/keda/applic
    or migrate now?
 4. Rehearse on a throwaway k3d cluster with the same apps before the in-place upgrade, or upgrade in place directly?
 5. When? It needs a window with the dependent project.
+
+## Decisions (owner, 2026-11-18)
+
+- Target: chosen by Kubernetes 1.35 support and how long the line is maintained.
+- Tracking: keep label tracking for this upgrade; moving to annotations is a separate task.
+- Rehearse on a throwaway k3d cluster with the same apps before the in-place upgrade.
+- The window is agreed with the dependent project before the live upgrade.
