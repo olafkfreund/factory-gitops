@@ -44,6 +44,10 @@
 # readable from the live API at any moment -- so a stream here would be write-
 # only data. The GitHub issue IS the durable record.
 #
+# DISK PROBE: each run samples /proc/diskstats for sdd and records a bounded
+# read/write latency observation in its log and any issue it raises. It does
+# not emit to OpenObserve; the issue carries the durable sample.
+#
 # WHO WATCHES THIS WATCHDOG: it is a CronJob in the `factory` namespace, and
 # job-watchdog reports staleness and failure for every CronJob in the cluster,
 # including this one. If this stops running, job-watchdog opens an issue about
@@ -199,12 +203,17 @@ data:
       ALERT_REPO            owner/repo to raise issues on
       ALERT_RENOTIFY_HOURS  re-comment cadence while unhealthy (24)
       GITHUB_TOKEN          token with `repo` scope on ALERT_REPO
+      DISK_PROBE            observe (default) or off
+      DISK_DEVICE           diskstats device to sample (sdd)
+      DISK_INTERVAL_SECONDS sample interval, 1..30 seconds (5)
     """
 
     import json
+    import math
     import os
     import ssl
     import sys
+    import time
     import urllib.error
     import urllib.request
     from datetime import datetime, timezone
@@ -251,6 +260,79 @@ data:
         if s < 172800:
             return f"{s / 3600:.1f}h"
         return f"{s / 86400:.1f}d"
+
+
+    def parse_diskstats(text):
+        out = {}
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) >= 13:
+                out[fields[2]] = tuple(int(fields[i]) for i in (3, 6, 7, 10, 12))
+        return out
+
+
+    def disk_metrics(a, b, elapsed_s, device, ts):
+        sample = {"schema": "disk_probe/v1", "ts": ts, "device": device,
+                  "interval_s": elapsed_s, "status": "unavailable", "await_ms": None,
+                  "util_pct": None, "ios": None, "error": None}
+        if a is None or b is None:
+            sample["error"] = "device missing from diskstats"
+            return sample
+        if elapsed_s is None or elapsed_s <= 0:
+            sample["error"] = "nonpositive elapsed time"
+            return sample
+        delta = [end - start for start, end in zip(a, b)]
+        if any(value < 0 for value in delta):
+            sample["error"] = "disk counter regressed"
+            return sample
+        reads, read_ms, writes, write_ms, io_ms = delta
+        ios = reads + writes
+        sample.update(status="ok" if ios else "no_io", ios=ios,
+                      await_ms=(read_ms + write_ms) / ios if ios else None,
+                      util_pct=min(100, io_ms / (elapsed_s * 1000) * 100))
+        return sample
+
+
+    def read_diskstats():
+        with open("/proc/diskstats") as f:
+            return f.read()
+
+
+    def disk_probe(device, interval_raw, read=read_diskstats, sleep=time.sleep,
+                   clock=time.monotonic):
+        ts = datetime.now(timezone.utc).isoformat()
+        try:
+            interval = float(interval_raw)
+            if not math.isfinite(interval) or not 1 <= interval <= 30:
+                raise ValueError("invalid interval")
+            start = clock()
+            a = parse_diskstats(read()).get(device)
+            sleep(interval)
+            b = parse_diskstats(read()).get(device)
+            return disk_metrics(a, b, clock() - start, device, ts)
+        except Exception as e:  # noqa: BLE001 - probe failure must never block alerting
+            sample = disk_metrics(None, None, None, device, ts)
+            sample["error"] = type(e).__name__
+            return sample
+
+
+    def disk_section(sample):
+        return "\n".join((
+            "## Node disk at observation time", "",
+            "This host-wide sample was taken when the watchdog ran, not when the "
+            "container restarted. A 30-minute cadence can miss a stall lasting seconds.",
+            "Read/write await excludes flushes and discards; a healthy value does not "
+            "rule out fsync latency. Utilization is kernel io_ticks, not proof of saturation.",
+            "", "```",
+            f"timestamp           {sample['ts']}",
+            f"device              {sample['device']}",
+            f"interval_s          {sample['interval_s']}",
+            f"status              {sample['status']}",
+            f"await_ms            {sample['await_ms']}",
+            f"util_pct            {sample['util_pct']}",
+            f"ios                 {sample['ios']}",
+            f"error               {sample['error']}",
+            "```"))
 
 
     def workload_key(pod):
@@ -451,11 +533,11 @@ data:
             "  -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'",
             f"kubectl -n {r['namespace']} logs {r['pod']} -c {r['container']} --previous",
             "```",
-            "",
-            "---",
-            "Raised automatically by `apps/restart-watchdog`. It closes itself when "
-            "the container stops restarting.",
         ]
+        if r.get("disk"):
+            lines.extend(("", disk_section(r["disk"])))
+        lines.extend(("", "---", "Raised automatically by `apps/restart-watchdog`. "
+                      "It closes itself when the container stops restarting."))
         return "\n".join(lines)
 
 
@@ -656,6 +738,18 @@ data:
         eprint(f"scanned {len(pods)} pods, {found} unhealthy container(s), "
                f"{len(suppressed)} attached to a node event, {len(records)} reported")
 
+        if os.environ.get("DISK_PROBE", "observe") != "off":
+            try:
+                sample = disk_probe(os.environ.get("DISK_DEVICE", "sdd"),
+                                    os.environ.get("DISK_INTERVAL_SECONDS", "5"))
+            except Exception as e:  # noqa: BLE001 - sampling never blocks notification
+                sample = disk_metrics(None, None, None, os.environ.get("DISK_DEVICE", "sdd"),
+                                      datetime.now(timezone.utc).isoformat())
+                sample["error"] = type(e).__name__
+            eprint("DISKPROBE " + json.dumps(sample, separators=(",", ":")))
+            for r in records:
+                r["disk"] = sample
+
         try:
             sent = notify(token, repo, records, live, now, renotify)
         except Exception as e:  # noqa: BLE001 - an undelivered alert is a failure
@@ -777,6 +871,57 @@ data:
         assert marker.split(":", 1)[1].rsplit("-->", 1)[0].strip() == key_of(rec)
         assert marker in issue_body(rec).splitlines()[0]
 
+        line = ("8 48 sdd 2057268 562938 59342191 2632082 5678558 20354514 "
+                "1357122939 72486033 0 11214296 77901689 0 0 0")
+        assert parse_diskstats(line)["sdd"] == (2057268, 2632082, 5678558, 72486033, 11214296)
+        first, last = (10, 100, 20, 200, 300), (12, 120, 23, 250, 350)
+        disk = disk_metrics(first, last, 10, "sdd", now.isoformat())
+        assert disk["status"] == "ok" and disk["ios"] == 5
+        assert disk["await_ms"] == 14 and disk["util_pct"] == 0.5, disk
+        idle = disk_metrics(first, (10, 100, 20, 200, 310), 10, "sdd", now.isoformat())
+        assert idle["status"] == "no_io" and idle["await_ms"] is None
+        assert idle["util_pct"] == 0.1, idle
+        assert disk_metrics(first, (9, 100, 20, 200, 300), 10, "sdd", now.isoformat())["status"] == "unavailable"
+        assert disk_metrics(None, last, 10, "sdd", now.isoformat())["status"] == "unavailable"
+        def failing_read():
+            raise OSError("read failed")
+        assert disk_probe("sdd", "5", read=failing_read, sleep=lambda _: None)["status"] == "unavailable"
+        assert disk_probe("missing", "5", read=lambda: line,
+                          sleep=lambda _: None)["status"] == "unavailable"
+        for bad in ("abc", "nan", "0", "-1", "999"):
+            assert disk_probe("sdd", bad, read=lambda: line, sleep=lambda _: None)["status"] == "unavailable"
+        ticks = iter((0, 10))
+        slept = []
+        reads = iter(("8 48 sdd 10 0 0 100 20 0 0 200 0 300",
+                      "8 48 sdd 12 0 0 120 23 0 0 250 0 350"))
+        overslept = disk_probe("sdd", "5", read=lambda: next(reads),
+                               sleep=slept.append, clock=lambda: next(ticks))
+        assert slept == [5] and overslept["interval_s"] == 10
+        assert overslept["util_pct"] == 0.5, overslept
+        assert "## Node disk at observation time" not in issue_body(rec)
+        assert "## Node disk at observation time" in issue_body(dict(rec, disk=disk))
+
+        original = {name: globals()[name] for name in ("k8s_get", "notify", "disk_probe")}
+        env = {name: os.environ.get(name) for name in ("ALERT_REPO", "GITHUB_TOKEN", "DISK_PROBE")}
+        notified = []
+        try:
+            os.environ.update(ALERT_REPO="test/repo", GITHUB_TOKEN="test-token")
+            globals()["k8s_get"] = lambda _: {"items": [pod("x-aaaaaaaaaa-bbbbb", restarts=9,
+                                                           fin=datetime.now(timezone.utc).isoformat())]}
+            globals()["notify"] = lambda _token, _repo, records, _live, _now, _hours: notified.append(records) or 0
+            globals()["disk_probe"] = lambda *_: disk_metrics(None, None, None, "sdd", now.isoformat())
+            os.environ["DISK_PROBE"] = "off"
+            assert main() == 0 and "disk" not in notified[-1][0]
+            os.environ["DISK_PROBE"] = "observe"
+            assert main() == 0 and notified[-1][0]["disk"]["status"] == "unavailable"
+        finally:
+            globals().update(original)
+            for name, value in env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
         # Muting: reported once, then silent until the renotify window elapses.
         iss = {"labels": [{"name": SEVERITY_LABELS["warning"]}], "updated_at": "2026-08-07T11:00:00Z"}
         assert notify_action(rec, None, now, 24) == "open"
@@ -880,6 +1025,9 @@ spec:
                 # bad case is half a threshold.
                 - { name: MIN_RESTARTS, value: "5" }
                 - { name: WINDOW_HOURS, value: "6" }
+                - { name: DISK_PROBE, value: "observe" }
+                - { name: DISK_DEVICE, value: "sdd" }
+                - { name: DISK_INTERVAL_SECONDS, value: "5" }
                 # Same destination as job-watchdog, on purpose: one label, one
                 # inbox, one place fleet faults are already worked.
                 - { name: ALERT_REPO, value: "olafkfreund/Factory" }
