@@ -76,8 +76,9 @@ Assumes each node has a /24 pod CIDR (k3s default). If a node shows rules only
 for the other node's pods, kube-router holds a stale IP: restart that node
 again (`docker restart`, then re-add the hosts entries, then re-check).
 
-Then confirm the probe: both CronJobs should pass on their next run (or trigger
-one: `kubectl create job -n factory --from=cronjob/netpol-node-probe-agent probe-now`).
+Then confirm the probe: the server CronJob should pass on its next run (or trigger
+one: `kubectl create job -n factory --from=cronjob/netpol-node-probe-server probe-now`).
+agent-0 has no probe (see below): rely on the rule-count check above for it.
 
 ```bash
 kubectl get cronjob,job -n factory | grep netpol-node-probe
@@ -86,8 +87,16 @@ kubectl get applications -n argocd   # all Synced/Healthy
 
 ## The probe (`apps/netpol-node-probe`)
 
-Two CronJobs (`netpol-node-probe-server`, `-agent`), every 10 minutes, each
-pinned to its node by `kubernetes.io/hostname`. A failing Job is turned into a
+One CronJob (`netpol-node-probe-server`), every 10 minutes, pinned to its node by
+`kubernetes.io/hostname`. The `-agent` CronJob was retired (Factory#3832):
+k3d-factory-agent-0 carries the taint `rfactory.io/desktops=true:NoSchedule`
+(RFactory#3), Kyverno `rfactory-desktops-toleration` allows that toleration only
+on desktop launcher pods, so the probe pod could never schedule (Pending, then
+`DeadlineExceeded`) and agent-0 hosts no task pods. That was a probe that could
+not run, not a loss of enforcement. If the taint is removed, restore the CronJob
+with `git log -p -- apps/netpol-node-probe/manifests/manifests.yaml`
+(the commit that retired it, Factory#3832) and re-add it with `nodeSelector`
+`k3d-factory-agent-0`. A failing Job is turned into a
 GitHub issue by `apps/job-watchdog` after two consecutive failures (about 50
 minutes). Triage a failure:
 
