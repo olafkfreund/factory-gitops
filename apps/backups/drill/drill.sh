@@ -5,9 +5,9 @@
 # verdict is in the file and the last container turns it into the Job status.
 set -uo pipefail
 S=${SCRATCH:-/scratch}
-EXPECTED_DBS=${EXPECTED_DBS:-pfactory tfactory aifactory cfactory factory}
-# The bootstrap database `factory` may legitimately hold no tables, so only these must.
-TABLE_DBS=${TABLE_DBS:-pfactory tfactory aifactory cfactory}
+# Live Postgres has no `factory` database and cfactory holds no tables (Factory#3807).
+EXPECTED_DBS=${EXPECTED_DBS:-pfactory tfactory aifactory cfactory}
+TABLE_DBS=${TABLE_DBS:-pfactory tfactory aifactory}
 MAX_RESTORE_ERRORS=${MAX_RESTORE_ERRORS:-0}
 MAX_DUMP_AGE_SECONDS=${MAX_DUMP_AGE_SECONDS:-90000}   # 25h: yesterday's dump is 25h old at worst
 export HOME="$S" TMPDIR="$S"
@@ -50,10 +50,12 @@ run() {
   initdb_s=$(( $(now) - a ))
 
   a=$(now)
-  gunzip -c "$S/dump.sql.gz" | "${PSQL[@]}" -d postgres -v ON_ERROR_STOP=0 >"$S/restore.log" 2>&1
+  # DROP ROLE lines are removed: on a fresh cluster every non-bootstrap role is absent, and a
+  # blanket "role does not exist" filter would also hide failed ALTER OWNER and GRANT lines.
+  gunzip -c "$S/dump.sql.gz" | sed '/^DROP ROLE /d' | "${PSQL[@]}" -d postgres -v ON_ERROR_STOP=0 >"$S/restore.log" 2>&1
   [ "${PIPESTATUS[0]}" -eq 0 ] || problems+=("gunzip_failed")
   # Replaying onto a fresh cluster always gives these three: DROP DATABASE of a
-  # database that does not exist yet, DROP/CREATE ROLE of the bootstrap role.
+  # database that does not exist yet, CREATE of the bootstrap role.
   errors=$(grep -E 'ERROR:|FATAL:|PANIC:|psql: error|invalid command' "$S/restore.log" | grep -vcE 'database ".*" does not exist|current user cannot be dropped|role "factory" already exists' || true)
   restore_s=$(( $(now) - a ))
   [ "$errors" -le "$MAX_RESTORE_ERRORS" ] || problems+=("restore_errors_${errors}")
