@@ -1,0 +1,27 @@
+# KubeVirt: VM workloads on this cluster, for RFactory #3's disposable desktop VMs
+# (olafkfreund/RFactory, spec/2026-11-18-3-agent-workspace-k3d.md). Upstream release manifests,
+# every image pinned to tag@digest (see manifests/kustomization.yaml). KVM only.
+#
+# Prune is off and the namespace is never deleted by ArgoCD: removing KubeVirt deletes running VMs,
+# so it is an explicit, ordered operation (delete the KubeVirt CR first, then this app).
+# App-of-apps auto-discovers this file (apps/**/application.yaml).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kubevirt
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/kubevirt/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kubevirt
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
