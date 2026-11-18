@@ -158,21 +158,30 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 http.server.HTTPServer(("127.0.0.1", 9999), H).serve_forever()
 PY
-python3 "$BENCH/listen.py" > "$BENCH/hits.log" &  LISTENER=$!
+python3 "$BENCH/listen.py" > "$BENCH/hits.log" 2>&1 &  LISTENER=$!
+sleep 1; kill -0 "$LISTENER" || echo "listener did not start (port 9999 busy?): fix this before reading any result"
 
 # 3. point the CLI at the listener, authenticated by the token file
 CLAUDE_CODE_OAUTH_TOKEN="$(cat "$BENCH/oauth-token")" ANTHROPIC_BASE_URL=http://127.0.0.1:9999 \
   timeout 90 claude -p hi; echo "exit=$?"
 
-# 4. read the result, then clean up
-cat "$BENCH/hits.log"; kill "$LISTENER"; shred -u "$BENCH/oauth-token"
+# 4. read the result
+cat "$BENCH/hits.log"
+
+# 5. second run with the other credential form, then read again
+ANTHROPIC_AUTH_TOKEN="$(cat "$BENCH/oauth-token")" ANTHROPIC_BASE_URL=http://127.0.0.1:9999 \
+  timeout 90 claude -p hi; echo "exit=$?"; cat "$BENCH/hits.log"
+
+# 6. clean up only after both runs
+kill "$LISTENER"; shred -u "$BENCH/oauth-token"
 ```
 
 Reading it: a line like `POST /v1/messages ... ['authorization', ...]` (or `x-api-key`) means the base URL IS
 honoured under the OAuth token, and the header names tell which credential form the CLI sends. An empty
-`hits.log` means the CLI ignored the variable (it went to its own endpoint), so Plane B is not possible through a
-gateway and the epic records that. Repeat once with `ANTHROPIC_AUTH_TOKEN` instead of `CLAUDE_CODE_OAUTH_TOKEN` and note
-whether behaviour differs. Then revoke the token (`claude` account settings) and delete `$BENCH`.
+`hits.log` with the listener confirmed running (step 2) means the CLI ignored the variable (it went to its own
+endpoint), so Plane B is not possible through a gateway and the epic records that; an empty log with a listener
+that failed to start is inconclusive. Step 5 repeats with `ANTHROPIC_AUTH_TOKEN` instead of `CLAUDE_CODE_OAUTH_TOKEN`:
+note whether behaviour differs. Then revoke the token (`claude` account settings) and delete `$BENCH`.
 
 Terms (cannot be decided from code): read Anthropic's current Consumer Terms, Commercial Terms and the Claude Code
 legal and compliance page, and answer in writing whether a subscription OAuth token may be sent through a
