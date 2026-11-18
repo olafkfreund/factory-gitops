@@ -1,0 +1,36 @@
+# RFactory #3 desktops (KubeVirt VMs): manifests live in olafkfreund/RFactory, pinned to a commit.
+# Not synced by itself: `exclude` keeps this file and namespace.yaml out of the
+# synced set. The namespace is applied once by hand and never owned by the app
+# (plan deviation 9). Deleting this Application removes the workloads, policies
+# and StorageClass, never the namespace, PVCs or profile ConfigMaps.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rfactory-desktops
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/RFactory
+    targetRevision: 36723c7a8013c284ac369d3b3b9402557ed4cc89
+    path: deploy/k8s/rfactory-desktops
+    directory:
+      exclude: "{namespace.yaml,application.yaml}"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rfactory-desktops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - PruneLast=true
+      - RespectIgnoreDifferences=true
+  # The runner owns the Lease's holder and renewTime.
+  ignoreDifferences:
+    - group: coordination.k8s.io
+      kind: Lease
+      name: rfactory-runner
+      jsonPointers: [/spec]
