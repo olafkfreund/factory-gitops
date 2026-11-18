@@ -16,6 +16,11 @@ for value in "${S3_ACCESS_KEY:-}" "${S3_SECRET_KEY:-}" "${OFFSITE_S3_BUCKET:-}" 
 done
 
 SCRATCH=${SCRATCH:-/scratch}
+# Cap mc parallelism: autodetect scales with the host CPUs and OOMKilled the 512Mi pod (Factory#3806).
+MC_MAX_WORKERS=${MC_MAX_WORKERS:-4}
+case "$MC_MAX_WORKERS" in
+  ""|*[!0-9]*|0*) fail 'invalid MC_MAX_WORKERS' ;;
+esac
 MAX_AGE_SECONDS=${MAX_AGE_SECONDS:-43200}
 case "$MAX_AGE_SECONDS" in
   ''|*[!0-9]*) fail 'invalid MAX_AGE_SECONDS' ;;
@@ -83,7 +88,7 @@ if [ -n "${OFFSITE_AGE_RECIPIENT:-}" ]; then
   exit 0
 fi
 
-mc mirror fac/factory-backups/postgres/ "off/$OFFSITE_S3_BUCKET/postgres/" || fail 'mirror failed'
+mc mirror --max-workers "$MC_MAX_WORKERS" fac/factory-backups/postgres/ "off/$OFFSITE_S3_BUCKET/postgres/" || fail 'mirror failed'
 # shortcut: reads the whole newest dump back each night, fine at MB size; compare provider checksums when dumps reach GBs
 mc cat "off/$OFFSITE_S3_BUCKET/postgres/$name" > "$SCRATCH/readback.gz" || fail 'destination read-back failed'
 [ -s "$SCRATCH/readback.gz" ] || fail 'destination dump is empty'
