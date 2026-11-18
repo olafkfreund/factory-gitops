@@ -4,8 +4,10 @@
 import argparse
 import difflib
 import json
+import math
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 GATEWAY = ROOT / "apps/model-gateway"
@@ -29,6 +31,39 @@ def main():
         for key, value in overrides.items()
     ):
         parser.error("overrides must map known classes to non-empty model strings")
+    policy_file = GATEWAY / "route-policy.json"
+    try:
+        policy = json.loads(policy_file.read_text()) if policy_file.exists() else {}
+    except json.JSONDecodeError as exc:
+        parser.error(f"invalid route-policy.json: {exc}")
+    if not isinstance(policy, dict) or any(key not in CLASSES for key in policy):
+        parser.error("policy must map known classes to objects")
+    for model_class, route in policy.items():
+        if not isinstance(route, dict) or route.keys() - {"quota", "upstreams"}:
+            parser.error(f"invalid policy for {model_class}")
+        if "quota" in route:
+            quota = route["quota"]
+            if not isinstance(quota, dict) or quota.keys() - {"window_s", "requests", "tokens"} or not ({"requests", "tokens"} & quota.keys()):
+                parser.error(f"invalid quota for {model_class}")
+            quota.setdefault("window_s", 60)
+            if any(type(value) not in (int, float) or (isinstance(value, float) and not math.isfinite(value)) or value <= 0 for value in quota.values()):
+                parser.error(f"invalid quota for {model_class}")
+        if "upstreams" in route:
+            upstreams = route["upstreams"]
+            if not isinstance(upstreams, list) or not upstreams:
+                parser.error(f"invalid upstreams for {model_class}")
+            for upstream in upstreams:
+                if not isinstance(upstream, dict) or upstream.keys() - {"url", "key_env", "model"}:
+                    parser.error(f"invalid upstream for {model_class}")
+                url = upstream.get("url")
+                try:
+                    parsed = urlsplit(url) if isinstance(url, str) else None
+                    valid_url = parsed and parsed.scheme in ("http", "https") and parsed.hostname and parsed.port != 0
+                except ValueError:
+                    valid_url = False
+                if not valid_url or ("key_env" in upstream and upstream["key_env"] not in ("GATEWAY_UPSTREAM_API_KEY", "GATEWAY_UPSTREAM2_API_KEY")) or ("model" in upstream and (not isinstance(upstream["model"], str) or not upstream["model"].strip())):
+                    parser.error(f"invalid upstream for {model_class}")
+                upstream["url"] = url.rstrip("/")
 
     routes = {}
     for model_class in CLASSES:
@@ -52,6 +87,10 @@ def main():
         if best:
             routes[model_class] = best[0]
     routes.update(overrides)
+    for model_class, route in policy.items():
+        if model_class not in routes:
+            parser.error(f"no model for policy class {model_class}")
+        routes[model_class] = {"model": routes[model_class], **route}
 
     value = json.dumps(routes, sort_keys=True, indent=2) + "\n"
     rendered = (

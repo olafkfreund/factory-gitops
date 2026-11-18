@@ -250,9 +250,65 @@ legal and compliance page, and answer in writing whether a subscription OAuth to
 self-hosted proxy used by automation. Post the answer, the CLI version (`claude --version`) and the date as a comment on
 Factory#1959. If the answer is no, Plane B stays closed and the epic keeps the subscription logins mounted.
 
+## Gateway features (3.17.0): quota, spend, failover, OTLP
+
+The image `sha-800eb3e-gateway` (AIFactory 3.17.0, AIFactory#2138) has per-route quota, `/metrics`, ordered
+upstream failover and an OTLP span exporter. All of it is wired in git and **off**; `scripts/test-gateway-wiring.sh`
+fails if a change turns any of it on by default.
+
+| Feature | Off because | How the owner turns it on |
+| --- | --- | --- |
+| Metrics, `GET /metrics` | `GATEWAY_METRICS` is the literal `off` | PR: set the value to `on`, then restart |
+| OTLP spans | `GATEWAY_OTLP_ENDPOINT` unset (optional Secret key) | seed `GATEWAY_OTLP_ENDPOINT`, `GATEWAY_OTLP_HEADERS` in `model-gateway-secrets`, restart |
+| Failover upstream | no route lists one; `GATEWAY_UPSTREAM2_API_KEY` is an optional Secret key | seed the key, add the route policy (below), restart for the key |
+| Quota | no route has `quota` | add the route policy, merge (hot reload, no restart) |
+
+Secret-backed env is read at container start, so after seeding or changing a Secret key, or flipping
+`GATEWAY_METRICS`: `kubectl -n gateway rollout restart deploy/model-gateway`. Never put a value on a command line;
+use `--from-file` from a `/dev/shm` file as in the owner steps above.
+
+**Route policy.** `apps/model-gateway/route-policy.json` (committed as `{}`) maps a class to
+`{"quota": {"window_s": 60, "requests": 100, "tokens": 200000}, "upstreams": [{"url": "https://...", "key_env":
+"GATEWAY_UPSTREAM2_API_KEY", "model": "optional"}]}`. Upstreams are tried in order (primary first) on 5xx, timeout or
+connection error. `key_env` may only be `GATEWAY_UPSTREAM_API_KEY` or `GATEWAY_UPSTREAM2_API_KEY`. Regenerate and
+check exactly as for overrides (see Routes); the class must have a model from the catalog rule or an override.
+
+**Per pod, not per fleet.** There are 2 replicas with no session affinity, and quota windows and counters live in each
+pod's memory (a restart resets them). A request quota is enforced per pod, so the fleet total is up to twice the
+configured value: set the per-pod limit to half the intended total. A token quota is only an admission threshold:
+tokens are charged after a response completes, so concurrent requests can overshoot it by more than 2x. It is not a
+fleet cap.
+
+**Reading the counters (no ServiceMonitor: the cluster has no Prometheus Operator CRDs).** With metrics on, per pod:
+
+```bash
+# token file supplied by the owner (the gateway client token); never echo it
+for p in $(kubectl -n gateway get pods -l app=model-gateway -o name); do
+  kubectl -n gateway port-forward "$p" 18080:8080 >/dev/null & pf=$!; sleep 2
+  curl -fsS -H "Authorization: Bearer $(cat "$TOKEN_FILE")" http://127.0.0.1:18080/metrics | grep -E '^gateway_(requests|tokens|cost_usd|failovers|unpriced|usage_missing)'
+  kill "$pf"
+done
+```
+
+Sum each series over the pods. **AC-3 (grouped cost over a PARR run)** counts as proven only when you sum both pods
+before and after the run, `GATEWAY_METRICS` was on, the exercised models are priced in the catalog,
+`gateway_usage_missing_total` and `gateway_unpriced_total` did not rise (both add zero cost silently), and no pod
+restarted during the run. `python gateway.py --self-test` (in the image) is the non-zero-counter smoke check.
+
+**OpenObserve OTLP (read-only finding, NOT proven live).** The pinned OpenObserve (`apps/observe`, v0.90.3) source
+shows `POST /api/{org}/v1/traces` accepting `Content-Type: application/json` (`traces::otlp_json`, an OTLP
+`ExportTraceServiceRequest`) as well as `application/x-protobuf`, with Basic auth. The gateway appends `/v1/traces`
+and sends JSON, and sets `gen_ai.usage.input_tokens` and `output_tokens`, which OpenObserve's usage extractor reads.
+So the values to seed are `GATEWAY_OTLP_ENDPOINT=http://observe.factory.svc.cluster.local:5080/api/default` and
+`GATEWAY_OTLP_HEADERS=Authorization=Basic <base64 of user:password>` (the exporter is best-effort and silent, so
+success is only visible as spans in the OpenObserve `default` traces stream). `allow-otlp-egress` opens the one
+path gateway to `observe:5080`. Source evidence is not an ingest test: after seeding and a restart, send one chat
+request and look for the span; if it is missing, file an AIFactory issue for the exporter.
+
 ## Not done yet
 
-- The owner steps above (Secret, keys, proof, switch-on), the Plane B bench test, pinning upstream-servable
+- The owner steps above (Secret, keys, proof, switch-on), seeding the optional OTLP and second-upstream keys and the
+  live proofs for AC-2, AC-3 and AC-4, the Plane B bench test, pinning upstream-servable
   ids in `route-overrides.json`, and enabling `AIFACTORY_PHASE_ROUTES` after the Secret exists.
 - Epic stages 3 to 6: routes in the contract, AIFactory and PFactory through the gateway, Plane B, and
   revoking and rotating the old provider keys at the provider (removing them from a Deployment does not

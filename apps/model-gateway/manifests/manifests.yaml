@@ -29,7 +29,7 @@ spec:
           # Immutable build tag, NOT tag@digest: Kyverno v1.18 does not match
           # `aifactory:<tag>@sha256:...` against the `aifactory:*` glob, so a
           # tag@digest Pod is admitted with no signature check (measured, #1959).
-          image: ghcr.io/olafkfreund/aifactory:sha-24184c6-gateway
+          image: ghcr.io/olafkfreund/aifactory:sha-800eb3e-gateway
           ports:
             - name: http
               containerPort: 8080
@@ -59,6 +59,32 @@ spec:
             # change with no restart. Directory mount, no subPath: subPath mounts never update.
             - name: GATEWAY_ROUTES_PATH
               value: /etc/model-routes/routes.json
+            # Gateway 3.17.0 features (Factory#1959), all off until the owner acts. Secret-backed env
+            # is read at container start: after seeding or changing the Secret keys below, or flipping
+            # GATEWAY_METRICS in a PR, run `kubectl -n gateway rollout restart deploy/model-gateway`.
+            # Route quota and upstreams live in the routes file (route-policy.json) and hot-reload.
+            - name: GATEWAY_METRICS
+              value: "off"
+            # OTLP spans are exported only when the endpoint is set (docs/model-gateway.md).
+            - name: GATEWAY_OTLP_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: model-gateway-secrets
+                  key: GATEWAY_OTLP_ENDPOINT
+                  optional: true
+            - name: GATEWAY_OTLP_HEADERS
+              valueFrom:
+                secretKeyRef:
+                  name: model-gateway-secrets
+                  key: GATEWAY_OTLP_HEADERS
+                  optional: true
+            # Key for a failover upstream; read only when a route's upstreams name it as key_env.
+            - name: GATEWAY_UPSTREAM2_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: model-gateway-secrets
+                  key: GATEWAY_UPSTREAM2_API_KEY
+                  optional: true
           volumeMounts:
             - name: model-routes
               mountPath: /etc/model-routes
@@ -204,3 +230,28 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+---
+# OTLP span export to the in-cluster OpenObserve (Factory#1959). allow-provider-egress excludes
+# 10.0.0.0/8, so without this the exporter cannot reach `observe`. One peer (namespace AND pod),
+# one port. Inert until GATEWAY_OTLP_ENDPOINT is seeded.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otlp-egress
+  namespace: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: model-gateway
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: factory
+          podSelector:
+            matchLabels:
+              app: observe
+      ports:
+        - protocol: TCP
+          port: 5080
