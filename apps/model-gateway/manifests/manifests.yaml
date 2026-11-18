@@ -29,7 +29,7 @@ spec:
           # Immutable build tag, NOT tag@digest: Kyverno v1.18 does not match
           # `aifactory:<tag>@sha256:...` against the `aifactory:*` glob, so a
           # tag@digest Pod is admitted with no signature check (measured, #1959).
-          image: ghcr.io/olafkfreund/aifactory:sha-1c4cc96-gateway
+          image: ghcr.io/olafkfreund/aifactory:sha-24184c6-gateway
           ports:
             - name: http
               containerPort: 8080
@@ -53,6 +53,16 @@ spec:
                   name: model-gateway-secrets
                   key: GATEWAY_CLIENT_TOKEN
                   optional: true
+            # Capability-class routes (local|cheap|balanced|frontier) from ConfigMap
+            # model-routes, generated from the pinned hub catalog (scripts/gen-model-routes.py).
+            # The gateway re-reads the file on every request, so a route change is a ConfigMap
+            # change with no restart. Directory mount, no subPath: subPath mounts never update.
+            - name: GATEWAY_ROUTES_PATH
+              value: /etc/model-routes/routes.json
+          volumeMounts:
+            - name: model-routes
+              mountPath: /etc/model-routes
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -77,6 +87,12 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+      volumes:
+        # optional: a missing ConfigMap leaves class names unresolved instead of stalling the rollout.
+        - name: model-routes
+          configMap:
+            name: model-routes
+            optional: true
 ---
 apiVersion: v1
 kind: Service

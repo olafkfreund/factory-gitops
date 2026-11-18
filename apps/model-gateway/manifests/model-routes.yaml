@@ -1,0 +1,13 @@
+# generated from Factory apis/model-catalog.json @ 92d2508e057524c054c6842b0170168ff7213c25; do not edit
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-routes
+  namespace: gateway
+data:
+  routes.json: |
+    {
+      "balanced": "claude-sonnet-5",
+      "cheap": "claude-haiku-4-5-20251001",
+      "frontier": "claude-opus-4-8"
+    }

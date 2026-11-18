@@ -3,3 +3,4 @@ kind: Kustomization
 namespace: gateway
 resources:
 - manifests.yaml
+- model-routes.yaml
