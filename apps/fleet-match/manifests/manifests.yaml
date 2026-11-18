@@ -1062,7 +1062,11 @@ data:
                     eprint(f"warn: cannot read deploy jobs of {repo} run {run['id']}: {e!r}")
                     break  # unknown counts as built, as before #3602
         except urllib.error.HTTPError as e:
-            eprint(f"warn: cannot read deploy runs of {repo}: HTTP {e.code} {e.read(200)!r}")
+            try:
+                body = e.read(200)
+            except Exception:  # noqa: BLE001 -- diagnostics must not abort the fallback
+                body = b""
+            eprint(f"warn: cannot read deploy runs of {repo}: HTTP {e.code} {body!r}")
             runs = None
         except Exception as e:  # noqa: BLE001
             eprint(f"warn: cannot read deploy runs of {repo}: {e!r}")
