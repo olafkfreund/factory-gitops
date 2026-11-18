@@ -9,6 +9,7 @@ mkdir -p "$tmp/bin" "$tmp/scratch" "$tmp/backup"
 cat > "$tmp/bin/mc" <<EOS
 #!/bin/sh
 [ "\$1" = alias ] && exit 0
+[ "\$1" = mirror ] && { [ "\$2" = --max-workers ] && [ "\$3" = "\${EXPECT_WORKERS:-4}" ] || { echo "mirror without the --max-workers cap" >&2; exit 97; }; }   # Factory#3806
 [ "\$1" = mirror ] && [ -n "\${FAIL_MIRROR:-}" ] && exit 1
 for a in "\$@"; do
   case "\$a" in fac/*) a="$tmp/root/\$a" ;; esac
@@ -57,4 +58,7 @@ run; run
 [ "$(gens)" -eq 3 ] || { echo "FAIL keeps only 3 generations (have $(gens))"; exit 1; }
 [ ! -d "$g1" ] || { echo "FAIL oldest not pruned"; exit 1; }
 echo "PASS keeps 3 generations"
+MC_MAX_WORKERS=2 EXPECT_WORKERS=2 run || { echo "FAIL MC_MAX_WORKERS override"; exit 1; }
+for bad in 0 00 x; do MC_MAX_WORKERS=$bad sh "$here/minio-local.sh" >/dev/null 2>&1 && { echo "FAIL bad MC_MAX_WORKERS $bad accepted"; exit 1; }; done
+echo "PASS worker cap overridable, bad values rejected"
 echo "ALL PASS"
