@@ -223,3 +223,34 @@ Self-contained: the approved decisions from the intent and spec, then the steps.
 Revert the factory-gitops merge and apply `bootstrap/` in two phases. The rehearsal proved this restores v2.13.1.
 Step 3 stays, because it works with both versions. If a single app misbehaves after the upgrade, disable its
 auto-sync first and then decide whether to roll back. Never delete a CRD.
+
+## Deviations (during steps 5 and 6)
+
+- **Lease exclusions dropped (owner decision, 2026-11-18).** ArgoCD never manages Leases, even on today's v2.13.1:
+  - RFactory's `lease.yaml` is in the rfactory-desktops source;
+  - the live cluster's argocd-cm sets no exclusions;
+  - yet `Lease/rfactory-runner` is absent from the live app's `.status.resources` and from the rendered manifests, on
+    both versions.
+
+  Removing the Lease rule from 3.x's default exclusions therefore changes nothing. The patch
+  `bootstrap/argocd-cm-tracking-patch.yaml` now sets only `application.resourceTrackingMethod: label`, and
+  `resource.exclusions` is v3.5.7's default. The rehearsal check became "Lease handling same as v2.13.1".
+- **CRD barrier.** `kubectl wait --for condition=established` errors, instead of waiting, on a CRD so new that it has
+  no conditions yet (rehearsal run 7). Every apply, the live one included, polls each of the three CRDs instead: for
+  up to 120 s, for `.status.conditions[?(@.type=="Established")].status == True`. If one never gets there, it stops
+  before phase 2.
+- **The rehearsal script's setup**, fixed across runs 1 to 11 and not part of the upgrade itself:
+  - The rehearsal has its own kubeconfig, holding only `k3d-argocd-rehearsal`, so the live cluster is unreachable
+    and the shared kubeconfig untouched.
+  - That kubeconfig's namespace is `argocd`, which `argocd --core` needs.
+  - The fixture git daemon runs on `alpine:3.20` with `git-daemon` and a `safe.directory` exception. Apps reach it
+    by IP, because CoreDNS can't see Docker network aliases.
+  - Each record step first refreshes every app and waits until it has reconciled, since the controller's cache
+    starts empty after an upgrade.
+- **Rehearsal checks.**
+  - Instance labels are compared with v2.13.1. keda's and kyverno's CRDs carry no instance label on either
+    version.
+  - The CronJob fixture alternates between success and failure, because v3.5.7 reads `Degraded` only after a
+    success followed by a failure (`resource_customizations/batch/CronJob/health.lua`). Its health is polled while
+    the cluster is on v3.5.7.
+- **Result:** run 11 passed all 20 checks, rollback included. A final run on the changed patch confirms the result.

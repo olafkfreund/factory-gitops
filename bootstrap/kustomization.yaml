@@ -50,7 +50,7 @@ images:
 
 patches:
   - path: argocd-cm-compareoptions-patch.yaml
-  - path: argocd-cm-tracking-exclusions-patch.yaml
+  - path: argocd-cm-tracking-patch.yaml
   - path: argocd-server-insecure-patch.yaml
     target:
       group: apps
