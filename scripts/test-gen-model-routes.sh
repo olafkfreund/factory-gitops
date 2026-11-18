@@ -26,14 +26,14 @@ script="$tmp/scripts/gen-model-routes.py"
 output="$tmp/apps/model-gateway/manifests/model-routes.yaml"
 python3 "$script" --catalog "$tmp/catalog.json"
 python3 "$script" --catalog "$tmp/catalog.json" --check
-rg -q '"cheap": "cheap-a"' "$output"
-rg -q '"balanced": "balanced-ok"' "$output"
-rg -q '"frontier": "frontier-ok"' "$output"
-if rg -q '"local"' "$output"; then exit 1; fi
+grep -q '"cheap": "cheap-a"' "$output"
+grep -q '"balanced": "balanced-ok"' "$output"
+grep -q '"frontier": "frontier-ok"' "$output"
+if grep -q '"local"' "$output"; then exit 1; fi
 
 printf '{"cheap":"override-model"}\n' > "$tmp/apps/model-gateway/route-overrides.json"
 python3 "$script" --catalog "$tmp/catalog.json"
-rg -q '"cheap": "override-model"' "$output"
+grep -q '"cheap": "override-model"' "$output"
 for bad in '{"unknown":"model"}' '{"cheap":""}'; do
     printf '%s\n' "$bad" > "$tmp/apps/model-gateway/route-overrides.json"
     if python3 "$script" --catalog "$tmp/catalog.json" > "$tmp/out" 2>&1; then
@@ -49,14 +49,14 @@ if python3 "$script" --catalog "$tmp/catalog.json" --check > "$tmp/diff"; then
 else
     status=$?
     test "$status" -eq 1
-    rg -q '^--- ' "$tmp/diff"
+    grep -q '^--- ' "$tmp/diff"
 fi
 
-rg -q '^- model-routes.yaml$' "$repo/apps/model-gateway/manifests/kustomization.yaml"
+grep -q '^- model-routes.yaml$' "$repo/apps/model-gateway/manifests/kustomization.yaml"
 if command -v kustomize >/dev/null 2>&1; then
     kustomize build "$repo/apps/model-gateway/manifests" > "$tmp/build.yaml"
     test -s "$tmp/build.yaml"
-    rg -q 'name: model-routes' "$tmp/build.yaml"
+    grep -q 'name: model-routes' "$tmp/build.yaml"
 elif test "${REQUIRE_KUSTOMIZE:-0}" = 1; then
     echo 'kustomize is required' >&2; exit 1
 fi
