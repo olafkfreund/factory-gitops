@@ -4,7 +4,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-mkdir -p "$work/bin" "$work/nojq"
+mkdir -p "$work/bin" "$work/nojq" "$work/nokube"
 cat > "$work/bin/kubectl" <<'KUBE'
 #!/bin/bash
 case "$*" in
@@ -17,6 +17,11 @@ cat "$FIXTURES/$file.json"
 KUBE
 chmod +x "$work/bin/kubectl"
 cp "$work/bin/kubectl" "$work/nojq/kubectl"
+for tool in chmod cp jq mktemp rm sed tail; do
+    ln -s "$(command -v "$tool")" "$work/nokube/$tool"
+done
+printf '{bad json' > "$work/bad.json"
+: > "$work/empty.json"
 printf 'throwaway-gateway-token\n' > "$work/token"
 cat > "$work/fixtures.py" <<'PY'
 import json, os, sys
@@ -72,7 +77,7 @@ check() { # mode expected-exit expected-text [extra args...]
     fi
     echo "pass $mode"
 }
-check clean 0 'deployments=4 jobs=1' --strict
+check clean 0 'deployments=4 jobs=1 inspection_failed=0 static=0' --strict
 check env-secret 1 'VIOLATION Deployment/aifactory main OPENAI_COMPATIBLE_API_KEY' --strict
 check env-literal 1 'VIOLATION Deployment/aifactory main OPENAI_COMPATIBLE_API_KEY' --strict --gateway-token-file "$work/token"
 check env-unverified 1 'UNVERIFIED Deployment/aifactory main OPENAI_COMPATIBLE_API_KEY' --strict
@@ -89,4 +94,11 @@ check malformed 1 'INSPECTION-FAIL' --strict
 check missing-deploy 1 'INSPECTION-FAIL' --strict
 KUBECTL_FAIL='jobs' check clean 1 'INSPECTION-FAIL' --strict
 RUN_PATH="$work/nojq" check clean 1 'INSPECTION-FAIL jq unavailable' --strict
+RUN_PATH="$work/nokube" check clean 0 'deployments=4 jobs=0 inspection_failed=0 static=1' --strict --deployments-json "$work/deploy.json"
+check env-secret 0 'SUMMARY VIOLATION=1 UNVERIFIED=0 GATEWAY-REF=0 ACCEPTED=0 deployments=4 jobs=0 inspection_failed=0 static=1' --deployments-json "$work/deploy.json"
+check env-secret 1 'VIOLATION Deployment/aifactory main OPENAI_COMPATIBLE_API_KEY' --strict --deployments-json "$work/deploy.json"
+check clean 0 'INSPECTION-FAIL Deployments file unreadable' --deployments-json "$work/missing.json"
+check clean 1 'inspection_failed=1 static=1' --strict --deployments-json "$work/missing.json"
+check clean 1 'INSPECTION-FAIL invalid workload data' --strict --deployments-json "$work/empty.json"
+check clean 1 'inspection_failed=1 static=1' --strict --deployments-json "$work/bad.json"
 echo 'verify-no-provider-keys tests passed'
