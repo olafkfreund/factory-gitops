@@ -1,6 +1,12 @@
 # netpol-node-probe: NetworkPolicy enforcement, proven per node (Factory#3782).
 #
-# One CronJob per node. Each pod carries factory.io/kind=task, so
+# One CronJob (server-0). The agent-0 CronJob is RETIRED (Factory#3832): agent-0
+# carries the taint rfactory.io/desktops=true:NoSchedule (RFactory#3) and Kyverno
+# `rfactory-desktops-toleration` admits that toleration only on desktop launcher
+# pods, so the probe pod stayed Pending until its deadline every run. New task
+# pods cannot land on agent-0 either, so the probe's subject is gone. If the
+# taint is lifted, restore the CronJob from git history (docs/runbooks/k3d-restart.md).
+# Each pod carries factory.io/kind=task, so
 # factory-sandbox-jobs-egress selects it like any task pod, and runs the same
 # two-leg check as the netpol-gate (apps/kyverno-policies): the kube-api
 # ClusterIP must connect AND this node's kubelet :10250 must be refused. Both
@@ -82,66 +88,6 @@ spec:
           automountServiceAccountToken: false
           # Not nodeName: that would skip the scheduler's resource and taint checks.
           nodeSelector: { kubernetes.io/hostname: k3d-factory-server-0 }
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 65534
-            runAsGroup: 65534
-            seccompProfile: { type: RuntimeDefault }
-          containers:
-            - name: probe
-              image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
-              command: ["sh", "/script/probe.sh"]
-              env:
-                - name: HOST_IP
-                  valueFrom: { fieldRef: { fieldPath: status.hostIP } }
-                - name: NODE
-                  valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
-              securityContext:
-                allowPrivilegeEscalation: false
-                readOnlyRootFilesystem: true
-                capabilities: { drop: ["ALL"] }
-              resources:
-                requests: { cpu: 10m, memory: 16Mi }
-                limits: { memory: 32Mi }
-              volumeMounts:
-                - { name: script, mountPath: /script, readOnly: true }
-          volumes:
-            - name: script
-              configMap: { name: netpol-node-probe-script }
----
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: netpol-node-probe-agent
-  namespace: factory
-  labels: { app: netpol-node-probe }
-spec:
-  # Not staggered: apps/job-watchdog reads `5-59/10` style schedules as hourly.
-  schedule: "*/10 * * * *"
-  concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 3
-  # Failed Jobs are the evidence job-watchdog counts; keep them (no TTL).
-  failedJobsHistoryLimit: 10
-  startingDeadlineSeconds: 300
-  jobTemplate:
-    spec:
-      backoffLimit: 0
-      # Covers pod start, the Kyverno-injected netpol-gate (up to 60 polls) and
-      # the check below. A NotReady node never starts the pod, so this also fails.
-      activeDeadlineSeconds: 420
-      template:
-        metadata:
-          labels:
-            # The selector factory-sandbox-jobs-egress uses, so this pod is
-            # confined exactly like a real task pod. Kyverno injects the gate too.
-            factory.io/kind: task
-            app: netpol-node-probe
-        spec:
-          restartPolicy: Never
-          enableServiceLinks: false
-          automountServiceAccountToken: false
-          # Not nodeName: that would skip the scheduler's resource and taint checks.
-          nodeSelector: { kubernetes.io/hostname: k3d-factory-agent-0 }
           securityContext:
             runAsNonRoot: true
             runAsUser: 65534
