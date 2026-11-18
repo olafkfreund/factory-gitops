@@ -1,0 +1,10 @@
+# Label tracking, set explicitly: argo-cd 3.0 changed the default to annotation
+# tracking, and this upgrade keeps label tracking (factory-gitops #387). Moving
+# to annotations is a separate task. resource.exclusions is left at the
+# release's default; ArgoCD never managed Lease/rfactory-runner, on v2.13.1 either.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+data:
+  application.resourceTrackingMethod: label
