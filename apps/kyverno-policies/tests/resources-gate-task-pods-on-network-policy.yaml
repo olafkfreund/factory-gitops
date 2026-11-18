@@ -20,6 +20,24 @@ spec:
     - name: coder
       image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
 ---
+# Agent Job pod (AIFactory#2126): same shape as task-no-init but running as the
+# dedicated token-less SA. The gate selects on the label, so it must be gated.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: task-agent-job-sa
+  namespace: factory
+  labels:
+    app: aifactory-task
+    factory.io/kind: task
+spec:
+  restartPolicy: Never
+  serviceAccountName: aifactory-agent-job
+  automountServiceAccountToken: false
+  containers:
+    - name: coder
+      image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
+---
 # Gate-lane shape: a warm-nix-store seed init container already present.
 apiVersion: v1
 kind: Pod
