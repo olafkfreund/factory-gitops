@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 1959
 intent: intent/2026-11-18-1959-policyreport-pod-row.md
 ---
