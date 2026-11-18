@@ -31,7 +31,8 @@ mkdir -p "$tmp"; trap 'rm -rf "$tmp"' EXIT   # a failed run leaves nothing behin
 # factory-backups is not here: the postgres dumps have their own copy and drill.
 for bucket in factory-artifacts factory-evidence; do
   mkdir -p "$tmp/$bucket"
-  mc mirror "fac/$bucket" "$tmp/$bucket" >/dev/null || fail "mirror of $bucket failed"
+  # --max-workers: autodetect scales with the host's CPUs and OOMKilled the 512Mi pod (Factory#3806).
+  mc mirror --max-workers 4 "fac/$bucket" "$tmp/$bucket" >/dev/null || fail "mirror of $bucket failed"
   # shortcut: the MANIFEST hashes the snapshot copy, not the live bucket (a write during the run
   # must not fail it); a copy corrupted in transit that mc mirror misses is recorded, not caught.
   find "$tmp/$bucket" -type f > "$SCRATCH/objects" || fail "listing of $bucket snapshot failed"

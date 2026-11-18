@@ -8,7 +8,9 @@ T=$(mktemp -d); trap 'pg_ctl -D "$T/src" -m immediate stop >/dev/null 2>&1 || tr
 mkdir -p "$T/sock"
 initdb -U factory --auth=trust -D "$T/src" >/dev/null
 pg_ctl -D "$T/src" -w -o "-c listen_addresses= -c unix_socket_directories=$T/sock" -l "$T/src.log" start >/dev/null
-for db in pfactory tfactory aifactory cfactory factory; do
+# Shaped like production (Factory#3807): no `factory` database, cfactory empty, an extra role+database.
+psql -X -q -h "$T/sock" -U factory -d postgres -c "create role myfriends login" -c "create database myfriends owner myfriends" -c "create database cfactory"
+for db in pfactory tfactory aifactory; do
   psql -X -q -h "$T/sock" -U factory -d postgres -c "create database $db"
   psql -X -q -h "$T/sock" -U factory -d "$db" -c "create table job_states(id serial primary key, v text); insert into job_states(v) select 'x' from generate_series(1,10)"
 done
@@ -28,7 +30,7 @@ check() { # $1 label, $2 dir, $3 pattern that must be in result.json
 
 case_dir "$T/good"; SCRATCH="$T/good" bash "$here/drill.sh" >/dev/null
 check good "$T/good" '"ok":true'
-check good-counts "$T/good" '"databases":5,"tables":5,"rows":50,"restore_errors":0'
+check good-counts "$T/good" '"databases":4,"tables":3,"rows":30,"restore_errors":0'
 
 case_dir "$T/trunc"; head -c 200 "$T/$name" > "$T/trunc/dump.sql.gz"
 SCRATCH="$T/trunc" bash "$here/drill.sh" >/dev/null
