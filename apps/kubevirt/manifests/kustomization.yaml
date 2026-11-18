@@ -48,6 +48,12 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value: {name: SIDECAR_SHIM_IMAGE, value: "quay.io/kubevirt/sidecar-shim:v1.9.1@sha256:d48c6af64305c28de7e9a5509a11737b115cc0193f57f2a0f42faff85bebe5cd"}
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: {name: VIRT_TEMPLATE_APISERVER_IMAGE, value: "quay.io/kubevirt/virt-template-apiserver:v0.2.3@sha256:27defde24b4a4705d6096a86d134df0dc324243b56be8f0c057e1882c6da338b"}
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: {name: VIRT_TEMPLATE_CONTROLLER_IMAGE, value: "quay.io/kubevirt/virt-template-controller:v0.2.3@sha256:b45ac55de5fc9dbbee14974b45718c41eaed4d4979f92677dab3500598e33d22"}
   - target: {kind: KubeVirt, name: kubevirt}
     patch: |-
       - op: add
