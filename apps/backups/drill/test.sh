@@ -45,6 +45,11 @@ case_dir "$T/fatal"; gunzip -c "$T/$name" | sed 's/^\\connect tfactory/\\connect
 SCRATCH="$T/fatal" bash "$here/drill.sh" >/dev/null
 check fatal-counted "$T/fatal" '"ok":false'
 
+# A restore that cannot apply ownership must not pass (Factory#3807 review).
+case_dir "$T/owner"; gunzip -c "$T/$name" | sed 's/^\\connect pfactory/&\nALTER TABLE public.job_states OWNER TO missing_owner;/' | gzip > "$T/owner/dump.sql.gz"
+SCRATCH="$T/owner" bash "$here/drill.sh" >/dev/null
+check missing-owner "$T/owner" '"ok":false'
+
 case_dir "$T/old"; echo factory-cluster-20200101T000000Z.sql.gz > "$T/old/dump.name"
 SCRATCH="$T/old" bash "$here/drill.sh" >/dev/null
 check stale "$T/old" 'dump_stale'

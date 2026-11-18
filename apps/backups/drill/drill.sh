@@ -50,11 +50,13 @@ run() {
   initdb_s=$(( $(now) - a ))
 
   a=$(now)
-  gunzip -c "$S/dump.sql.gz" | "${PSQL[@]}" -d postgres -v ON_ERROR_STOP=0 >"$S/restore.log" 2>&1
+  # DROP ROLE lines are removed: on a fresh cluster every non-bootstrap role is absent, and a
+  # blanket "role does not exist" filter would also hide failed ALTER OWNER and GRANT lines.
+  gunzip -c "$S/dump.sql.gz" | sed '/^DROP ROLE /d' | "${PSQL[@]}" -d postgres -v ON_ERROR_STOP=0 >"$S/restore.log" 2>&1
   [ "${PIPESTATUS[0]}" -eq 0 ] || problems+=("gunzip_failed")
   # Replaying onto a fresh cluster always gives these three: DROP DATABASE of a
-  # database that does not exist yet, DROP of any role but the bootstrap one, CREATE of the bootstrap role.
-  errors=$(grep -E 'ERROR:|FATAL:|PANIC:|psql: error|invalid command' "$S/restore.log" | grep -vcE 'database ".*" does not exist|current user cannot be dropped|role ".*" does not exist|role "factory" already exists' || true)
+  # database that does not exist yet, CREATE of the bootstrap role.
+  errors=$(grep -E 'ERROR:|FATAL:|PANIC:|psql: error|invalid command' "$S/restore.log" | grep -vcE 'database ".*" does not exist|current user cannot be dropped|role "factory" already exists' || true)
   restore_s=$(( $(now) - a ))
   [ "$errors" -le "$MAX_RESTORE_ERRORS" ] || problems+=("restore_errors_${errors}")
 
