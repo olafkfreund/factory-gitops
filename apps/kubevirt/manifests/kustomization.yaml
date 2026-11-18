@@ -59,3 +59,9 @@ patches:
       - op: add
         path: /metadata/annotations
         value: {argocd.argoproj.io/sync-wave: "1", argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true}
+      # virt-handler runs on every node, including k3d-factory-agent-0 once RFactory#3 taints it
+      # rfactory.io/desktops=true:NoSchedule. A blanket toleration, not that key: Kyverno's
+      # rfactory-desktops-toleration admits the key only on desktop launcher pods.
+      - op: add
+        path: /spec/workloads
+        value: {nodePlacement: {tolerations: [{operator: Exists}]}}
