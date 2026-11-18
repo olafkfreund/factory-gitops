@@ -9,6 +9,7 @@ mkdir -p "$tmp/bin" "$tmp/scratch"
 cat > "$tmp/bin/mc" <<EOS
 #!/bin/sh
 [ "\$1" = alias ] && exit 0
+[ "\$1" = mirror ] && { [ "\$2" = --max-workers ] && [ "\$3" = "\${EXPECT_WORKERS:-4}" ] || { echo "mirror without the --max-workers cap" >&2; exit 97; }; }   # Factory#3806
 [ "\$1" = cat ] && [ -n "\${FAIL_CAT:-}" ] && exit 1
 [ "\$1" = ls ] && [ -n "\${FAIL_LS:-}" ] && exit 1
 [ "\$1" = cp ] && [ -n "\${CORRUPT_CP:-}" ] && { head -c 10 "\$2" > "$tmp/root/\$3"; exit 0; }
@@ -34,6 +35,8 @@ echo one > "$R/fac/factory-artifacts/a/1"; echo two > "$R/fac/factory-evidence/e
 sh "$here/minio-offsite.sh" >/dev/null || { echo "FAIL good copy"; exit 1; }
 [ "$(cat "$R/off/bk/minio/factory-artifacts/a/1")" = one ] || { echo "FAIL copy missing"; exit 1; }
 echo "PASS good copy"
+MC_MAX_WORKERS=2 EXPECT_WORKERS=2 sh "$here/minio-offsite.sh" >/dev/null || { echo "FAIL MC_MAX_WORKERS override"; exit 1; }
+echo "PASS worker cap overridable"
 
 rm "$R/fac/factory-artifacts/a/1"   # deleted at source: backup keeps it, job stays green
 sh "$here/minio-offsite.sh" >/dev/null || { echo "FAIL source delete must not fail"; exit 1; }
