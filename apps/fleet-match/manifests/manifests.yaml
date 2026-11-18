@@ -183,11 +183,16 @@ data:
     import os
     import ssl
     import sys
+    import time
     import urllib.error
     import urllib.request
     from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
 
     SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    RETRY_WAITS = (2, 5)
+    RETRY_DEADLINE = 120
+    _T0 = time.monotonic()
 
     # Window in which a mismatch is normal, timed from the deploy run's COMPLETION.
     # Floor is the ~360s of ArgoCD blindness measured on this cluster (two stacked
@@ -661,9 +666,35 @@ data:
             },
             method=method,
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read()
-        return json.loads(raw) if raw else None
+        for attempt in range(3 if method == "GET" else 1):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    raw = r.read()
+                return json.loads(raw) if raw else None
+            except (urllib.error.URLError, TimeoutError) as e:
+                if method != "GET" or attempt == 2:
+                    raise
+                wait = RETRY_WAITS[attempt]
+                if isinstance(e, urllib.error.HTTPError):
+                    retry_after = e.headers.get("Retry-After", e.headers.get("retry-after"))
+                    remaining = e.headers.get("X-RateLimit-Remaining", e.headers.get("x-ratelimit-remaining"))
+                    if not (500 <= e.code < 600 or e.code == 429 or
+                            (e.code == 403 and (retry_after is not None or remaining == "0"))):
+                        raise
+                    if retry_after is not None:
+                        try:
+                            wait = int(retry_after)
+                        except ValueError:
+                            try:
+                                wait = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                            except (TypeError, ValueError, OverflowError):
+                                raise e
+                        wait = max(0, wait)
+                        if wait > 30:
+                            raise
+                if time.monotonic() + wait >= _T0 + RETRY_DEADLINE:
+                    raise
+                time.sleep(wait)
 
 
     def ensure_labels(token: str, repo: str) -> None:
@@ -1030,6 +1061,13 @@ data:
                 except Exception as e:  # noqa: BLE001
                     eprint(f"warn: cannot read deploy jobs of {repo} run {run['id']}: {e!r}")
                     break  # unknown counts as built, as before #3602
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read(200)
+            except Exception:  # noqa: BLE001 -- diagnostics must not abort the fallback
+                body = b""
+            eprint(f"warn: cannot read deploy runs of {repo}: HTTP {e.code} {body!r}")
+            runs = None
         except Exception as e:  # noqa: BLE001
             eprint(f"warn: cannot read deploy runs of {repo}: {e!r}")
             runs = None
@@ -1334,10 +1372,54 @@ data:
                                "relevant", now, 900, 3600)
         assert version_gated["status"] == "version_gated" and version_gated["codes"] == [], version_gated
 
+        # ---- gh() retries a transient GET, and only a GET (Factory#3814) ---
+        import io
+        calls = []
+        script = []
+
+        class _Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=0):
+            calls.append(req.get_method())
+            step = script.pop(0)
+            if step == "ok":
+                return _Resp(b'{"a": 1}')
+            code, hdrs = step
+            raise urllib.error.HTTPError(req.full_url, code, "x", hdrs, io.BytesIO(b"boom"))
+
+        def gh_with(steps, method="GET", deadline=None):
+            calls.clear()
+            script[:] = steps
+            saved = (urllib.request.urlopen, globals()["RETRY_WAITS"], globals()["RETRY_DEADLINE"])
+            urllib.request.urlopen = fake_urlopen
+            globals()["RETRY_WAITS"] = (0, 0)
+            if deadline is not None:
+                globals()["RETRY_DEADLINE"] = deadline
+            try:
+                return gh("t", method, "/x", {} if method != "GET" else None), None
+            except urllib.error.HTTPError as e:
+                return None, e.code
+            finally:
+                urllib.request.urlopen, globals()["RETRY_WAITS"], globals()["RETRY_DEADLINE"] = saved
+
+        assert gh_with([(502, {}), (502, {}), "ok"]) == ({"a": 1}, None) and len(calls) == 3
+        assert gh_with([(404, {}), "ok"]) == (None, 404) and len(calls) == 1
+        assert gh_with([(502, {}), (502, {}), (502, {})]) == (None, 502) and len(calls) == 3
+        assert gh_with([(502, {}), "ok"], method="POST") == (None, 502) and len(calls) == 1
+        assert gh_with([(403, {"Retry-After": "1"}), "ok"]) == ({"a": 1}, None)
+        assert gh_with([(403, {"Retry-After": "99"}), "ok"]) == (None, 403) and len(calls) == 1
+        assert gh_with([(403, {}), "ok"]) == (None, 403) and len(calls) == 1  # a real 403
+        assert gh_with([(502, {}), "ok"], deadline=-1) == (None, 502) and len(calls) == 1
+
         # ---- UNEVALUABLE IS A FINDING, NEVER A SKIP ------------------------
         blind = assess(T, None, None, None, [dep()], None, now, 900, 3600)
         assert blind["codes"] == ["unevaluable", "unevaluable"], blind
         assert blind["status"] == "unevaluable"
+        assert not blind["matches_main"]
         assert severity_of(blind, None, now) == "warning"
         # ...and it escalates off the age of its own issue, or a permanent blind
         # spot would sit at warning forever. That is how rolehunter hid 47 days.

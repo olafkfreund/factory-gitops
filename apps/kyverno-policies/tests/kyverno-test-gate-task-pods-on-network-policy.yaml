@@ -41,6 +41,7 @@ results:
     result: pass
     resources:
       - task-no-init
+      - task-agent-job-sa
     patchedResources: patched-gate-task-pods-on-network-policy.yaml
   - policy: gate-task-pods-on-network-policy
     rule: inject-netpol-gate
@@ -48,6 +49,7 @@ results:
     result: pass
     resources:
       - task-no-init
+      - task-agent-job-sa
       - task-with-init
     patchedResources: patched-gate-task-pods-on-network-policy.yaml
 

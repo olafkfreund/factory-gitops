@@ -895,6 +895,61 @@ subjects:
     name: aifactory-sandbox
     namespace: factory
 ---
+# AIFactory#2126: agent Jobs no longer run as the control plane's SA. Not
+# referenced by any pod until the AIFACTORY_JOB_SA / AIFACTORY_BUILD_SA env is
+# set on the aifactory Deployment (a later PR, merged after this one syncs).
+#
+# aifactory-agent-job: spec, apply-correction, PR-review and clarification Jobs.
+# They call no Kubernetes API, so the SA has NO Role, NO RoleBinding and no
+# token mount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aifactory-agent-job
+  namespace: factory
+automountServiceAccountToken: false
+---
+# aifactory-build-job: the build Job. When sandbox gates run as Jobs
+# (AIFACTORY_SANDBOX_GATES + nixjob backend) it mounts a token and creates the
+# gate Jobs itself (core/kube_sandbox.py), so it needs the same dispatch rights
+# the control plane SA has. Copied, not narrowed: only the gate path was audited
+# (it uses jobs create/get/delete, pods list, pods/log get).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aifactory-build-job
+  namespace: factory
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aifactory-build-job
+  namespace: factory
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aifactory-build-job
+  namespace: factory
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aifactory-build-job
+subjects:
+  - kind: ServiceAccount
+    name: aifactory-build-job
+    namespace: factory
+---
 # The aifactory-nix-store-gc CronJob (RFC-0016 #197) is GONE with the PVC it
 # trimmed (Factory#253). It nightly `nix store gc`'d a warm store that nothing
 # writes to any more — garbage-collecting garbage. Per-Job /nix now comes from
