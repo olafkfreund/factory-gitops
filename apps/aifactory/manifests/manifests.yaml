@@ -469,6 +469,9 @@ spec:
             # running: a missing SA fails every Job create. Unset both to roll back.
             - { name: AIFACTORY_BUILD_SA, value: "aifactory-build-job" }
             - { name: AIFACTORY_JOB_SA, value: "aifactory-agent-job" }
+            # AIFactory#2133 (3.17.0): keep finished agent Jobs 10 min so their SA,
+            # exit status and logs can be inspected. Unset for the 300 s default.
+            - { name: AIFACTORY_JOB_TTL_SECONDS, value: "600" }
             # ── RFC-0011 label-driven intake poller (#636) — the issue->build
             # handover. INERT until an issue carries a `factory:*` label: the loop
             # lists issues, skips anything already `factory:queued` (its
