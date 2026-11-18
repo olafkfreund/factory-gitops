@@ -62,16 +62,127 @@ pods on 8080, so nothing changes until step 5. The images that run today carry t
 The Secret `model-gateway-secrets` carries no Argo labels or annotations. Both of its keys are
 `optional` in the Deployment, so nothing changes before they exist.
 
-## Plane B bench test (owner)
+## Routes (capability classes)
 
-Does the `claude` CLI honour `ANTHROPIC_BASE_URL` while authenticating with
-`CLAUDE_CODE_OAUTH_TOKEN`? Run `ANTHROPIC_BASE_URL=http://127.0.0.1:9 claude -p hi` on a bench
-host with a throwaway logged-in profile and watch for a connection attempt to port 9. A hit means
-the base URL is honoured. Also check the provider's terms for proxying subscription auth.
+The gateway rewrites a request only when its `model` is literally `local`, `cheap`, `balanced` or
+`frontier`, using the flat JSON file at `GATEWAY_ROUTES_PATH` (`/etc/model-routes/routes.json`),
+re-read on every request, and answers `X-Model-Route: <class>`. Any other model name, a missing class
+or an unreadable file leaves the request unchanged. The file is ConfigMap `model-routes`, mounted as an
+optional directory volume (no `subPath`: subPath mounts never update), so a change needs no restart.
+
+The ConfigMap is generated, never edited by hand: `scripts/gen-model-routes.py` renders
+`apps/model-gateway/manifests/model-routes.yaml` from `apis/model-catalog.json` of the Factory hub at the
+SHA in `apps/model-gateway/hub-catalog.sha`, plus per-class pins in `apps/model-gateway/route-overrides.json`.
+CI (`model-gateway-tools.yml`) fetches the catalog at that SHA and fails when the committed file differs.
+
+Selection rule, per class: catalog models with provider `claude`, `price.mode` `metered` and a concrete id
+(no `<placeholder>`); the lowest `in_per_mtok + out_per_mtok` wins, ties go to the larger `caps.context`,
+then the id. `local` has no concrete candidate and is omitted. Subscription entries (`codex`,
+`github-models`, `ollama-cloud:<model>`) are CLI-login or placeholder providers the gateway cannot serve,
+and `gemini` is a CLI shorthand, not a model id. Today: `cheap=claude-haiku-4-5-20251001`,
+`balanced=claude-sonnet-5`, `frontier=claude-opus-4-8`.
+
+Residual: the only upstream is Ollama Cloud, which cannot serve Claude ids. Nothing sends a class name until
+the owner enables `AIFACTORY_PHASE_ROUTES` (not set here, nor `AIFACTORY_RUNTIMES`), so traffic is unchanged.
+Before enabling it, pin ids the upstream serves in `route-overrides.json` (for example
+`{"cheap": "<an Ollama Cloud model id>"}`) and run the generator.
+
+Change a route or the catalog pin:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/olafkfreund/Factory/$(cat apps/model-gateway/hub-catalog.sha)/apis/model-catalog.json" -o /tmp/model-catalog.json
+python3 scripts/gen-model-routes.py --catalog /tmp/model-catalog.json   # writes model-routes.yaml
+python3 scripts/gen-model-routes.py --catalog /tmp/model-catalog.json --check
+```
+
+To take a newer catalog, write the new Factory `main` SHA into `hub-catalog.sha`, fetch that catalog, regenerate,
+and commit both in one PR.
+
+## Acceptance verifiers (read-only)
+
+Both need `kubectl` (context `k3d-factory`, override with `KUBE_CONTEXT`) and `jq`, read workload specs only
+(never a Secret), and print names, never values.
+
+**AC-1, no provider key anywhere** (container env, mounted credential volumes, dispatched Job env):
+
+```bash
+bash scripts/verify-no-provider-keys.sh --accept-volume cli-creds   # report; always exit 0
+bash scripts/verify-no-provider-keys.sh --strict --accept-volume cli-creds \
+  --gateway-token-file "$d/client"                                    # fails on any finding
+```
+
+Lines are `VIOLATION|UNVERIFIED|GATEWAY-REF|ACCEPTED <workload> <container-or-volume> <name>`. A key sourced from
+`factory-secrets/MODEL_GATEWAY_CLIENT_TOKEN` is `GATEWAY-REF`; a literal is `GATEWAY-REF` only when it equals the
+token in `--gateway-token-file` (compared in memory), else `UNVERIFIED` or `VIOLATION`; `envFrom` is `UNVERIFIED`.
+`--accept-volume` takes the volume name (`cli-creds`) and is how the accepted Plane C residual is listed
+separately. The default mode reports current violations without failing while the migration is incomplete;
+`--strict` is for the end state. Scope: model-provider keys only, not the gateway's own upstream key or
+third-party keys (LANGCHAIN, RAPIDAPI). A missing Deployment, zero Jobs or a failed `kubectl` is a failure in
+`--strict`, never a pass.
+
+**AC-2, a route change needs no redeploy:**
+
+```bash
+bash scripts/verify-route-hot-reload.sh record /tmp/routes-before.json
+# change apps/model-gateway/route-overrides.json (or the catalog pin) in a PR, regenerate, merge,
+# let Argo sync. Never kubectl edit: selfHeal reverts it.
+bash scripts/verify-route-hot-reload.sh check /tmp/routes-before.json 240
+```
+
+`record` stores each gateway pod's name, UID, restart count and the routes file it sees (via `kubectl exec`
+of a read). `check` polls until every pod shows the same new content, equal to the live ConfigMap, then
+requires the same UIDs and restart counts. It prints old and new model per class. A restart cannot fake it;
+an exec failure fails. Kubelet propagation takes up to about 90 s: note the measured time on the epic.
+(`X-Model-Route` is not used: it carries the class, which does not change when its model does.)
+
+## Plane B bench test (owner-run checklist, not run by us)
+
+Question 1: does the `claude` CLI send its requests to `ANTHROPIC_BASE_URL` while authenticating with
+`CLAUDE_CODE_OAUTH_TOKEN`? Question 2: may a subscription token be used that way (terms). Do this on a bench
+host, not a cluster node, with a throwaway home so no real login is touched.
+
+```bash
+# 1. throwaway home and token file (the token is typed once, never echoed, never on a command line)
+export BENCH=$(mktemp -d) && export HOME=$BENCH && umask 077
+claude setup-token        # interactive login; copy the token it shows
+IFS= read -rsp 'token: ' t && printf %s "$t" > "$BENCH/oauth-token"; unset t; echo
+
+# 2. a loopback listener that prints only the request line and header NAMES, never values
+cat > "$BENCH/listen.py" <<'PY'
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        print(self.requestline, sorted(self.headers.keys()), flush=True)
+        self.send_response(401); self.send_header("Content-Length", "0"); self.end_headers()
+    do_GET = do_POST
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", 9999), H).serve_forever()
+PY
+python3 "$BENCH/listen.py" > "$BENCH/hits.log" &  LISTENER=$!
+
+# 3. point the CLI at the listener, authenticated by the token file
+CLAUDE_CODE_OAUTH_TOKEN="$(cat "$BENCH/oauth-token")" ANTHROPIC_BASE_URL=http://127.0.0.1:9999 \
+  timeout 90 claude -p hi; echo "exit=$?"
+
+# 4. read the result, then clean up
+cat "$BENCH/hits.log"; kill "$LISTENER"; shred -u "$BENCH/oauth-token"
+```
+
+Reading it: a line like `POST /v1/messages ... ['authorization', ...]` (or `x-api-key`) means the base URL IS
+honoured under the OAuth token, and the header names tell which credential form the CLI sends. An empty
+`hits.log` means the CLI ignored the variable (it went to its own endpoint), so Plane B is not possible through a
+gateway and the epic records that. Repeat once with `ANTHROPIC_AUTH_TOKEN` instead of `CLAUDE_CODE_OAUTH_TOKEN` and note
+whether behaviour differs. Then revoke the token (`claude` account settings) and delete `$BENCH`.
+
+Terms (cannot be decided from code): read Anthropic's current Consumer Terms, Commercial Terms and the Claude Code
+legal and compliance page, and answer in writing whether a subscription OAuth token may be sent through a
+self-hosted proxy used by automation. Post the answer, the CLI version (`claude --version`) and the date as a comment on
+Factory#1959. If the answer is no, Plane B stays closed and the epic keeps the subscription logins mounted.
 
 ## Not done yet
 
-- The owner steps above (Secret, keys, proof, switch-on) and the Plane B bench test.
+- The owner steps above (Secret, keys, proof, switch-on), the Plane B bench test, pinning upstream-servable
+  ids in `route-overrides.json`, and enabling `AIFACTORY_PHASE_ROUTES` after the Secret exists.
 - Epic stages 3 to 6: routes in the contract, AIFactory and PFactory through the gateway, Plane B, and
   revoking and rotating the old provider keys at the provider (removing them from a Deployment does not
   invalidate them).

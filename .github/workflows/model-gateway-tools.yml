@@ -1,0 +1,63 @@
+# Model gateway tooling (Factory#1959): the routes ConfigMap must match the pinned hub catalog,
+# and the cluster-free tests of the generator and the two verifiers must pass.
+#
+# `routes-drift` fetches apis/model-catalog.json from the hub at the SHA in
+# apps/model-gateway/hub-catalog.sha. The URL has a constant owner and repo, so a PR cannot point it
+# at a fork; the file is parsed as JSON, never executed; an unreachable hub fails the job rather than
+# skipping it. Bumping the SHA and regenerating happen in one PR (docs/model-gateway.md).
+#
+# No `paths:` filter: a required check that does not run on a PR blocks that PR forever.
+name: model gateway tools
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  routes-drift:
+    name: model-routes matches the pinned hub catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Fetch the catalog at the pinned SHA
+        run: |
+          set -euo pipefail
+          sha=$(tr -d '[:space:]' < apps/model-gateway/hub-catalog.sha)
+          [[ $sha =~ ^[0-9a-f]{40}$ ]] || { echo "hub-catalog.sha must be 40 lowercase hex" >&2; exit 1; }
+          curl -fsSL "https://raw.githubusercontent.com/olafkfreund/Factory/${sha}/apis/model-catalog.json" -o /tmp/model-catalog.json
+          test -s /tmp/model-catalog.json
+      - name: Committed ConfigMap equals a fresh render
+        run: python3 scripts/gen-model-routes.py --catalog /tmp/model-catalog.json --check
+
+  shell-tests:
+    name: generator and verifier tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install kustomize (same pin as manifest-validate)
+        run: |
+          set -euo pipefail
+          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kustomize
+          kustomize version
+      - name: Generator test (the kustomize build assertion must run, not skip)
+        run: REQUIRE_KUSTOMIZE=1 bash scripts/test-gen-model-routes.sh
+      - name: AC-1 verifier test
+        run: bash scripts/test-verify-no-provider-keys.sh
+      - name: AC-2 verifier test
+        run: bash scripts/test-verify-route-hot-reload.sh
+      - name: shellcheck
+        run: shellcheck scripts/verify-no-provider-keys.sh scripts/verify-route-hot-reload.sh scripts/test-verify-no-provider-keys.sh scripts/test-verify-route-hot-reload.sh scripts/test-gen-model-routes.sh
