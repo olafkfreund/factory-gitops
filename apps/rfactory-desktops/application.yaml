@@ -14,7 +14,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/olafkfreund/RFactory
-    targetRevision: 2a6300c44a6207befcb94da2339a75aa82e7829b
+    targetRevision: 012e025fc0640045699947ab380b9133951fe623
     path: deploy/k8s/rfactory-desktops
     directory:
       exclude: "{namespace.yaml,application.yaml}"
