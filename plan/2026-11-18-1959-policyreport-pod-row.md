@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 1959
 spec: spec/2026-11-18-1959-policyreport-pod-row.md
 coders:
