@@ -64,3 +64,38 @@ images:
     newTag: "2.20.1@sha256:ba32172082a2ff935d5b62ffa0bd0698424d373b55c5cae0846db057e237b28e"
   - name: ghcr.io/kedacore/keda-admission-webhooks
     newTag: "2.20.1@sha256:0350cbb59471123623134801a3e9a753c90e0945bb4eb7e36086746fc4b35fb8"
+
+# Leader-election tolerance for keda-operator (Factory#3407, plan 2026-11-18-3560).
+#
+# keda-operator exits 1 with "leader election lost" when a lease PUT to the apiserver times
+# out (observed 2026-11-18 16:26:42-47, same seconds as virt-template-controller and the
+# Kyverno reports controller). The apiserver datastore (k3s SQLite/kine) logged a burst of
+# slow SQL in that minute. KEDA reads these three env vars (env only, v2.20.1,
+# cmd/operator/main.go); Go durations, and an unparsable value exits 1 at start.
+# 60s lease / 40s renew deadline / 5s retry lets one operator ride out a stall of up to ~40s.
+# Tradeoff: a truly hung operator's lease is reclaimed up to 60s later. The effective
+# defaults were not verified. This does not touch the suspected cause (a full shared SSD).
+# Kyverno and virt-template-controller expose no such timings. Remove to roll back.
+patches:
+  - target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: keda-operator
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: keda-operator
+      spec:
+        template:
+          spec:
+            containers:
+              - name: keda-operator
+                env:
+                  - name: KEDA_OPERATOR_LEADER_ELECTION_LEASE_DURATION
+                    value: 60s
+                  - name: KEDA_OPERATOR_LEADER_ELECTION_RENEW_DEADLINE
+                    value: 40s
+                  - name: KEDA_OPERATOR_LEADER_ELECTION_RETRY_PERIOD
+                    value: 5s
