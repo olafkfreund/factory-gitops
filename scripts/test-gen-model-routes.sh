@@ -30,6 +30,52 @@ grep -q '"cheap": "cheap-a"' "$output"
 grep -q '"balanced": "balanced-ok"' "$output"
 grep -q '"frontier": "frontier-ok"' "$output"
 if grep -q '"local"' "$output"; then exit 1; fi
+cp "$output" "$tmp/no-policy.yaml"
+printf '{}\n' > "$tmp/apps/model-gateway/route-policy.json"
+python3 "$script" --catalog "$tmp/catalog.json"
+cmp "$output" "$tmp/no-policy.yaml"
+cat > "$tmp/apps/model-gateway/route-policy.json" <<'JSON'
+{"cheap":{"quota":{"requests":10,"tokens":100},"upstreams":[{"url":"https://primary.example/","key_env":"GATEWAY_UPSTREAM_API_KEY"},{"url":"http://backup.example/","key_env":"GATEWAY_UPSTREAM2_API_KEY","model":"backup-model"}]}}
+JSON
+python3 "$script" --catalog "$tmp/catalog.json"
+python3 - "$output" <<'PY'
+import json
+import sys
+
+lines = open(sys.argv[1]).read().split('  routes.json: |\n', 1)[1].splitlines()
+routes = json.loads('\n'.join(line[4:] for line in lines))
+assert routes['cheap'] == {
+    'model': 'cheap-a',
+    'quota': {'window_s': 60, 'requests': 10, 'tokens': 100},
+    'upstreams': [
+        {'url': 'https://primary.example', 'key_env': 'GATEWAY_UPSTREAM_API_KEY'},
+        {'url': 'http://backup.example', 'key_env': 'GATEWAY_UPSTREAM2_API_KEY', 'model': 'backup-model'},
+    ],
+}
+assert routes['balanced'] == 'balanced-ok'
+PY
+for bad in \
+    '[]' \
+    '{' \
+    '{"cheap":{"quota":{"requests":0}}}' \
+    '{"cheap":{"quota":{"requests":true}}}' \
+    '{"cheap":{"quota":{"requests":-1}}}' \
+    '{"cheap":{"quota":{"window_s":60}}}' \
+    '{"cheap":{"upstreams":[{"url":"ftp://primary.example"}]}}' \
+    '{"cheap":{"upstreams":[{"url":"https://primary.example","key_env":"GATEWAY_UPSTREAM99_API_KEY"}]}}' \
+    '{"cheap":{"upstreams":[{"url":"https://primary.example","key_env":"PATH"}]}}' \
+    '{"unknown":{}}' \
+    '{"cheap":{"unknown":1}}' \
+    '{"local":{"quota":{"requests":1}}}'; do
+    printf '%s\n' "$bad" > "$tmp/apps/model-gateway/route-policy.json"
+    if python3 "$script" --catalog "$tmp/catalog.json" > "$tmp/out" 2>&1; then
+        echo "invalid policy passed: $bad" >&2; exit 1
+    else
+        status=$?
+        test "$status" -eq 2
+    fi
+done
+printf '{}\n' > "$tmp/apps/model-gateway/route-policy.json"
 
 printf '{"cheap":"override-model"}\n' > "$tmp/apps/model-gateway/route-overrides.json"
 python3 "$script" --catalog "$tmp/catalog.json"
