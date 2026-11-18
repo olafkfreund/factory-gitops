@@ -32,11 +32,22 @@ Self-contained: the approved decisions from the intent and spec, then the steps.
 
   The redis image name changes, so the pin entry's `name:` changes too. Digests were resolved with `crane digest` on
   2026-11-18.
-- **Every apply runs in two phases:**
-  1. CRDs only, server-side with `--force-conflicts`, then `kubectl wait --for condition=established` on all three;
-  2. the rest, then a rollout status check of every ArgoCD workload.
+- **Every apply runs in two phases.** `B` is the bootstrap build: `kustomize build <bootstrap dir>`, with the root
+  Application filtered out in the rehearsal.
+  1. **CRDs.** Apply `B | yq 'select(.kind == "CustomResourceDefinition")'` with
+     `kubectl apply --server-side --force-conflicts -f -`. Then wait:
+     `kubectl wait --for condition=established --timeout=120s crd/applications.argoproj.io
+     crd/applicationsets.argoproj.io crd/appprojects.argoproj.io`.
+     **If the apply or the wait exits non-zero, stop.** Phase 2 does not run, and nothing else is changed.
+  2. **The rest.** Apply `B | yq 'select(.kind != "CustomResourceDefinition")'` the same way. Then run
+     `kubectl -n argocd rollout status --timeout=300s` on each workload:
+     - the Deployments `argocd-server`, `argocd-repo-server`, `argocd-redis`, `argocd-dex-server`,
+       `argocd-applicationset-controller` and `argocd-notifications-controller`;
+     - the StatefulSet `argocd-application-controller`.
 
-  CRDs are never deleted.
+     If any check fails, stop and report. Don't retry blindly.
+
+  CRDs are never deleted. These names are the same in v2.13.1 and v3.5.7.
 - **Order:**
   1. The nixos_config change, so the bootstrap unit uses server-side apply, is deployed on p620 first.
   2. The rehearsal passes.
@@ -94,39 +105,83 @@ Self-contained: the approved decisions from the intent and spec, then the steps.
    - Do not restart `k3d-cluster-bootstrap`: it would re-apply main's v2.13.1 bootstrap. That is harmless, but it
      isn't needed.
 
-   **Verify:** `systemctl cat k3d-cluster-bootstrap` shows `--server-side --force-conflicts`.
+   **Verify:** the unit's `ExecStart` is a generated script (`k3d.nix` line 940), so check the script, not the unit:
+   `grep -- '--server-side --force-conflicts -k' "$(systemctl show -p ExecStart --value k3d-cluster-bootstrap | sed -E 's/.*path=([^ ;]+).*/\1/')"`
+   finds the line.
 
-5. **The rehearsal script**, kept in the scratchpad and not committed: `rehearse-387.sh`, with every `kubectl` and
-   `argocd` call taking `--context k3d-argocd-rehearsal`.
-   1. Create the k3d cluster (k3s `rancher/k3s:v1.35.10-k3s1`, one server, no ports, no volumes).
-   2. Install from `main`'s `bootstrap/`, in two phases, without the root Application.
-   3. Record each child app's branch head, then create the 44 child Applications with `syncPolicy.automated` deleted
-      and `targetRevision` set to that commit.
-   4. Create the two test apps from a scratch directory that is never committed.
-   5. Sync the four apps and the two test apps by hand.
-   6. Record, for every app:
-      - sync status, health, and conditions;
-      - the normalised `argocd --core app manifests --source git`;
-      - UIDs, read from the live objects listed in `.status.resources` (fail if any is missing).
+5. **The rehearsal script**, kept in the scratchpad and not committed: `rehearse-387.sh`. Every `kubectl` and
+   `argocd` call passes `--context k3d-argocd-rehearsal`.
 
-      Also record the three CRDs' `.spec`, and the `managedFields` managers of the CRDs and of `argocd-cm`.
-   7. Upgrade with the branch's `bootstrap/` (two phases, root filtered out), sync the six apps again, and record
+   **Fixtures**, in a scratch directory that is never committed:
+   - `cronjob-health`: an Application on a plain directory holding two CronJobs, both with `schedule: "*/1 * * * *"`
+     and `successfulJobsHistoryLimit: 1`. `ok` runs `true` and `fail` runs `false`, both from `busybox:1.36`.
+   - `label-adoption`: an Application on a directory holding one ConfigMap, `adoption-keep`, with `syncPolicy:
+     {automated: {prune: true}}`. It is the only rehearsal app with auto-sync, and it holds nothing but that
+     ConfigMap.
+
+   Both apps' `repoURL` is a local git repo served by the rehearsal only: a `git daemon` container on the k3d
+   network. They never use a GitHub repo.
+
+   **Pinned sources.** For each of the 44 child Applications, a `targetRevision` that is already a 40-hex commit
+   (as rfactory-desktops has) is kept. A branch or tag is resolved once, with `git ls-remote <repoURL> <ref>`, to
+   its commit. The result is written to `revisions.tsv` (app, original ref, commit) and used before and after.
+
+   **The steps:**
+   1. Refuse to start unless `kubectl config current-context` is `k3d-argocd-rehearsal`, after the cluster exists.
+      Create the cluster with `k3d cluster create argocd-rehearsal --image rancher/k3s:v1.35.10-k3s1 --servers 1
+      --agents 0 --no-lb`: no ports, no volumes.
+   2. Install from `main`'s `bootstrap/`, in two phases, root filtered out.
+   3. Create the 44 child Applications, with `syncPolicy.automated` deleted and `targetRevision` from
+      `revisions.tsv`. Then the two fixtures.
+   4. Sync keda, kyverno, kyverno-policies, coredns-upstream and `cronjob-health` by hand (`argocd --core app
+      sync`). Wait two minutes so both CronJobs run.
+   5. **Adoption check, v2.13.1.** Apply ConfigMap `adoption-stray` by hand with label
+      `app.kubernetes.io/instance: label-adoption`. Sync `label-adoption`. Expect `adoption-stray` to be gone within
+      60 s, and `adoption-keep` to remain.
+   6. **Record**, written to `rec-<phase>/`:
+      - per app: `.status.sync.status`, `.status.health.status`, and `.status.conditions`;
+      - per app: `argocd --core app manifests <app> --source git`, normalised with `yq -P 'sort_keys(..)'`;
+      - for the six synced apps only (the four plus both fixtures): `metadata.uid`, read from the live object for each
+        `.status.resources` entry. A missing object fails the step. The 38 unsynced apps have no live objects, so they
+        get no UID record;
+      - `kubectl get crd <name> -o json | jq .spec`, for each of the three CRDs;
+      - the sorted `metadata.managedFields[].manager` of the three CRDs and of `argocd-cm`.
+   7. Upgrade with the branch's `bootstrap/`, in two phases, root filtered out. Then sync the five apps from step 4
       again.
-   8. Run the adoption check: apply a second ConfigMap by hand with `label-adoption`'s instance label, sync, and
-      expect it to be pruned. Run this on both versions.
-   9. Roll back with `main`'s `bootstrap/` (two phases), sync again, and record again.
-   10. Diff the records and print a pass or fail for each spec check.
-   11. Delete the cluster.
+   8. Adoption check again, as in step 5, on v3.5.7. Record into `rec-upgraded/`.
+   9. Roll back with `main`'s `bootstrap/`, in two phases. Sync the five apps again. Adoption check again. Record
+      into `rec-rollback/`.
+   10. Print pass or fail for each check below, then delete the cluster and the `git daemon` container.
 
-   **Verify:** `bash -n` and `shellcheck` are clean. Codex has reviewed the script. Its dry-run mode prints every
+   **Checks on v3.5.7** (`rec-base` against `rec-upgraded`):
+   - no app has a condition of type `ComparisonError`;
+   - every app's normalised manifests are identical. Each difference is printed in full, and an unexplained one fails
+     the check;
+   - rfactory-desktops' `.status.resources` contains `coordination.k8s.io/Lease rfactory-desktops/rfactory-runner`;
+   - keda, kyverno, kyverno-policies and coredns-upstream are `Synced` and `Healthy`, and every recorded UID is
+     unchanged;
+   - their recorded objects still carry the `app.kubernetes.io/instance` label, so label tracking is in force;
+   - `adoption-stray` was pruned and `adoption-keep` kept, on both versions;
+   - `cronjob-health` is `Degraded` on v3.5.7, from the `fail` CronJob, which is the 3.2 health rule. Its v2.13.1
+     health is recorded, not judged.
+
+   **Checks on the rollback** (`rec-base` against `rec-rollback`):
+   - every check above, with the v2.13.1 results;
+   - each CRD's `.spec` is identical to `rec-base`;
+   - the managers set equals `rec-base`. A manager that is left over is printed with the fields it owns. It is a
+     finding for the owner, not a pass.
+
+   **Verify:** `bash -n` and `shellcheck` are clean, and Codex has reviewed the script. `--dry-run` prints every
    command without running any.
 
    **Traps:**
-   - A missing `--context` would hit the live cluster: the script refuses to start unless the current context is
-     the rehearsal one.
+   - The context guard in step 1 is the only thing that keeps the script off the live cluster. It runs first, and
+     again before every apply.
    - Never apply the root Application.
-   - The four synced apps were checked by the lead for outbound calls to live services before this step: keda,
-     kyverno, kyverno-policies, coredns-upstream.
+   - `label-adoption` has auto-sync, but its source is the local fixture repo. Nothing else gets auto-sync.
+   - Before writing the script, the lead reads the manifests of keda, kyverno, kyverno-policies and coredns-upstream
+     for outbound calls to live services. These are in-cluster controllers and config; any exception is written
+     down here.
 
 6. **Lead: run the rehearsal.** Report every check to the owner. A difference in the desired manifests is either
    explained, and then accepted or rejected by the owner, or it fails the step. Do not go on without a full pass,
