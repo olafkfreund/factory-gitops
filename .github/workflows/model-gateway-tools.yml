@@ -59,5 +59,26 @@ jobs:
         run: bash scripts/test-verify-no-provider-keys.sh
       - name: AC-2 verifier test
         run: bash scripts/test-verify-route-hot-reload.sh
+      - name: Acceptance 5 verifier test (fixture PolicyReports)
+        run: bash scripts/test-verify-gateway-policyreport.sh
+      - name: Client wiring and Job egress guard
+        run: bash scripts/test-gateway-wiring.sh
+      - name: AC-1 report (report-only, never blocks)
+        # Static: rendered Deployments only; Jobs are built by service code and are covered by the live
+        # run (docs/model-gateway.md). Any failure becomes a warning, never a silent 0 and never a red check.
+        run: |
+          set +e
+          unavailable() { echo "::warning::provider-key report unavailable: $1"; echo "AC-1 static report unavailable: $1" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          mkdir -p /tmp/ac1
+          for a in aifactory pfactory tfactory cfactory; do
+            kustomize build "apps/$a/manifests" >> /tmp/ac1/all.yaml || unavailable "kustomize build $a failed"
+            echo --- >> /tmp/ac1/all.yaml
+          done
+          yq -o=json -I0 'select(.kind == "Deployment" and (.metadata.name | test("^(aifactory|pfactory|tfactory|cfactory)$")))' /tmp/ac1/all.yaml | jq -s '{items: .}' > /tmp/ac1/deploy.json || unavailable "yq or jq conversion failed"
+          bash scripts/verify-no-provider-keys.sh --deployments-json /tmp/ac1/deploy.json --accept-volume cli-creds > /tmp/ac1/out.txt 2>&1 || unavailable "verifier exited non-zero"
+          cat /tmp/ac1/out.txt
+          grep -q '^INSPECTION-FAIL' /tmp/ac1/out.txt && unavailable "verifier could not inspect"
+          { echo '### AC-1 static report (report-only, Deployments only)'; echo '```'; grep '^SUMMARY' /tmp/ac1/out.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
       - name: shellcheck
-        run: shellcheck scripts/verify-no-provider-keys.sh scripts/verify-route-hot-reload.sh scripts/test-verify-no-provider-keys.sh scripts/test-verify-route-hot-reload.sh scripts/test-gen-model-routes.sh
+        run: shellcheck scripts/verify-no-provider-keys.sh scripts/verify-route-hot-reload.sh scripts/verify-gateway-policyreport.sh scripts/test-verify-no-provider-keys.sh scripts/test-verify-route-hot-reload.sh scripts/test-verify-gateway-policyreport.sh scripts/test-gateway-wiring.sh scripts/test-gen-model-routes.sh

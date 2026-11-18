@@ -135,6 +135,68 @@ requires the same UIDs and restart counts. It prints old and new model per class
 an exec failure fails. Kubelet propagation takes up to about 90 s: note the measured time on the epic.
 (`X-Model-Route` is not used: it carries the class, which does not change when its model does.)
 
+## Admission proofs (acceptance 5)
+
+Read-only apart from server-side dry-runs, which create nothing. Never run the apply below without
+`--dry-run=server`.
+
+**PASS row for the deployed image** (report mode always exits 0; `--strict` exits 1 without a proof):
+
+```bash
+bash scripts/verify-gateway-policyreport.sh            # rows + SUMMARY
+bash scripts/verify-gateway-policyreport.sh --strict   # exit 1 unless image_pass=1 and no fail/error row
+```
+
+`image_pass=1` needs a `pass` row of `verify-factory-image-signatures` in the report scoped to the current
+`Deployment/model-gateway` (matched by UID) whose message names the Deployment's exact image. "verified from
+cache" rows name no image and do not count; `require-first-party-signature-coverage` rows are `skip` in
+`gateway` ("preconditions not met") and are printed, not counted. Timestamps are the row's
+`results[].timestamp`, not the report's creation time. Fixture test: `scripts/test-verify-gateway-policyreport.sh`.
+
+**Deny and control (server-side dry-run).** Pick a pod spec in `gateway` and change only the image:
+
+```bash
+c="--context k3d-factory"
+kubectl $c -n gateway get pods --no-headers | wc -l                       # count before
+cat > /tmp/gw-probe.yaml <<'YAML'
+apiVersion: v1
+kind: Pod
+metadata: {name: gateway-admission-probe, namespace: gateway, labels: {app: model-gateway}}
+spec:
+  containers:
+    - {name: gateway, image: "ghcr.io/olafkfreund/aifactory:TAG"}
+YAML
+sed 's/TAG/sha-24184c6-gateway/' /tmp/gw-probe.yaml | kubectl $c apply --dry-run=server -f -   # control: "created (server dry run)"
+sed 's/TAG/sha-0202033/'         /tmp/gw-probe.yaml | kubectl $c apply --dry-run=server -f -   # deny
+kubectl $c -n gateway get pods --no-headers | wc -l                       # count after: unchanged
+rm -f /tmp/gw-probe.yaml
+```
+
+The deny must read `verify-factory-image-signatures ... .attestors[0].entries[0].keyless: no signatures found`:
+that is an existing tag that was never signed, rejected by the signature rule. A tag that does not exist is also
+rejected (`MANIFEST_UNKNOWN`), but proves only that the tag is missing, so it does not count. Observed
+2026-11-18: control admitted, `sha-0202033` and `sha-1c44e63` denied with "no signatures found", Pod count 2
+before and after. If `sha-0202033` is ever signed or deleted, pick another old `sha-*` tag of
+`ghcr.io/olafkfreund/aifactory` that has no `sha256-<digest>.sig` sibling tag.
+
+## CI report and the `--strict` flip criterion
+
+The `model gateway tools` workflow runs `verify-no-provider-keys.sh --deployments-json` on the Deployments
+rendered by kustomize and prints the summary (also on the run's summary page). It is report-only: it never
+fails the check, and a render or inspection failure is a `::warning::` and an "unavailable" note, never a zero.
+Static counts Deployments only (14 today); the live run adds the dispatched Jobs (18 today), so the two numbers
+differ by design and the output says `static=1` or `static=0`.
+
+Flip criterion: change the CI step to `--strict`, and add a scheduled or manual live run of
+`--strict --accept-volume cli-creds --gateway-token-file "$d/client"`, only when the live report shows
+`VIOLATION=0 UNVERIFIED=0` after epic stages 1 to 5 are verified through a full PARR run (including a
+dispatched Job's env). Stage 6 (provider-side revocation, owner-only) is not a condition for the flip.
+
+Client wiring is guarded cluster-free by `scripts/test-gateway-wiring.sh`: `aifactory`, `tfactory` and `cfactory` keep
+`<SVC>_MODEL_GATEWAY_URL` and `_TOKEN` as optional `factory-secrets` refs (`MODEL_GATEWAY_URL`,
+`MODEL_GATEWAY_CLIENT_TOKEN`), and `factory-sandbox-jobs-egress` keeps one gateway peer (namespace plus
+`app=model-gateway`) on TCP 8080 for `factory.io/kind=task` Jobs. All of it stays off until the owner seeds the Secret.
+
 ## Plane B bench test (owner-run checklist, not run by us)
 
 Question 1: does the `claude` CLI send its requests to `ANTHROPIC_BASE_URL` while authenticating with
