@@ -375,6 +375,7 @@ jobs:
             case "$1" in
               skillai)        return 0 ;;   # olafkfreund/SkillAi deploy/k8s -- Factory#588
               fides-reporter) return 0 ;;   # olafkfreund/fides charts/ -- #162
+              rfactory-desktops) return 0 ;; # olafkfreund/RFactory deploy/k8s/rfactory-desktops, digest-pinned there and enforced by its Kyverno policy -- RFactory#3
               *)              return 1 ;;
             esac
           }
