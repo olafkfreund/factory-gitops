@@ -1,5 +1,5 @@
 ---
-status: draft
+status: approved
 issue: 387
 spec: spec/2026-11-18-387-argocd-upgrade.md
 coders:
