@@ -463,6 +463,12 @@ spec:
             # AIFactory#1737: the gate-image-prepull DaemonSet copies this value (kustomization.yaml replacements); renaming this var breaks the build on purpose.
             - { name: AIFACTORY_SANDBOX_IMAGE, value: "ghcr.io/olafkfreund/factory-runner-nix:sha-47900d1@sha256:e2e42c08f5fb8cc7b0d4e3a11efe9639f0b15f02668d80ae797d461b67746eb9" }
             - { name: AIFACTORY_SANDBOX_REPO_PVC, value: "aifactory-data" }
+            # AIFactory#2126: agent Jobs run as their own ServiceAccounts, not the
+            # control plane's. MERGE ONLY AFTER the SAs (factory-gitops#381) are
+            # synced and the AIFactory release that reads AIFACTORY_JOB_SA is
+            # running: a missing SA fails every Job create. Unset both to roll back.
+            - { name: AIFACTORY_BUILD_SA, value: "aifactory-build-job" }
+            - { name: AIFACTORY_JOB_SA, value: "aifactory-agent-job" }
             # ── RFC-0011 label-driven intake poller (#636) — the issue->build
             # handover. INERT until an issue carries a `factory:*` label: the loop
             # lists issues, skips anything already `factory:queued` (its
@@ -738,7 +744,7 @@ spec:
             # Corrected to the actual published tag. Validated live: pulls + runs
             # nix 2.30.1 (121 /nix/store entries) on a 2nd k3d node, no nix PVC.
             # AIFactory#1737: the gate-image-prepull DaemonSet copies this value (kustomization.yaml replacements); renaming this var breaks the build on purpose.
-            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-be790d5-nix" }
+            - { name: AIFACTORY_BUILD_IMAGE, value: "ghcr.io/olafkfreund/aifactory:sha-a02c6ac-nix" }
             - { name: AIFACTORY_PACKED_NIX_IN_IMAGE, value: "true" }
             # provider keys
             # RFC-0014 operator runtime allowlist (AIFactory#1607). Naming a
