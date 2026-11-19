@@ -14,7 +14,9 @@ spec:
   scaleTargetRef:
     name: tfactory
   minReplicaCount: 1
-  maxReplicaCount: 4
+  # Held at 1 until TFactory#1599 ships: a 2nd replica's startup reconciler fails the
+  # other replica's live in-process stages (control_plane_restart). Raise after the fix.
+  maxReplicaCount: 1
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
