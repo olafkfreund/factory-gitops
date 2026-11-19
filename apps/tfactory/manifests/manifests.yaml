@@ -184,6 +184,9 @@ spec:
   template:
     metadata: { labels: { app: tfactory } }
     spec:
+      # TFactory#1599: on SIGTERM the pod waits (APP_SHUTDOWN_DRAIN_SECONDS=600) for
+      # its own in-process planner/gen stages; uvicorn's connection wait comes first.
+      terminationGracePeriodSeconds: 900
       # RFC-0005 Tier A: this SA can create/read the ephemeral Nix-lane Jobs.
       serviceAccountName: tfactory-sandbox
       # Factory#550. This pod DOES need its SA token, and says so rather than
