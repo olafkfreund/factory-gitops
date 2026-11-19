@@ -532,6 +532,11 @@ spec:
             - { name: TFACTORY_DEPLOY_DRYRUN_SA, value: "tfactory-deploy-dryrun" }
             - { name: TFACTORY_NIX_RUNNER_IMAGE, value: "ghcr.io/olafkfreund/factory-runner-nix:sha-47900d1@sha256:e2e42c08f5fb8cc7b0d4e3a11efe9639f0b15f02668d80ae797d461b67746eb9" }
             - { name: TFACTORY_NIX_IN_IMAGE, value: "true" }
+            # TFactory#1617: nix lane Jobs authenticate github.com flake fetches
+            # (anonymous api.github.com hits the 60/h rate limit). Reuses the
+            # agenix-synced GITHUB_TOKEN; kube_sandbox passes it as a secretKeyRef.
+            - { name: TFACTORY_NIX_GITHUB_SECRET, value: "factory-secrets" }
+            - { name: TFACTORY_NIX_GITHUB_SECRET_KEY, value: "GITHUB_TOKEN" }
             # TFACTORY_IMAGE pins the TFactory backend image the verify Job runs
             # on (the image that now ships the `agents` package on PYTHONPATH —
             # the ModuleNotFoundError that reverted FLIP #3 was fixed in #479).
