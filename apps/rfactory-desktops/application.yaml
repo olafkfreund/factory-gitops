@@ -1,4 +1,6 @@
-# RFactory #3 desktops (KubeVirt VMs): manifests live in olafkfreund/RFactory, pinned to a commit.
+# RFactory #3 desktops (KubeVirt VMs): manifests live in olafkfreund/RFactory. While the feature is built the app
+# follows its branch, so a pushed image pin deploys without a pull request here (RFactory plan deviation 42);
+# set targetRevision to main when the branch merges.
 # Not synced by itself: `exclude` keeps this file and namespace.yaml out of the
 # synced set. The namespace is applied once by hand and never owned by the app
 # (plan deviation 9). Deleting this Application removes the workloads, policies
@@ -14,7 +16,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/olafkfreund/RFactory
-    targetRevision: 38724f8d3f5cdc22badca651e119847050d3cbe6
+    targetRevision: feat/3-agent-workspace
     path: deploy/k8s/rfactory-desktops
     directory:
       exclude: "{namespace.yaml,application.yaml}"
@@ -28,9 +30,3 @@ spec:
     syncOptions:
       - PruneLast=true
       - RespectIgnoreDifferences=true
-  # The runner owns the Lease's holder and renewTime.
-  ignoreDifferences:
-    - group: coordination.k8s.io
-      kind: Lease
-      name: rfactory-runner
-      jsonPointers: [/spec]
