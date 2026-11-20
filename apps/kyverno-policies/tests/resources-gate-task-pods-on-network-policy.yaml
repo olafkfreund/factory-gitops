@@ -118,3 +118,36 @@ spec:
   containers:
     - name: coder
       image: busybox:1.36
+---
+# Investigation pods use the same task label but their own egress policies.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: investigate-agent
+  namespace: factory
+  labels:
+    app: aifactory-investigate
+    factory.io/kind: task
+    factory.io/run-kind: investigate-agent
+    factory.io/investigation: 00000000-0000-0000-0000-000000000001
+spec:
+  restartPolicy: Never
+  containers:
+    - name: agent
+      image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: investigate-test
+  namespace: factory
+  labels:
+    app: aifactory-investigate
+    factory.io/kind: task
+    factory.io/run-kind: investigate-test
+    factory.io/investigation: 00000000-0000-0000-0000-000000000001
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee

@@ -366,6 +366,10 @@ spec:
                   valueFrom:
                     fieldRef:
                       fieldPath: status.hostIP
+                - name: RUN_KIND
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.labels['factory.io/run-kind']
               command:
                 - sh
                 - -c
@@ -406,7 +410,20 @@ spec:
                   # command substitution and shell arithmetic. This is not a
                   # style choice and it will not survive being "modernised".
                   set -u
-                  allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; }
+                  # Investigation policies allow kube-dns, not the API service.
+                  allow_name=kube-api
+                  allow_target=10.43.0.1:443
+                  allow_hint="egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default"
+                  allow_fix="API reachability"
+                  case "${RUN_KIND:-}" in
+                    investigate-*)
+                      allow_name=kube-dns
+                      allow_target=kube-dns.kube-system.svc.cluster.local:53
+                      allow_hint="the investigation DNS egress rule"
+                      allow_fix="DNS reachability"
+                      allowed() { nc -z -w2 kube-dns.kube-system.svc.cluster.local 53 >/dev/null 2>&1; } ;;
+                    *) allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; } ;;
+                  esac
                   denied()  { ! nc -z -w1 "$HOST_IP" 10250 >/dev/null 2>&1; }
 
                   i=0
@@ -447,11 +464,11 @@ spec:
                   # all", and a confident wrong answer here is what Factory#871
                   # already cost once.
                   if allowed; then
-                    echo "netpol-gate: kube-api reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
+                    echo "netpol-gate: $allow_name reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
                   elif denied; then
-                    echo "netpol-gate: UNKNOWN -- neither kube-api nor kubelet is reachable. Either the policy IS enforced and its kube-api allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default" >&2
+                    echo "netpol-gate: UNKNOWN -- neither $allow_name nor kubelet is reachable. Either the policy IS enforced and its $allow_name allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check $allow_hint" >&2
                   else
-                    echo "netpol-gate: kubelet reachable but kube-api is NOT -- the deny leg is open, so nothing is enforced, and the allow destination 10.43.0.1:443 is down as well. Fix API reachability first; this gate cannot pass while it is unreachable." >&2
+                    echo "netpol-gate: kubelet reachable but $allow_name is NOT -- the deny leg is open, so nothing is enforced, and the allow destination $allow_target is down as well. Fix $allow_fix first; this gate cannot pass while it is unreachable." >&2
                   fi
                   echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
                   exit 1

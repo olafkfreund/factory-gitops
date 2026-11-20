@@ -42,6 +42,8 @@ results:
     resources:
       - task-no-init
       - task-agent-job-sa
+      - investigate-agent
+      - investigate-test
     patchedResources: patched-gate-task-pods-on-network-policy.yaml
   - policy: gate-task-pods-on-network-policy
     rule: inject-netpol-gate
@@ -51,6 +53,8 @@ results:
       - task-no-init
       - task-agent-job-sa
       - task-with-init
+      - investigate-agent
+      - investigate-test
     patchedResources: patched-gate-task-pods-on-network-policy.yaml
 
   # --- MUST NOT create the array when one already exists: rule 1's precondition

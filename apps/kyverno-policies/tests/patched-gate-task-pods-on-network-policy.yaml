@@ -39,6 +39,10 @@ spec:
       valueFrom:
         fieldRef:
           fieldPath: status.hostIP
+    - name: RUN_KIND
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.labels['factory.io/run-kind']
     command:
     - sh
     - -c
@@ -79,7 +83,20 @@ spec:
       # command substitution and shell arithmetic. This is not a
       # style choice and it will not survive being "modernised".
       set -u
-      allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; }
+      # Investigation policies allow kube-dns, not the API service.
+      allow_name=kube-api
+      allow_target=10.43.0.1:443
+      allow_hint="egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default"
+      allow_fix="API reachability"
+      case "${RUN_KIND:-}" in
+        investigate-*)
+          allow_name=kube-dns
+          allow_target=kube-dns.kube-system.svc.cluster.local:53
+          allow_hint="the investigation DNS egress rule"
+          allow_fix="DNS reachability"
+          allowed() { nc -z -w2 kube-dns.kube-system.svc.cluster.local 53 >/dev/null 2>&1; } ;;
+        *) allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; } ;;
+      esac
       denied()  { ! nc -z -w1 "$HOST_IP" 10250 >/dev/null 2>&1; }
 
       i=0
@@ -120,11 +137,11 @@ spec:
       # all", and a confident wrong answer here is what Factory#871
       # already cost once.
       if allowed; then
-        echo "netpol-gate: kube-api reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
+        echo "netpol-gate: $allow_name reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
       elif denied; then
-        echo "netpol-gate: UNKNOWN -- neither kube-api nor kubelet is reachable. Either the policy IS enforced and its kube-api allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default" >&2
+        echo "netpol-gate: UNKNOWN -- neither $allow_name nor kubelet is reachable. Either the policy IS enforced and its $allow_name allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check $allow_hint" >&2
       else
-        echo "netpol-gate: kubelet reachable but kube-api is NOT -- the deny leg is open, so nothing is enforced, and the allow destination 10.43.0.1:443 is down as well. Fix API reachability first; this gate cannot pass while it is unreachable." >&2
+        echo "netpol-gate: kubelet reachable but $allow_name is NOT -- the deny leg is open, so nothing is enforced, and the allow destination $allow_target is down as well. Fix $allow_fix first; this gate cannot pass while it is unreachable." >&2
       fi
       echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
       exit 1
@@ -168,6 +185,10 @@ spec:
       valueFrom:
         fieldRef:
           fieldPath: status.hostIP
+    - name: RUN_KIND
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.labels['factory.io/run-kind']
     command:
     - sh
     - -c
@@ -208,7 +229,20 @@ spec:
       # command substitution and shell arithmetic. This is not a
       # style choice and it will not survive being "modernised".
       set -u
-      allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; }
+      # Investigation policies allow kube-dns, not the API service.
+      allow_name=kube-api
+      allow_target=10.43.0.1:443
+      allow_hint="egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default"
+      allow_fix="API reachability"
+      case "${RUN_KIND:-}" in
+        investigate-*)
+          allow_name=kube-dns
+          allow_target=kube-dns.kube-system.svc.cluster.local:53
+          allow_hint="the investigation DNS egress rule"
+          allow_fix="DNS reachability"
+          allowed() { nc -z -w2 kube-dns.kube-system.svc.cluster.local 53 >/dev/null 2>&1; } ;;
+        *) allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; } ;;
+      esac
       denied()  { ! nc -z -w1 "$HOST_IP" 10250 >/dev/null 2>&1; }
 
       i=0
@@ -249,11 +283,11 @@ spec:
       # all", and a confident wrong answer here is what Factory#871
       # already cost once.
       if allowed; then
-        echo "netpol-gate: kube-api reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
+        echo "netpol-gate: $allow_name reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
       elif denied; then
-        echo "netpol-gate: UNKNOWN -- neither kube-api nor kubelet is reachable. Either the policy IS enforced and its kube-api allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default" >&2
+        echo "netpol-gate: UNKNOWN -- neither $allow_name nor kubelet is reachable. Either the policy IS enforced and its $allow_name allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check $allow_hint" >&2
       else
-        echo "netpol-gate: kubelet reachable but kube-api is NOT -- the deny leg is open, so nothing is enforced, and the allow destination 10.43.0.1:443 is down as well. Fix API reachability first; this gate cannot pass while it is unreachable." >&2
+        echo "netpol-gate: kubelet reachable but $allow_name is NOT -- the deny leg is open, so nothing is enforced, and the allow destination $allow_target is down as well. Fix $allow_fix first; this gate cannot pass while it is unreachable." >&2
       fi
       echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
       exit 1
@@ -290,6 +324,10 @@ spec:
       valueFrom:
         fieldRef:
           fieldPath: status.hostIP
+    - name: RUN_KIND
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.labels['factory.io/run-kind']
     command:
     - sh
     - -c
@@ -330,7 +368,20 @@ spec:
       # command substitution and shell arithmetic. This is not a
       # style choice and it will not survive being "modernised".
       set -u
-      allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; }
+      # Investigation policies allow kube-dns, not the API service.
+      allow_name=kube-api
+      allow_target=10.43.0.1:443
+      allow_hint="egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default"
+      allow_fix="API reachability"
+      case "${RUN_KIND:-}" in
+        investigate-*)
+          allow_name=kube-dns
+          allow_target=kube-dns.kube-system.svc.cluster.local:53
+          allow_hint="the investigation DNS egress rule"
+          allow_fix="DNS reachability"
+          allowed() { nc -z -w2 kube-dns.kube-system.svc.cluster.local 53 >/dev/null 2>&1; } ;;
+        *) allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; } ;;
+      esac
       denied()  { ! nc -z -w1 "$HOST_IP" 10250 >/dev/null 2>&1; }
 
       i=0
@@ -371,11 +422,11 @@ spec:
       # all", and a confident wrong answer here is what Factory#871
       # already cost once.
       if allowed; then
-        echo "netpol-gate: kube-api reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
+        echo "netpol-gate: $allow_name reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
       elif denied; then
-        echo "netpol-gate: UNKNOWN -- neither kube-api nor kubelet is reachable. Either the policy IS enforced and its kube-api allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default" >&2
+        echo "netpol-gate: UNKNOWN -- neither $allow_name nor kubelet is reachable. Either the policy IS enforced and its $allow_name allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check $allow_hint" >&2
       else
-        echo "netpol-gate: kubelet reachable but kube-api is NOT -- the deny leg is open, so nothing is enforced, and the allow destination 10.43.0.1:443 is down as well. Fix API reachability first; this gate cannot pass while it is unreachable." >&2
+        echo "netpol-gate: kubelet reachable but $allow_name is NOT -- the deny leg is open, so nothing is enforced, and the allow destination $allow_target is down as well. Fix $allow_fix first; this gate cannot pass while it is unreachable." >&2
       fi
       echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
       exit 1
@@ -402,3 +453,331 @@ spec:
   containers:
   - name: gate
     image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
+---
+# Expected output of gate-task-pods-on-network-policy for the two task
+# pod shapes in resources-gate-task-pods-on-network-policy.yaml.
+#
+# The netpol-gate container here is a copy of the `value:` block in the
+# policy's inject-netpol-gate rule, TWICE -- once per pod shape. IF YOU
+# EDIT THE GATE SCRIPT, EDIT IT IN BOTH PLACES HERE TOO -- the suite
+# compares the produced pod against these and will fail until all three
+# agree. That is deliberate: it means the script cannot be changed
+# without someone looking at what task pods actually end up running.
+#
+# The script is a literal block scalar (`- |`) rather than the folded,
+# backslash-escaped quoting the Kyverno CLI emits, so the copies are
+# diffable and hand-editable. Both forms parse to the same string; the
+# suite compares the parsed resource, not the file's bytes.
+#
+# The assertions that matter are structural: netpol-gate is
+# initContainers[0] in BOTH pods, and in task-with-init the original
+# seed-nix-store is still there, still second, still holding its own
+# image and command. `task-already-gated` deliberately has NO patched
+# form -- the idempotency precondition skips it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: investigate-agent
+  namespace: factory
+  labels:
+    app: aifactory-investigate
+    factory.io/run-kind: investigate-agent
+    factory.io/investigation: 00000000-0000-0000-0000-000000000001
+    factory.io/kind: task
+spec:
+  restartPolicy: Never
+  containers:
+    - name: agent
+      image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
+  initContainers:
+    - name: netpol-gate
+      image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+      env:
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: RUN_KIND
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['factory.io/run-kind']
+      command:
+        - sh
+        - -c
+        - |
+          # Block until this pod's NetworkPolicy is actually in force.
+          #
+          # THE CHECK IS TWO-SIDED ON PURPOSE. "A denied destination
+          # refused me" is on its own worthless: it is equally true of a
+          # pod with no working network at all, so a one-sided gate
+          # would wave through exactly the pods that are least healthy,
+          # fail-open wearing a fail-closed mask. It cannot tell
+          # "policy programmed" from "nothing was ever reachable".
+          # Both legs must hold at the same time:
+          #
+          #   ALLOW  10.43.0.1:443   kubernetes API ClusterIP, permitted
+          #                          by egress rule 4. Must CONNECT ->
+          #                          the datapath is up.
+          #   DENY   $HOST_IP:10250  kubelet on this pod's own node.
+          #                          Must REFUSE -> the policy is live.
+          #
+          # The deny leg is chosen so it cannot go stale or flap:
+          # kubelet is always listening (it is the process that started
+          # this pod), and no egress rule reaches it -- 172.16/12 is
+          # excluded from the public-443 rule and :10250 appears
+          # nowhere else. Verified against an unlabelled control pod,
+          # which CONNECTS to the same address; without that control,
+          # "blocked" could just mean "nothing is listening there".
+          # Neither leg depends on a Factory workload being up, so no
+          # service outage can wedge a build behind this gate.
+          #
+          # NO DOLLAR-PAREN ANYWHERE BELOW, DELIBERATELY -- not in the
+          # code and not in these comments either. Kyverno reads
+          # dollar-paren as its OWN variable syntax and rejects the
+          # whole policy at admission with "got nil resolved variable".
+          # That applies to the entire patch string, comments included,
+          # so writing the forbidden form even to warn about it is
+          # itself rejected. Hence backticks and `expr` in place of
+          # command substitution and shell arithmetic. This is not a
+          # style choice and it will not survive being "modernised".
+          set -u
+          # Investigation policies allow kube-dns, not the API service.
+          allow_name=kube-api
+          allow_target=10.43.0.1:443
+          allow_hint="egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default"
+          allow_fix="API reachability"
+          case "${RUN_KIND:-}" in
+            investigate-*)
+              allow_name=kube-dns
+              allow_target=kube-dns.kube-system.svc.cluster.local:53
+              allow_hint="the investigation DNS egress rule"
+              allow_fix="DNS reachability"
+              allowed() { nc -z -w2 kube-dns.kube-system.svc.cluster.local 53 >/dev/null 2>&1; } ;;
+            *) allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; } ;;
+          esac
+          denied()  { ! nc -z -w1 "$HOST_IP" 10250 >/dev/null 2>&1; }
+
+          i=0
+          while [ "$i" -lt 60 ]; do
+            # Sampled twice: one dropped SYN must not read as an
+            # enforced policy. `allowed` is re-checked between the two
+            # so a datapath that dies mid-check cannot pass either.
+            if allowed && denied && allowed && denied; then
+              echo "netpol-gate: enforced at poll $i"
+              exit 0
+            fi
+            i=`expr $i + 1`
+            # Poll spacing only. The loop exits on evidence, never on
+            # elapsed time; replacing the whole gate with a sleep is
+            # the thing this is here to avoid.
+            sleep 1
+          done
+          # Fail closed. A build that never starts beats a build that
+          # starts unconfined.
+          #
+          # SAY WHICH LEG LOST (Factory#919). Giving up has two causes
+          # with opposite fixes -- "nothing is enforced" is a CNI/datapath
+          # problem, "the kube-api allow rule no longer matches this
+          # cluster" is one line of egress rule 4 -- and until this block
+          # existed both printed the same sentence. That cost a full
+          # cluster-wide investigation and a wrong issue: Factory#871
+          # concluded enforcement was dead fleet-wide when enforcement was
+          # fine and the server node address had simply moved. Closed as
+          # invalid.
+          #
+          # The helpers are re-run once, on the same two destinations the
+          # loop already probes. No new probing, and the verdict is exit 1
+          # whichever branch wins -- this reports, it does not decide.
+          #
+          # The both-blocked case is reported as UNKNOWN rather than as
+          # the stale-rule case it usually is. From inside the pod it is
+          # genuinely indistinguishable from "this pod has no network at
+          # all", and a confident wrong answer here is what Factory#871
+          # already cost once.
+          if allowed; then
+            echo "netpol-gate: $allow_name reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
+          elif denied; then
+            echo "netpol-gate: UNKNOWN -- neither $allow_name nor kubelet is reachable. Either the policy IS enforced and its $allow_name allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check $allow_hint" >&2
+          else
+            echo "netpol-gate: kubelet reachable but $allow_name is NOT -- the deny leg is open, so nothing is enforced, and the allow destination $allow_target is down as well. Fix $allow_fix first; this gate cannot pass while it is unreachable." >&2
+          fi
+          echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
+          exit 1
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi
+---
+# Expected output of gate-task-pods-on-network-policy for the two task
+# pod shapes in resources-gate-task-pods-on-network-policy.yaml.
+#
+# The netpol-gate container here is a copy of the `value:` block in the
+# policy's inject-netpol-gate rule, TWICE -- once per pod shape. IF YOU
+# EDIT THE GATE SCRIPT, EDIT IT IN BOTH PLACES HERE TOO -- the suite
+# compares the produced pod against these and will fail until all three
+# agree. That is deliberate: it means the script cannot be changed
+# without someone looking at what task pods actually end up running.
+#
+# The script is a literal block scalar (`- |`) rather than the folded,
+# backslash-escaped quoting the Kyverno CLI emits, so the copies are
+# diffable and hand-editable. Both forms parse to the same string; the
+# suite compares the parsed resource, not the file's bytes.
+#
+# The assertions that matter are structural: netpol-gate is
+# initContainers[0] in BOTH pods, and in task-with-init the original
+# seed-nix-store is still there, still second, still holding its own
+# image and command. `task-already-gated` deliberately has NO patched
+# form -- the idempotency precondition skips it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: investigate-test
+  namespace: factory
+  labels:
+    app: aifactory-investigate
+    factory.io/run-kind: investigate-test
+    factory.io/investigation: 00000000-0000-0000-0000-000000000001
+    factory.io/kind: task
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: ghcr.io/olafkfreund/aifactory-nix:sha-deadbee
+  initContainers:
+    - name: netpol-gate
+      image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+      env:
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: RUN_KIND
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['factory.io/run-kind']
+      command:
+        - sh
+        - -c
+        - |
+          # Block until this pod's NetworkPolicy is actually in force.
+          #
+          # THE CHECK IS TWO-SIDED ON PURPOSE. "A denied destination
+          # refused me" is on its own worthless: it is equally true of a
+          # pod with no working network at all, so a one-sided gate
+          # would wave through exactly the pods that are least healthy,
+          # fail-open wearing a fail-closed mask. It cannot tell
+          # "policy programmed" from "nothing was ever reachable".
+          # Both legs must hold at the same time:
+          #
+          #   ALLOW  10.43.0.1:443   kubernetes API ClusterIP, permitted
+          #                          by egress rule 4. Must CONNECT ->
+          #                          the datapath is up.
+          #   DENY   $HOST_IP:10250  kubelet on this pod's own node.
+          #                          Must REFUSE -> the policy is live.
+          #
+          # The deny leg is chosen so it cannot go stale or flap:
+          # kubelet is always listening (it is the process that started
+          # this pod), and no egress rule reaches it -- 172.16/12 is
+          # excluded from the public-443 rule and :10250 appears
+          # nowhere else. Verified against an unlabelled control pod,
+          # which CONNECTS to the same address; without that control,
+          # "blocked" could just mean "nothing is listening there".
+          # Neither leg depends on a Factory workload being up, so no
+          # service outage can wedge a build behind this gate.
+          #
+          # NO DOLLAR-PAREN ANYWHERE BELOW, DELIBERATELY -- not in the
+          # code and not in these comments either. Kyverno reads
+          # dollar-paren as its OWN variable syntax and rejects the
+          # whole policy at admission with "got nil resolved variable".
+          # That applies to the entire patch string, comments included,
+          # so writing the forbidden form even to warn about it is
+          # itself rejected. Hence backticks and `expr` in place of
+          # command substitution and shell arithmetic. This is not a
+          # style choice and it will not survive being "modernised".
+          set -u
+          # Investigation policies allow kube-dns, not the API service.
+          allow_name=kube-api
+          allow_target=10.43.0.1:443
+          allow_hint="egress rule 4 of networkpolicy-sandbox-jobs against: kubectl get endpoints kubernetes -n default"
+          allow_fix="API reachability"
+          case "${RUN_KIND:-}" in
+            investigate-*)
+              allow_name=kube-dns
+              allow_target=kube-dns.kube-system.svc.cluster.local:53
+              allow_hint="the investigation DNS egress rule"
+              allow_fix="DNS reachability"
+              allowed() { nc -z -w2 kube-dns.kube-system.svc.cluster.local 53 >/dev/null 2>&1; } ;;
+            *) allowed() { nc -z -w2 10.43.0.1 443 >/dev/null 2>&1; } ;;
+          esac
+          denied()  { ! nc -z -w1 "$HOST_IP" 10250 >/dev/null 2>&1; }
+
+          i=0
+          while [ "$i" -lt 60 ]; do
+            # Sampled twice: one dropped SYN must not read as an
+            # enforced policy. `allowed` is re-checked between the two
+            # so a datapath that dies mid-check cannot pass either.
+            if allowed && denied && allowed && denied; then
+              echo "netpol-gate: enforced at poll $i"
+              exit 0
+            fi
+            i=`expr $i + 1`
+            # Poll spacing only. The loop exits on evidence, never on
+            # elapsed time; replacing the whole gate with a sleep is
+            # the thing this is here to avoid.
+            sleep 1
+          done
+          # Fail closed. A build that never starts beats a build that
+          # starts unconfined.
+          #
+          # SAY WHICH LEG LOST (Factory#919). Giving up has two causes
+          # with opposite fixes -- "nothing is enforced" is a CNI/datapath
+          # problem, "the kube-api allow rule no longer matches this
+          # cluster" is one line of egress rule 4 -- and until this block
+          # existed both printed the same sentence. That cost a full
+          # cluster-wide investigation and a wrong issue: Factory#871
+          # concluded enforcement was dead fleet-wide when enforcement was
+          # fine and the server node address had simply moved. Closed as
+          # invalid.
+          #
+          # The helpers are re-run once, on the same two destinations the
+          # loop already probes. No new probing, and the verdict is exit 1
+          # whichever branch wins -- this reports, it does not decide.
+          #
+          # The both-blocked case is reported as UNKNOWN rather than as
+          # the stale-rule case it usually is. From inside the pod it is
+          # genuinely indistinguishable from "this pod has no network at
+          # all", and a confident wrong answer here is what Factory#871
+          # already cost once.
+          if allowed; then
+            echo "netpol-gate: $allow_name reachable and kubelet ALSO reachable -- the deny leg never closed, so NO NetworkPolicy is in force for this pod. Look at the CNI/datapath, not at the policy text." >&2
+          elif denied; then
+            echo "netpol-gate: UNKNOWN -- neither $allow_name nor kubelet is reachable. Either the policy IS enforced and its $allow_name allow rule no longer matches this cluster, or this pod has no working network at all. The gate cannot tell those apart from in here. Check $allow_hint" >&2
+          else
+            echo "netpol-gate: kubelet reachable but $allow_name is NOT -- the deny leg is open, so nothing is enforced, and the allow destination $allow_target is down as well. Fix $allow_fix first; this gate cannot pass while it is unreachable." >&2
+          fi
+          echo "netpol-gate: NOT enforced after 60 polls -- refusing to start the task" >&2
+          exit 1
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          memory: 32Mi

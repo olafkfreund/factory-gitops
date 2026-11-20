@@ -128,6 +128,9 @@ spec:
   podSelector:
     matchLabels:
       factory.io/kind: task
+    # Investigation pods have separate policies (AIFactory#2156).
+    matchExpressions:
+      - { key: factory.io/run-kind, operator: DoesNotExist }
   policyTypes:
     - Ingress
     - Egress

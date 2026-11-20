@@ -889,6 +889,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # Read-only investigations (AIFactory#2156): per-run Secret and policy check.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -1020,3 +1027,225 @@ spec:
           imagePullPolicy: IfNotPresent
           securityContext: *prepull-sc
           resources: *prepull-res
+---
+# AIFactory#2156: isolated investigation pods and their registry proxy.
+# Investigation agent pod: no ingress; DNS, the Claude API, and the server API.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aifactory-investigate-agent
+  namespace: factory
+  labels:
+    app: aifactory
+spec:
+  podSelector:
+    matchLabels:
+      factory.io/run-kind: investigate-agent
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: "160.79.104.0/23"
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - podSelector:
+            matchLabels:
+              app: aifactory
+      ports:
+        - protocol: TCP
+          port: 3101
+---
+# Investigation test pod: no ingress; DNS and the registry proxy only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aifactory-investigate-test
+  namespace: factory
+  labels:
+    app: aifactory
+spec:
+  podSelector:
+    matchLabels:
+      factory.io/run-kind: investigate-test
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              factory.io/run-kind: investigate-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
+---
+# Registry proxy: ingress from test pods on 3128; egress to public 443 and DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aifactory-investigate-proxy
+  namespace: factory
+  labels:
+    app: aifactory
+spec:
+  podSelector:
+    matchLabels:
+      factory.io/run-kind: investigate-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              factory.io/run-kind: investigate-test
+      ports:
+        - protocol: TCP
+          port: 3128
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aifactory-investigate-proxy
+  namespace: factory
+  labels:
+    app: aifactory
+data:
+  squid.conf: |
+    http_port 3128
+    acl SSL_ports port 443
+    acl CONNECT method CONNECT
+    acl registries dstdomain -n registry.npmjs.org
+    acl registries dstdomain -n pypi.org files.pythonhosted.org
+    acl registries dstdomain -n crates.io static.crates.io index.crates.io
+    acl registries dstdomain -n proxy.golang.org sum.golang.org
+    acl registries dstdomain -n repo.maven.apache.org repo1.maven.org
+    http_access deny !CONNECT
+    http_access deny CONNECT !SSL_ports
+    http_access allow CONNECT registries
+    http_access deny all
+    cache deny all
+    access_log stdio:/dev/stdout
+    pid_filename none
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aifactory-investigate-proxy
+  namespace: factory
+  labels:
+    app: aifactory
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aifactory-investigate-proxy
+      factory.io/run-kind: investigate-proxy
+  template:
+    metadata:
+      # No app.kubernetes.io/instance: the release-wide policy must not select it.
+      labels:
+        app: aifactory-investigate-proxy
+        factory.io/run-kind: investigate-proxy
+      annotations:
+        checksum/config: 660f05885bce1c414093424eec9c834f5ecdec8b1a6a0e75c4e19e8dbb24918a
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 13
+        runAsGroup: 13
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: squid
+          image: ubuntu/squid:6.6-24.04_beta@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+          args: ["-f", "/etc/squid/squid.conf", "-N"]
+          ports:
+            - containerPort: 3128
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: conf, mountPath: /etc/squid/squid.conf, subPath: squid.conf, readOnly: true}
+            - {name: run, mountPath: /var/run}
+            - {name: log, mountPath: /var/log/squid}
+            - {name: spool, mountPath: /var/spool/squid}
+      volumes:
+        - name: conf
+          configMap:
+            name: aifactory-investigate-proxy
+        - {name: run, emptyDir: {}}
+        - {name: log, emptyDir: {}}
+        - {name: spool, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aifactory-investigate-proxy
+  namespace: factory
+  labels:
+    app: aifactory
+spec:
+  type: ClusterIP
+  ports:
+    - name: squid
+      port: 3128
+      targetPort: 3128
+      protocol: TCP
+  selector:
+    app: aifactory-investigate-proxy
+    factory.io/run-kind: investigate-proxy
