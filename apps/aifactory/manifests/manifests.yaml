@@ -418,6 +418,8 @@ spec:
             - { name: APP_OIDC_ENABLED, value: "true" }
             - { name: APP_OIDC_ISSUER_URL, value: "https://keycloak.freundcloud.org.uk/realms/factory" }
             - { name: APP_OIDC_CLIENT_ID, value: "aifactory" }
+            # Owner role through SSO (Factory#3873 B3): members of the Keycloak group factory-admins get owner.
+            - { name: APP_OIDC_GROUP_TO_ROLE, value: '{"factory-admins":"owner","/factory-admins":"owner"}' }
             - { name: APP_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: factory-secrets, key: AIFACTORY_OIDC_CLIENT_SECRET } } }
             - { name: APP_OIDC_REDIRECT_URI, value: "https://aifactory.freundcloud.org.uk/api/auth/oidc/callback" }
             # rmux Live Agent Console — always on
