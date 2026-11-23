@@ -502,7 +502,7 @@ spec:
             # public ingress, so intake does not depend on Cloudflare/oauth2-proxy
             # being in the path. GITHUB_TOKEN (factory-secrets) is the fetch/label
             # credential.
-            - { name: AIFACTORY_INTAKE_POLLER, value: "false" }
+            - { name: AIFACTORY_INTAKE_POLLER, value: "true" }
             # AIFactory#1064 orphaned-task reaper. A task's status is written
             # by the worker running it, so when that worker dies nothing writes
             # the terminal status and the card shows as active forever --

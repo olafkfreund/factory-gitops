@@ -366,6 +366,8 @@ spec:
             # localhost:3101 default). Lets PFactory's /handback-to-aifactory POST
             # corrections to the live AIFactory instead of a local one.
             - { name: PFACTORY_AIFACTORY_API_URL, value: "http://aifactory.factory.svc.cluster.local:3101" }
+            # Issue -> intent/spec/plan draft-PR stages (PFactory #1096); on for the e2e verification run (Factory#3864).
+            - { name: APP_ISSUE_STAGES_ENABLED, value: "true" }
             # Persist plan sessions to the PVC (mounted at ~/.pfactory) so they
             # survive pod restarts/redeploys (the store was in-memory only).
             - { name: PFACTORY_PLAN_PERSIST, value: "1" }
