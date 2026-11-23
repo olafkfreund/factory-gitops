@@ -9,6 +9,9 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: mirror-images
+
 jobs:
   mirror:
     runs-on: ubuntu-latest
@@ -17,16 +20,18 @@ jobs:
       - name: Install crane
         run: |
           set -euo pipefail
-          curl -sfL https://github.com/google/go-containerregistry/releases/download/v0.21.6/go-containerregistry_Linux_x86_64.tar.gz \
-            | tar -xz -C /usr/local/bin crane
+          archive="$(mktemp)"
+          curl -sfL --output "$archive" https://github.com/google/go-containerregistry/releases/download/v0.21.6/go-containerregistry_Linux_x86_64.tar.gz
+          echo "7ebbdcd05b652345c1f5105f8475e518534b90d66f3bdb50017be63f426ea435  $archive" | sha256sum --check
+          tar -xzf "$archive" -C /usr/local/bin crane
           crane version
 
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Copy pinned OCI indexes and check their digests
         run: |
