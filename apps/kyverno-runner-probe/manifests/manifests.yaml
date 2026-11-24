@@ -337,8 +337,8 @@ data:
     ghcr.io/olafkfreund/factory-runner-cloud:latest
     ghcr.io/olafkfreund/factory-runner-nix:latest
     ghcr.io/olafkfreund/odin:sha-2749b26
-    ghcr.io/olafkfreund/rfactory-web:sha-PENDING
-    ghcr.io/olafkfreund/rfactory-stt:sha-PENDING
+    ghcr.io/olafkfreund/rfactory-web:sha-16f3d65
+    ghcr.io/olafkfreund/rfactory-stt:sha-16f3d65
     """
 
     # Factory#574. An image no verifyImages rule NAMES is not "verified", it is

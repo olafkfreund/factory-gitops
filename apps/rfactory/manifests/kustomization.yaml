@@ -6,7 +6,9 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/rfactory-web
   newName: ghcr.io/olafkfreund/rfactory-web
-  newTag: sha-PENDING
+  newTag: sha-16f3d65
+  digest: sha256:1e0bcf13599eaa4d76c0153a637e881b5aafd15e0ceecc0ae088dbc34ba3ef8d
 - name: ghcr.io/olafkfreund/rfactory-stt
   newName: ghcr.io/olafkfreund/rfactory-stt
-  newTag: sha-PENDING
+  newTag: sha-16f3d65
+  digest: sha256:a7adf8f9387408235271bdee58d79e663d1271921ac0bde916f9c553717e2a4a
