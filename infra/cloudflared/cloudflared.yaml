@@ -55,6 +55,10 @@ data:
       # Auth is Fides' own session cookie + FIDES_API_TOKEN — no oauth2-proxy.
       - hostname: fides.freundcloud.org.uk
         service: http://fides-server.fides.svc.cluster.local:8080
+      # RFactory sits behind its own oauth2-proxy sidecar (Keycloak SSO,
+      # client: rfactory); see apps/rfactory/. The proxy shares the pod.
+      - hostname: rfactory.freundcloud.org.uk
+        service: http://rfactory.factory.svc.cluster.local:4180
       - service: http_status:404
 ---
 apiVersion: apps/v1

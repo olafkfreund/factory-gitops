@@ -1,0 +1,378 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: rfactory-data, namespace: factory, labels: { app: rfactory } }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: rfactory, namespace: factory, labels: { app: rfactory } }
+spec:
+  type: ClusterIP
+  selector: { app: rfactory }
+  ports: [{ name: http, port: 4180, targetPort: 4180 }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: rfactory-oauth2-proxy, namespace: factory, labels: { app: rfactory } }
+data:
+  config.yaml: |
+    upstreamConfig:
+      upstreams:
+        - { id: rfactory-web, path: /, uri: "http://127.0.0.1:8080", timeout: 60s }
+    server:
+      bindAddress: "0.0.0.0:4180"
+    providers:
+      - id: keycloak
+        provider: oidc
+        clientID: rfactory
+        clientSecretFile: /etc/oauth2-proxy/secrets/client-secret
+        code_challenge_method: S256
+        loginURL: https://keycloak.freundcloud.org.uk/realms/factory/protocol/openid-connect/auth
+        redeemURL: http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/token
+        oidcConfig:
+          issuerURL: https://keycloak.freundcloud.org.uk/realms/factory
+          skipDiscovery: true
+          jwksURL: http://keycloak.factory.svc.cluster.local:8080/realms/factory/protocol/openid-connect/certs
+          emailClaim: email
+          audienceClaims: [aud]
+          insecureSkipNonce: false
+    injectRequestHeaders:
+      - name: X-Forwarded-Email
+        values: [{ claim: email }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: rfactory-ingress, namespace: factory, labels: { app: rfactory } }
+spec:
+  podSelector: { matchLabels: { app: rfactory } }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: cloudflared } }
+      ports:
+        - { protocol: TCP, port: 4180 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: rfactory, namespace: factory, labels: { app: rfactory } }
+spec:
+  replicas: 0
+  selector: { matchLabels: { app: rfactory } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: rfactory } }
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets: [{ name: ghcr-pull }]
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: seed-creds
+          image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+          command: ["sh","-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /var/lib/rfactory/claude-home/.claude
+              cp /seed/claude-credentials.json /var/lib/rfactory/claude-home/.claude/.credentials.json
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: claude-home, mountPath: /var/lib/rfactory/claude-home }
+            - { name: cli-creds, mountPath: /seed, readOnly: true }
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0@sha256:9ed7eaf720508640e1dce523f85f1e81743633d858175a9a26469978386ae05b
+          securityContext:
+            runAsUser: 65532
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          args:
+            - --alpha-config=/etc/oauth2-proxy/config.yaml
+            - --redirect-url=https://rfactory.freundcloud.org.uk/oauth2/callback
+            - --email-domain=*
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --reverse-proxy=true
+            - --skip-provider-button=true
+            - --whitelist-domain=rfactory.freundcloud.org.uk
+          env:
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-rfactory
+                  key: cookie-secret
+          volumeMounts:
+            - { name: oauth2-proxy-config, mountPath: /etc/oauth2-proxy/config.yaml, subPath: config.yaml, readOnly: true }
+            - { name: oauth2-proxy-secrets, mountPath: /etc/oauth2-proxy/secrets, readOnly: true }
+          ports:
+            - { name: http, containerPort: 4180 }
+          readinessProbe:
+            httpGet: { path: /ping, port: 4180 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /ping, port: 4180 }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+        - name: rfactory-web
+          image: ghcr.io/olafkfreund/rfactory-web:0.1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - { name: RFACTORY_WRITES, value: "on" }
+            - { name: RFACTORY_SHARES, value: "on" }
+            - { name: RFACTORY_DESKTOP, value: "1" }
+            - { name: RFACTORY_CALLS, value: "1" }
+            - { name: RFACTORY_RUNNER_URL, value: "https://rfactory-runner-api.rfactory-desktops.svc:8443" }
+            - { name: RFACTORY_STT_URL, value: "http://127.0.0.1:8081" }
+            - { name: RFACTORY_SCOPE_FILE, value: "/etc/rfactory/scope.json" }
+            - { name: RFACTORY_STT_SECRET_FILE, value: "/run/rfactory/stt-path" }
+            - { name: RFACTORY_RUNNER_CERT, value: "/run/rfactory/desktop-runner/client.crt" }
+            - { name: RFACTORY_RUNNER_KEY, value: "/run/rfactory/desktop-runner/client.key" }
+            - { name: RFACTORY_RUNNER_CA, value: "/run/rfactory/desktop-runner/ca.crt" }
+            - { name: RFACTORY_ALLOWED_EMAILS, valueFrom: { secretKeyRef: { name: rfactory-config, key: allowed-emails } } }
+            - { name: RFACTORY_APPROVERS, valueFrom: { secretKeyRef: { name: rfactory-config, key: approvers } } }
+            - { name: RFACTORY_ADMINS, valueFrom: { secretKeyRef: { name: rfactory-config, key: admins } } }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/rfactory/actions }
+            - { name: claude-home, mountPath: /var/lib/rfactory/claude-home }
+            - { name: web-tmp, mountPath: /tmp }
+            - { name: rfactory-config, mountPath: /etc/rfactory, readOnly: true }
+            - { name: rfactory-keys, mountPath: /run/rfactory/cfactory-read-key, subPath: cfactory-read-key, readOnly: true }
+            - { name: rfactory-keys, mountPath: /run/rfactory/cfactory-write-key, subPath: cfactory-write-key, readOnly: true }
+            - { name: rfactory-stt-path, mountPath: /run/rfactory/stt-path, subPath: path, readOnly: true }
+            - { name: rfactory-runner-client, mountPath: /run/rfactory/desktop-runner, readOnly: true }
+          readinessProbe:
+            exec:
+              command: ["node", "-e", "require('net').connect(8080,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["node", "-e", "require('net').connect(8080,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+        - name: rfactory-stt
+          image: ghcr.io/olafkfreund/rfactory-stt:0.1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - { name: STT_PORT, value: "8081" }
+          ports:
+            - { name: stt, containerPort: 8081 }
+          volumeMounts:
+            - { name: stt-tmp, mountPath: /tmp }
+            - { name: rfactory-stt-path, mountPath: /run/secrets/stt, readOnly: true }
+          readinessProbe:
+            tcpSocket: { port: 8081 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 8081 }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "8", memory: 2Gi }
+        - name: cred-sync
+          image: python:3.12-slim@sha256:646fb0bca3dd3ea1bcc6feb72c17ed16eed6e10cffc732fcc1478bd3e7f02d7b
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              # cred-sync (Factory#292, hardened by Factory#628). The cli-creds Secret
+              # volume is refreshed by kubelet, so this re-copies the seed into the writable
+              # ~/.claude emptyDir whenever the seed is genuinely newer than what is there.
+              #
+              # Factory#628: exp() used to collapse every read failure -- missing file,
+              # malformed JSON, absent key -- to 0, and 0 is not a sentinel here, it is the
+              # oldest possible timestamp. An unreadable destination therefore lost every
+              # comparison, so ANY seed was copied over it, including one that had expired
+              # two months earlier, announced as "adopted fresher credential (+494672.6h)".
+              # 494672.6h is 56 years: it is seed_expiry_ms/3600000 with the other side at 0.
+              #
+              # Tested by .github/scripts/test_cred_sync.py, which also proves the three
+              # vendored copies of this script are byte-identical.
+              import json, os, shutil, time
+              import signal, sys
+              # As PID 1 this process ignores SIGTERM unless it installs a handler, so since the
+              # 1800s drain grace (#303) every pod stop waited for SIGKILL. Exit on SIGTERM.
+              signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+              SEED = os.environ.get("CRED_SYNC_SEED", "/seed/claude-credentials.json")
+              DEST = os.environ.get("CRED_SYNC_DEST", "/h/.claude/.credentials.json")
+              # No real credential is 90 days fresher than the one it replaces. A delta that
+              # large means one side is garbage, not that the seed is better.
+              MAX_SKEW_MS = 90 * 86400000
+
+
+              def exp(path):
+                  """Expiry in ms, or None when unreadable / unparseable / no expiry key.
+
+                  None means "unknown" and is deliberately not a number. Substituting a
+                  timestamp for a read failure is the whole of Factory#628.
+                  """
+                  try:
+                      with open(path) as fh:
+                          value = json.load(fh).get("claudeAiOauth", {}).get("expiresAt")
+                  except Exception:
+                      return None
+                  return None if value is None else int(value)
+
+
+              def ts(ms):
+                  if ms is None:
+                      return "unknown"
+                  return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000))
+
+
+              def decide(seed, dest, dest_exists, now):
+                  """(adopt, message). Pure, so the selftest can pin every branch."""
+                  if seed is None:
+                      return False, "seed unreadable, leaving dest untouched"
+                  if seed <= now:
+                      return False, f"seed expires {ts(seed)}, already past (now {ts(now)}), refusing to adopt"
+                  if dest is None and dest_exists:
+                      return False, "dest exists but is unreadable, refusing to overwrite it"
+                  # `dest > 0`: a literal 0 expiry is a CLEARED credential, not a read
+                  # failure. exp() returns None for unreadable/unparseable/absent-key --
+                  # that was the whole of Factory#628 -- so 0 can now only come from a
+                  # real `expiresAt: 0` in valid JSON, which is what the Claude SDK
+                  # leaves behind when it clears an access token.
+                  #
+                  # Without this the bound wedges the pod permanently: dest reads 0, the
+                  # delta is ~56 years, cred-sync refuses forever, and every run dies at
+                  # the planner with "No OAuth token found" while a valid seed sits in
+                  # the Secret (observed 2026-08-27, TFactory spec 191).
+                  if dest is not None and dest > 0 and seed - dest > MAX_SKEW_MS:
+                      return False, (f"seed expires {ts(seed)}, dest expires {ts(dest)}, delta "
+                                     f"{(seed - dest) / 3600000:.1f}h exceeds the sanity bound, refusing")
+                  if dest is not None and seed <= dest:
+                      return False, ""
+                  # States what was compared, not a conclusion: this line cannot be wrong the
+                  # way "adopted fresher credential" was.
+                  return True, f"seed expires {ts(seed)}, dest expires {ts(dest)}, adopting seed"
+
+
+              def sync(now=None):
+                  now = int(time.time() * 1000) if now is None else now
+                  adopt, why = decide(exp(SEED), exp(DEST), os.path.exists(DEST), now)
+                  if adopt:
+                      tmp = DEST + ".tmp"
+                      shutil.copyfile(SEED, tmp)
+                      os.chmod(tmp, 0o660)
+                      os.replace(tmp, DEST)  # atomic; readers never see a partial file
+                  return adopt, why
+
+
+              def main():
+                  last = None
+                  while True:
+                      try:
+                          why = sync()[1]
+                      except Exception as e:
+                          why = f"{type(e).__name__}: {e}"
+                      if why and why != last:  # a refusal recurs every 60s; say it once
+                          print(f"cred-sync: {why}", flush=True)
+                      last = why
+                      time.sleep(60)
+
+
+              if __name__ == "__main__":
+                  main()
+          lifecycle: { preStop: { exec: { command: ["sh", "-c", "until grep -Eq '^SigCgt:.*[4-7c-f][0-9a-f]{3}$' /proc/1/status; do sleep 0.1; done"] } } }
+          env:
+            - { name: CRED_SYNC_DEST, value: "/var/lib/rfactory/claude-home/.claude/.credentials.json" }
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 5m, memory: 24Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          volumeMounts:
+            - { name: claude-home, mountPath: /var/lib/rfactory/claude-home }
+            - { name: cli-creds, mountPath: /seed, readOnly: true }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: rfactory-data } }
+        - { name: claude-home, emptyDir: {} }
+        - { name: web-tmp, emptyDir: {} }
+        - { name: stt-tmp, emptyDir: {} }
+        - name: oauth2-proxy-config
+          configMap:
+            name: rfactory-oauth2-proxy
+            items:
+              - { key: config.yaml, path: config.yaml }
+        - name: oauth2-proxy-secrets
+          secret:
+            secretName: oauth2-proxy-rfactory
+            defaultMode: 0440
+            items:
+              - { key: client-secret, path: client-secret }
+        - name: rfactory-config
+          secret:
+            secretName: rfactory-config
+            defaultMode: 0440
+            items:
+              - { key: scope.json, path: scope.json }
+        - name: rfactory-keys
+          secret:
+            secretName: rfactory-keys
+            defaultMode: 0440
+            items:
+              - { key: cfactory-read-key, path: cfactory-read-key }
+              - { key: cfactory-write-key, path: cfactory-write-key }
+        - name: rfactory-stt-path
+          secret:
+            secretName: rfactory-stt-path
+            defaultMode: 0440
+            items:
+              - { key: path, path: path }
+        - name: rfactory-runner-client
+          secret:
+            secretName: rfactory-runner-client
+            defaultMode: 0440
+            items:
+              - { key: client.crt, path: client.crt }
+              - { key: client.key, path: client.key }
+              - { key: ca.crt, path: ca.crt }
+        - name: cli-creds
+          secret:
+            secretName: factory-cli-creds
+            defaultMode: 0440
+            items:
+              - { key: claude-credentials.json, path: claude-credentials.json }
