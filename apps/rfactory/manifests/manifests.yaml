@@ -59,7 +59,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: { name: rfactory, namespace: factory, labels: { app: rfactory } }
 spec:
-  replicas: 0
+  replicas: 1
   selector: { matchLabels: { app: rfactory } }
   strategy: { type: Recreate }
   template:
