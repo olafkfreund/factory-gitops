@@ -125,6 +125,15 @@ metadata: {name: covered-cfactory-frontend, namespace: factory}
 spec:
   containers: [{name: c, image: "ghcr.io/olafkfreund/cfactory-frontend:sha-bd374f3"}]
 ---
+# Both RFactory packages have their own literal `:` mirror entries.
+apiVersion: v1
+kind: Pod
+metadata: {name: covered-rfactory, namespace: factory}
+spec:
+  containers:
+    - {name: web, image: "ghcr.io/olafkfreund/rfactory-web:sha-PENDING"}
+    - {name: stt, image: "ghcr.io/olafkfreund/rfactory-stt:sha-PENDING"}
+---
 # The runner glob has no `:` at all, so it must match every runner name.
 apiVersion: v1
 kind: Pod

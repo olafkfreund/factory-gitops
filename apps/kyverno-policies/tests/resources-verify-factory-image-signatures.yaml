@@ -48,6 +48,19 @@ metadata: {name: near-cfactory-frontend-preview, namespace: factory}
 spec:
   containers: [{name: c, image: "ghcr.io/olafkfreund/cfactory-frontend-preview:v1"}]
 ---
+# The RFactory globs must keep the literal separator after each package name.
+apiVersion: v1
+kind: Pod
+metadata: {name: near-rfactory-web-preview, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/rfactory-web-preview:v1"}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: near-rfactory-stt-debug, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/rfactory-stt-debug:v1"}]
+---
 # THE Factory#564 TRAP. `skillai:*` not matching `skillai-migrator:*` is why the
 # policy lists both, and `skillai-worker` is the next name in that family that
 # nobody has created yet. A glob widened to `skillai*` would swallow it AND

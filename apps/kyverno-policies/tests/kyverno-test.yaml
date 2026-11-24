@@ -55,6 +55,7 @@ results:
       - covered-tfactory
       - covered-cfactory
       - covered-cfactory-frontend
+      - covered-rfactory
       - covered-runners
       - covered-odin
       - covered-skillai-both
