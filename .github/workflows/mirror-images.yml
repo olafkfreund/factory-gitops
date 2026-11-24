@@ -1,0 +1,51 @@
+name: mirror pinned images
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-images
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          archive="$(mktemp)"
+          curl -sfL --output "$archive" https://github.com/google/go-containerregistry/releases/download/v0.21.6/go-containerregistry_Linux_x86_64.tar.gz
+          echo "7ebbdcd05b652345c1f5105f8475e518534b90d66f3bdb50017be63f426ea435  $archive" | sha256sum --check
+          tar -xzf "$archive" -C /usr/local/bin crane
+          crane version
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Copy pinned OCI indexes and check their digests
+        run: |
+          set -euo pipefail
+          while read -r name tag digest; do
+            source="cgr.dev/chainguard/${name}@sha256:${digest}"
+            target="ghcr.io/olafkfreund/mirror/${name}:${tag}"
+            crane copy "$source" "$target"
+            actual="$(crane digest "$target")"
+            test "$actual" = "sha256:${digest}" || {
+              echo "::error::${target} has ${actual}, expected sha256:${digest}" >&2
+              exit 1
+            }
+          done <<'IMAGES'
+          minio-client latest-dev b056b795d31828015aea061e3168267b0ba80590ba2d8f869e72ff77153a68e8
+          minio latest 4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034
+          IMAGES
