@@ -34,6 +34,8 @@ results:
     kind: Pod
     result: fail
     resources:
+      - mirror-unpinned
+      - mirror-lookalike
       - uncovered-odin-exporter
       - uncovered-future-service
       - uncovered-port443
@@ -47,6 +49,7 @@ results:
     kind: Pod
     result: skip
     resources:
+      - mirror-digest-pinned
       - covered-digest-pinned
       - covered-tag-digest
       - covered-aifactory

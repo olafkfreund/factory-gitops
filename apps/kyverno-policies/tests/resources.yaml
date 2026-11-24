@@ -250,3 +250,25 @@ metadata: {name: fides-uncovered-in-ephemeralcontainer, namespace: fides}
 spec:
   containers: [{name: c, image: "ghcr.io/olafkfreund/fides-server:a7f0738a98c185cecd42c647045c8beade1643ac"}]
   ephemeralContainers: [{name: debug, image: "ghcr.io/olafkfreund/not-a-rule:1"}]
+---
+# Factory#3880: digest-pinned third-party mirror is exempt.
+apiVersion: v1
+kind: Pod
+metadata: {name: mirror-digest-pinned, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/mirror/minio:latest@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034"}]
+---
+# Factory#3880: an unpinned mirror tag is still a gap.
+apiVersion: v1
+kind: Pod
+metadata: {name: mirror-unpinned, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/mirror/minio:latest"}]
+---
+# Factory#3880: a lookalike path is not the mirror.
+apiVersion: v1
+kind: Pod
+metadata: {name: mirror-lookalike, namespace: factory}
+spec:
+  containers: [{name: c, image: "ghcr.io/olafkfreund/mirrorx/minio:latest@sha256:4cf4831a2bbcf13ddca09c1cbcc9faff716dd3c4247e0babc32864b8ee8e0034"}]
+

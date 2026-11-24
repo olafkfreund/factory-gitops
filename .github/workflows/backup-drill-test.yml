@@ -23,7 +23,7 @@ jobs:
         run: |
           set -euo pipefail
           pg="$(grep -oE 'postgres:16[.0-9]*@sha256:[0-9a-f]+' apps/backups/drill/cronjob.yaml | head -n 1)"
-          mc="$(grep -o 'cgr.dev/chainguard/minio-client[^ ]*' apps/backups/drill/cronjob.yaml | head -n 1)"
+          mc="$(grep -o 'ghcr.io/olafkfreund/mirror/minio-client[^ ]*' apps/backups/drill/cronjob.yaml | head -n 1)"
           test -n "$pg" && test -n "$mc" || { echo "image not found in cronjob.yaml" >&2; exit 1; }
           echo "PG=$pg" >> "$GITHUB_ENV"; echo "MC=$mc" >> "$GITHUB_ENV"
       - name: Restore drill (real Postgres replay)
