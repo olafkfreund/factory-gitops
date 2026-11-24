@@ -80,6 +80,7 @@ spec:
               set -e
               mkdir -p /var/lib/rfactory/claude-home/.claude
               cp /seed/claude-credentials.json /var/lib/rfactory/claude-home/.claude/.credentials.json
+              chmod 600 /var/lib/rfactory/claude-home/.claude/.credentials.json
           securityContext:
             runAsUser: 1000
             runAsNonRoot: true
@@ -90,6 +91,24 @@ spec:
           volumeMounts:
             - { name: claude-home, mountPath: /var/lib/rfactory/claude-home }
             - { name: cli-creds, mountPath: /seed, readOnly: true }
+        # RFactory refuses a CFactory key file with any group or other bit (core/src/scope.js), and Secret
+        # files are root-owned, so copy them into a memory volume this uid owns, at mode 600.
+        - name: stage-keys
+          image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              for f in cfactory-read-key cfactory-write-key; do cp /keys-src/$f /run/rfactory/keys/$f; chmod 600 /run/rfactory/keys/$f; done
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: rfactory-keys, mountPath: /keys-src, readOnly: true }
+            - { name: keys, mountPath: /run/rfactory/keys }
       containers:
         - name: oauth2-proxy
           image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.0@sha256:9ed7eaf720508640e1dce523f85f1e81743633d858175a9a26469978386ae05b
@@ -142,6 +161,7 @@ spec:
             capabilities:
               drop: ["ALL"]
           env:
+            - { name: HOME, value: /tmp }
             - { name: RFACTORY_WRITES, value: "on" }
             - { name: RFACTORY_SHARES, value: "on" }
             - { name: RFACTORY_DESKTOP, value: "1" }
@@ -161,8 +181,7 @@ spec:
             - { name: claude-home, mountPath: /var/lib/rfactory/claude-home }
             - { name: web-tmp, mountPath: /tmp }
             - { name: rfactory-config, mountPath: /etc/rfactory, readOnly: true }
-            - { name: rfactory-keys, mountPath: /run/rfactory/cfactory-read-key, subPath: cfactory-read-key, readOnly: true }
-            - { name: rfactory-keys, mountPath: /run/rfactory/cfactory-write-key, subPath: cfactory-write-key, readOnly: true }
+            - { name: keys, mountPath: /run/rfactory/keys, readOnly: true }
             - { name: rfactory-stt-path, mountPath: /run/rfactory/stt-path, subPath: path, readOnly: true }
             - { name: rfactory-runner-client, mountPath: /run/rfactory/desktop-runner, readOnly: true }
           readinessProbe:
@@ -331,6 +350,7 @@ spec:
         - { name: data, persistentVolumeClaim: { claimName: rfactory-data } }
         - { name: claude-home, emptyDir: {} }
         - { name: web-tmp, emptyDir: {} }
+        - { name: keys, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
         - { name: stt-tmp, emptyDir: {} }
         - name: oauth2-proxy-config
           configMap:
