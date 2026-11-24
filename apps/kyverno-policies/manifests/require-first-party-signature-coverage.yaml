@@ -254,7 +254,7 @@ spec:
             jmesPath: >-
               request.object.spec.[containers, initContainers, ephemeralContainers][].image
               | [?regex_match('(?i)^ghcr\.io(:[0-9]+)?/olafkfreund/', @)]
-              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@|pfactory:|pfactory@|tfactory:|tfactory@|cfactory:|cfactory@|cfactory-frontend:|cfactory-frontend@|odin:|odin@|skillai:|skillai@|skillai-migrator:|skillai-migrator@|tfactory-runner-|factory-runner-)', @)]
+              | [?!regex_match('^ghcr\.io/olafkfreund/(aifactory:|aifactory@|pfactory:|pfactory@|tfactory:|tfactory@|cfactory:|cfactory@|cfactory-frontend:|cfactory-frontend@|rfactory-web:|rfactory-web@|rfactory-stt:|rfactory-stt@|odin:|odin@|skillai:|skillai@|skillai-migrator:|skillai-migrator@|tfactory-runner-|factory-runner-)', @)]
               | [?!regex_match('^ghcr\.io/olafkfreund/mirror/[a-z0-9-]+(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$', @)]
             # Factory#3880 (owner decision, 2026-11-24): ghcr.io/olafkfreund/mirror/* holds
             # digest-pinned copies of third-party Chainguard images (mirror-images.yml

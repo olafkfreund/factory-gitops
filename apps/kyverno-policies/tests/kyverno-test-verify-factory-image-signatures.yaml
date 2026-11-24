@@ -10,7 +10,7 @@
 #
 # This suite is OFFLINE. Nothing in it reaches ghcr.io, Fulcio or Rekor, and it
 # therefore says nothing about whether any signature verifies. It tests one
-# thing: the SCOPE of the seven verifyImages rules -- which image references they
+# thing: the SCOPE of the verifyImages rules -- which image references they
 # speak about, and, the point of the file, which ones they must not.
 #
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@
 #     caught: 5 errors where there were 15 passes.
 #   - a `results` entry naming a rule the engine did not load FAILS the gate,
 #     which is the first measurement above and is the one that matters here.
-#     Rename or delete any of the seven rules below and this suite goes red
+#     Rename or delete any of the rules below and this suite goes red
 #     rather than quietly asserting nothing.
 #
 # What is still not caught is the narrowing of a glob within a rule that still
@@ -132,7 +132,7 @@
 # `skip` is the expected result throughout. It reads as "this rule has nothing
 # to say about this image", which for a verifyImages rule means the reference
 # matched none of its `imageReferences` globs, or the Pod was out of namespace
-# scope. Each of the seven rules is asserted against every fixture, because the
+# scope. Each rule is asserted against every fixture, because the
 # claim being made is not per-rule: NO rule in this policy may speak about any
 # of these images. That cross-product is what catches a glob widened in one
 # rule toward a name that belongs to another.
@@ -155,6 +155,8 @@ results:
       - near-tfactory-runner-bare
       - near-cfactory-backend
       - near-cfactory-frontend-preview
+      - near-rfactory-web-preview
+      - near-rfactory-stt-debug
       - near-skillai-worker
       - near-skillai-migrator-tools
       - near-miss-in-initcontainer
@@ -179,6 +181,11 @@ results:
     resources: *no-rule-may-match
   - policy: verify-factory-image-signatures
     rule: verify-cfactory-signature
+    kind: Pod
+    result: skip
+    resources: *no-rule-may-match
+  - policy: verify-factory-image-signatures
+    rule: verify-rfactory-signature
     kind: Pod
     result: skip
     resources: *no-rule-may-match
