@@ -17,7 +17,8 @@ metadata: { name: minio-backup-local, namespace: factory, labels: { app: minio-b
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: local-path
-  resources: { requests: { storage: 20Gi } }
+  # KEEP=3 full generations of factory-artifacts (7.2 GB on 2026-11-24) need ~22 GB (#423).
+  resources: { requests: { storage: 40Gi } }
 ---
 apiVersion: batch/v1
 kind: CronJob
