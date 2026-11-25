@@ -164,6 +164,7 @@ spec:
             - { name: HOME, value: /tmp }
             - { name: RFACTORY_WRITES, value: "on" }
             - { name: RFACTORY_SHARES, value: "on" }
+            - { name: RFACTORY_INVESTIGATIONS, value: "on" }   # #18; the scope Secret must agree (bootstrap-secrets.sh)
             - { name: RFACTORY_DESKTOP, value: "1" }
             - { name: RFACTORY_CALLS, value: "1" }
             - { name: RFACTORY_RUNNER_URL, value: "https://rfactory-runner-api.rfactory-desktops.svc:8443" }
