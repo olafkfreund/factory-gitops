@@ -10,5 +10,5 @@ images:
   digest: sha256:8f24b4be32b7724af1ee27836f116d318f396b24d6a14c0c98f1bd75434b1a47
 - name: ghcr.io/olafkfreund/rfactory-stt
   newName: ghcr.io/olafkfreund/rfactory-stt
-  newTag: sha-b42b601
-  digest: 
+  newTag: sha-cab7473
+  digest: sha256:a7adf8f9387408235271bdee58d79e663d1271921ac0bde916f9c553717e2a4a
