@@ -221,6 +221,8 @@ spec:
             # read-only; relocate it into the cc-claude emptyDir (same trick as pfactory).
             - { name: CLAUDE_CONFIG_DIR, value: "/home/nonroot/.claude" }
             - { name: CFACTORY_AIFACTORY_API_URL, value: "http://aifactory.factory.svc.cluster.local:3101" }
+            # RFactory#18 / CFactory#561: read-only investigations; rollback on -> drain -> off
+            - { name: CFACTORY_INVESTIGATIONS, value: "on" }
             - { name: CFACTORY_PFACTORY_API_URL, value: "http://pfactory.factory.svc.cluster.local:3114" }
             - { name: CFACTORY_TFACTORY_API_URL, value: "http://tfactory.factory.svc.cluster.local:3103" }
             - { name: CFACTORY_SUBSCRIBE_UPSTREAMS, value: "true" }
