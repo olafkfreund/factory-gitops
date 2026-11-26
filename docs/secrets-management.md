@@ -296,7 +296,7 @@ weekly by `.github/workflows/secret-rotation-due.yml` via
 | `ghcr-pull` | 365 | unknown | - |
 | `APP_API_TOKEN` | 365 | unknown | - |
 | `CFACTORY_READ_KEY` | 365 | unknown | - |
-| `cfactory-api-keys` | 365 | unknown | - |
+| `cfactory-api-keys` | 365 | 2026-11-25 | - |
 | `PFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
 | `TFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
 | `AIFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
