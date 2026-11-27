@@ -137,6 +137,7 @@ spec:
             - |
               set -e
               for f in cfactory-read-key cfactory-write-key; do cp /keys-src/$f /run/rfactory/keys/$f; chmod 600 /run/rfactory/keys/$f; done
+              for f in /keys-src/agent-*; do [ -e "$f" ] || continue; cp "$f" /run/rfactory/keys/; chmod 600 "/run/rfactory/keys/${f##*/}"; done
           securityContext:
             runAsUser: 1000
             runAsNonRoot: true
