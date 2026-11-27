@@ -1670,14 +1670,15 @@ metadata:
   namespace: factory
   labels: { app: fleet-match }
 spec:
-  # Every 10 minutes. Polling faster than the 900s tolerance buys nothing — a
+  # Every 30 minutes. Polling faster than the 900s tolerance buys nothing — a
   # mismatch cannot become a finding until it has outlived the tolerance — and
   # the failures this exists to catch lasted days, not minutes. Cost of the
   # cadence, stated rather than hidden: 2 authenticated GitHub API calls per
-  # service per run (main HEAD + deploy-run history), so 8 per run and ~48 an
-  # hour against a 5000/hr limit. The commit-comparison call happens only when
-  # main is ahead of the last build, so a fleet at rest makes none.
-  schedule: "*/10 * * * *"
+  # service per run (main HEAD + deploy-run history) plus issue reads, and the
+  # token's 5000/hr limit is shared with the owner's other tools, which ran it
+  # dry on 2026-11-27 (nixos_config#3275), so every 30 min, not 10. The
+  # commit-comparison call happens only when main is ahead of the last build.
+  schedule: "*/30 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 10
