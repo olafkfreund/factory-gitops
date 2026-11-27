@@ -126,7 +126,7 @@ spec:
         # later: legible-and-frozen beats illegible-and-drifting, but only
         # while the freeze is visible. olafkfreund/fides#389 tracks the missing
         # deploy leg; until it lands the bump is this line, by hand.
-        image: ghcr.io/olafkfreund/fides-server:11e2e915b4e8d7311268c66e09c607e630e2248c
+        image: ghcr.io/olafkfreund/fides-server:96f83ad32784614bc2cc46a3ac2c4cb456b63326
         # Still Always: an immutable tag makes this a no-op on a warm node, and
         # it is the correct policy for the day somebody force-pushes a tag.
         imagePullPolicy: Always
