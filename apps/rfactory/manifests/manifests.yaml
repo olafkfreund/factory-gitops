@@ -55,6 +55,43 @@ spec:
       ports:
         - { protocol: TCP, port: 4180 }
 ---
+# Egress limit for the RFactory pod (RFactory#53). In-cluster targets are exact: cluster DNS,
+# Keycloak (oauth2-proxy token and keys) and the desktop runner API. A NetworkPolicy cannot
+# match host names, so Anthropic, the public CFactory MCP name and api.github.com are public
+# HTTPS only: TCP 443 to any address except the private, link-local and CGNAT ranges, the
+# same shape as allow-provider-egress in apps/model-gateway. That keeps the Kubernetes API,
+# the node, the LAN and every other Service out of reach. Residual risk, accepted in
+# RFactory#53: a compromised pod can reach any public HTTPS host, and can leak through DNS.
+# Host-name pinning through a proxy is a later slice. Check: RFactory deploy/k8s/check-egress.sh.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: rfactory-egress, namespace: factory, labels: { app: rfactory } }
+spec:
+  podSelector: { matchLabels: { app: rfactory } }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector: { matchLabels: { app: keycloak } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: rfactory-desktops } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: rfactory-runner } }
+      ports:
+        - { protocol: TCP, port: 8443 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports:
+        - { protocol: TCP, port: 443 }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: rfactory, namespace: factory, labels: { app: rfactory } }
