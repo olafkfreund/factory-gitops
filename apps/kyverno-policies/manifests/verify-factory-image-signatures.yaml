@@ -121,9 +121,9 @@
 # to repeat before trusting this paragraph again -- not `tags/list`, not a pull.
 #
 # COUNTING NOTE, because this number has been wrong twice and TWO DIFFERENT
-# NUMBERS ARE BOTH CORRECT. The globs below name nineteen REPOSITORIES -- 5
-# services + 11 runners + 2 SkillAi + odin. That is not the same as the count of
-# images actually running, which is what a live-board measurement returns (17 at
+# NUMBERS ARE BOTH CORRECT. The globs below name twenty-one REPOSITORIES -- 7
+# services + 11 runners + 2 SkillAi + odin. That is not the same as the count
+# of images actually running, which is what a live-board measurement returns (17 at
 # the time of Factory#566's credential experiment) and which changes whenever a
 # workload starts or stops. Say which one you mean, and prefer deriving either
 # from the globs or from the cluster over quoting a number out of a comment.
@@ -389,7 +389,33 @@ spec:
                     # rejected outright and ArgoCD cannot apply the file.
                     rekor:
                       url: "https://rekor.sigstore.dev"
-    # Factory#524, phase 2 (2026-08-05). The four rules above cover the five
+    # RFactory's web and STT packages are public, so Kyverno can read their
+    # deploy.yml signatures anonymously.
+    - name: verify-rfactory-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [factory]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/olafkfreund/rfactory-web:*"
+            - "ghcr.io/olafkfreund/rfactory-web@*"
+            - "ghcr.io/olafkfreund/rfactory-stt:*"
+            - "ghcr.io/olafkfreund/rfactory-stt@*"
+          verifyDigest: false
+          mutateDigest: false
+          required: true
+          useCache: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "^https://github\\.com/olafkfreund/RFactory/\\.github/workflows/deploy\\.yml@refs/heads/main$"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
+    # Factory#524, phase 2 (2026-08-05). The service rules above cover seven
     # SERVICE images -- the control plane. They cover none of the eleven RUNNER
     # images, which is the worse half: those are the sandbox in which generated
     # code is built and executed.

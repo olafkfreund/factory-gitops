@@ -31,7 +31,7 @@ import tempfile
 import time
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-APPS = ("aifactory", "pfactory", "tfactory", "cfactory")
+APPS = ("aifactory", "pfactory", "tfactory", "cfactory", "rfactory")
 
 
 def extract(app):

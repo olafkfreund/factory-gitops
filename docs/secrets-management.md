@@ -50,7 +50,7 @@ All are namespace `factory` and seeded via agenix on p510 unless noted.
 | `factory-secrets` | POSTGRES_PASSWORD, GITHUB_TOKEN, APP_API_TOKEN, CFACTORY_READ_KEY, AIFACTORY_TRUSTED_PLAN_KEY_PFACTORY (+ optional `__2026Q4` and `PFACTORY_TRUSTED_PLAN_SIGNING_KEY__2026Q4`, Factory#3689), PFACTORY_CONTRACT_SIGNING_KEY__PF-2026-10 (Ed25519 seed, TFactory#1432), {PFACTORY,TFACTORY,AIFACTORY}_JWT_SECRET, {PFACTORY,TFACTORY,AIFACTORY}_OIDC_CLIENT_SECRET, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY, GEMINI_API_KEY, CONTEXT7_KEY, LANGCHAIN_API_KEY, RAPIDAPI_KEY, CLAUDE_CODE_OAUTH_TOKEN, OLLAMA_API_KEY, CFACTORY_AUDIT_HMAC_SECRET, CFACTORY_CREDENTIAL_KEY, KMS_FERNET_KEY (aifactory at-rest key; rotation re-encrypts, see AIFactory `python -m server.crypto`) | pfactory, tfactory, aifactory, cfactory, backups, keda triggerauth | Manual (agenix). The catch-all secret — highest blast radius. |
 | `minio-creds` | S3_ACCESS_KEY, S3_SECRET_KEY; optional STS_ACCESS_KEY, STS_SECRET_KEY (AIFactory#2023: a non-root MinIO user `aifactory-sts`, created by the minio-create-bucket hook; read by aifactory as S3_STS_*) | minio, minio bucket-init, pfactory, tfactory, aifactory, backups | Manual (agenix). Rotate = recreate + bounce minio and every consumer. STS keys: new pair, resync minio (the hook tries to disable the previous user but only best effort: check `mc admin user list` and disable the old key by hand if it is still enabled), restart aifactory. |
 | `minio-kms` | MINIO_KMS_SECRET_KEY | minio | Manual (agenix). The object-encryption KEK — see docs/encryption-at-rest.md; compromise-only rotation, see [Rotation policy](#rotation-policy). |
-| `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory (mounted) | Claude credential: `claude setup-token` (about 1 year) re-seeded by hand; cred-broker (`apps/cred-broker`) watches the expiry and refreshes only an `auth login` credential. Others manual. |
+| `factory-cli-creds` | claude-credentials.json (+ codex/copilot/gemini keys) | pfactory, tfactory, aifactory, rfactory (mounted) | Claude credential: `claude setup-token` (about 1 year) re-seeded by hand; cred-broker (`apps/cred-broker`) watches the expiry and refreshes only an `auth login` credential. Others manual. |
 | `factory-db-pfactory` | DATABASE_URL | pfactory | Manual (agenix). Derived from POSTGRES_PASSWORD; rotate together. |
 | `factory-db-tfactory` | DATABASE_URL | tfactory | Manual (agenix). As above. |
 | `factory-db-aifactory` | DATABASE_URL | aifactory | Manual (agenix). As above. |
@@ -61,6 +61,11 @@ All are namespace `factory` and seeded via agenix on p510 unless noted.
 | `observe-root` | email, password | observe (OpenObserve) | Manual (agenix). |
 | `odin-ssh-key` | SSH key material (mounted as `secretName`) | odin | Manual (agenix). |
 | `otel-otlp-auth` | headers | aifactory (OTLP export) | Manual (agenix). |
+| `rfactory-config` | scope.json, allowed-emails, approvers, admins | rfactory | RFactory `deploy/k8s/bootstrap-secrets.sh`; source `~/.config/rfactory` on p620. |
+| `rfactory-keys` | cfactory-read-key, cfactory-write-key | rfactory | RFactory `deploy/k8s/bootstrap-secrets.sh`; source `~/.config/rfactory` on p620. |
+| `rfactory-stt-path` | path | rfactory | RFactory `deploy/k8s/bootstrap-secrets.sh`; source `~/.config/rfactory` on p620. |
+| `oauth2-proxy-rfactory` | client-secret, cookie-secret | rfactory | RFactory `deploy/k8s/bootstrap-secrets.sh`; source `~/.config/rfactory` on p620. |
+| `rfactory-runner-client` | client.crt, client.key, ca.crt | rfactory | RFactory `deploy/k8s/bootstrap-secrets.sh`; source `~/.config/rfactory` on p620. |
 
 Operator-managed, not in scope for this inventory (created by their own
 controllers, not the app-seeding path): `kedaorg-certs` (KEDA operator TLS),
@@ -291,7 +296,7 @@ weekly by `.github/workflows/secret-rotation-due.yml` via
 | `ghcr-pull` | 365 | unknown | - |
 | `APP_API_TOKEN` | 365 | unknown | - |
 | `CFACTORY_READ_KEY` | 365 | unknown | - |
-| `cfactory-api-keys` | 365 | unknown | - |
+| `cfactory-api-keys` | 365 | 2026-11-25 | - |
 | `PFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
 | `TFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
 | `AIFACTORY_OIDC_CLIENT_SECRET` | 365 | unknown | - |
@@ -309,6 +314,10 @@ weekly by `.github/workflows/secret-rotation-due.yml` via
 | `CFACTORY_CREDENTIAL_KEY` | 365 | unknown | - |
 | `CFACTORY_AUDIT_HMAC_SECRET` | none | unknown | - |
 | `minio-kms` | none | unknown | - |
+| `rfactory-keys` | 365 | unknown | - |
+| `rfactory-stt-path` | 365 | unknown | - |
+| `oauth2-proxy-rfactory` | 365 | unknown | - |
+| `rfactory-runner-client` | 365 | unknown | - |
 <!-- rotation-ledger:end -->
 
 ## Decryption-key custody
@@ -489,7 +498,7 @@ edit agenix. Never paste the token into a command line, a log or an issue.
    running pods will not adopt the one-year file; a fresh pod's seed step copies it directly.
 
    ```sh
-   kubectl --context k3d-factory -n factory rollout restart deploy/pfactory deploy/tfactory deploy/aifactory
+   kubectl --context k3d-factory -n factory rollout restart deploy/pfactory deploy/tfactory deploy/aifactory deploy/rfactory
    ```
 
 6. Check TFactory accepts it (its `/v1/models` probe):

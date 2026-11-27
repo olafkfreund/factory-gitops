@@ -1,0 +1,22 @@
+# RFactory — voice and desktop cockpit over CFactory.
+# Source repo: github.com/olafkfreund/RFactory
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rfactory
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/olafkfreund/factory-gitops
+    targetRevision: main
+    path: apps/rfactory/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: factory
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
