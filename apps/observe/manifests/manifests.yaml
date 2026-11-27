@@ -168,7 +168,8 @@ spec:
           # stream data, so a search spike cleared the old cap and the kernel
           # OOM-killed it (2026-08-21, memory.oom.group took the whole pod).
           # Request raised to match the real floor rather than a quarter of it.
-          resources: { requests: { cpu: 100m, memory: 512Mi }, limits: { memory: 2Gi } }
+          # 4Gi: 977Mi in use on 2026-11-27, 8 OOM restarts at 2Gi (nixos_config#3259).
+          resources: { requests: { cpu: 100m, memory: 1Gi }, limits: { memory: 4Gi } }
       volumes: [{ name: data, persistentVolumeClaim: { claimName: observe-data } }]
 ---
 ################################################################################
