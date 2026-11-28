@@ -6,8 +6,8 @@ resources:
 images:
 - name: ghcr.io/olafkfreund/rfactory-web
   newName: ghcr.io/olafkfreund/rfactory-web
-  newTag: sha-040a0e0
-  digest: sha256:57a0b3795f89c8d9d06544ddfb3161397c8d51fda0eaedea5e6bfe994775bf48
+  newTag: sha-d78170c
+  digest: sha256:13f5db5a56d9b01ccc888f151b02be3bfa808ca17a0c90d8e22b8b7b52ab18bd
 - name: ghcr.io/olafkfreund/rfactory-stt
   newName: ghcr.io/olafkfreund/rfactory-stt
   newTag: sha-cab7473
